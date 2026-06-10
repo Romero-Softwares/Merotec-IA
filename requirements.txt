@@ -1,0 +1,10 @@
+openai
+customtkinter~=5.2.2
+Pygments~=2.19.2
+speechrecognition~=3.14.5
+pyttsx3~=2.99
+pipwin
+sounddevice~=0.5.5
+scipy~=1.17.1
+numpy~=2.4.2
+protobuf~=5.29.6

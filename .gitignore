@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+
+# Configuracoes locais e segredos
+.env
+.env.*
+ide_settings.json
+
+# Historico/local da IDE
+history.json
+change_history.json
+*.bak
+.codex-manual-cache/
+.merotec_attachments/
+.merotec_backups/
+codex_schema_probe/
+
+# Logs e temporarios
+*.log
+*.tmp
+*.temp
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Sistema operacional / editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
