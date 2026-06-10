@@ -81,133 +81,26 @@ from PIL import Image, ImageDraw, ImageGrab, ImageTk
 from pygments.lexers import get_lexer_for_filename
 from pygments.styles import get_style_by_name
 
+from modules.app_constants import (
+    APP_CHANGE_HISTORY_FILE,
+    APP_HISTORY_FILE,
+    APP_NAME,
+    APP_SETTINGS_FILE,
+    CHAT_TAB_NAME,
+    CORE_TABS,
+    DEFAULT_APP_SETTINGS,
+    DEFAULT_WORKSPACE,
+    FILE_ICON_COLORS,
+    IGNORED_DIRS,
+    IGNORED_SUFFIXES,
+    PROJECT_ROOT,
+    SCRATCHPAD_DEFAULT_TEXT,
+)
 from modules.engine import UniversalEngine
 from modules.executor import CodeExecutor
 from modules.project_manager import ProjectManager
+from modules.ui_theme import THEME
 from modules.voice import VoiceModule
-
-
-APP_NAME = "Merotec IA IDE"
-CHAT_TAB_NAME = "Chat AI"
-CORE_TABS = {CHAT_TAB_NAME, "Chat IA", "Scratchpad", "Terminal Local", "Log do Agente"}
-PROJECT_ROOT = Path(__file__).resolve().parent
-DEFAULT_WORKSPACE = PROJECT_ROOT / "projects"
-APP_SETTINGS_FILE = PROJECT_ROOT / "ide_settings.json"
-APP_HISTORY_FILE = PROJECT_ROOT / "history.json"
-APP_CHANGE_HISTORY_FILE = PROJECT_ROOT / "change_history.json"
-DEFAULT_APP_SETTINGS = {
-    "last_workspace": "",
-    "recent_projects": [],
-    "ai_provider": "codex",
-    "codex_model_name": "",
-    "codex_reasoning_effort": "xhigh",
-}
-SCRATCHPAD_DEFAULT_TEXT = """# Como configurar um modelo de IA nesta IDE
-#
-# Motor principal:
-# - Provedor: codex
-# - Usa o Codex local ja logado no Windows.
-# - A IDE usa apenas o Codex como agente principal.
-#
-# Opcao OpenAI:
-# 1. Crie uma chave em: https://platform.openai.com/api-keys
-# 2. Configure as variaveis no PowerShell:
-#    setx AI_PROVIDER "openai"
-#    setx OPENAI_API_KEY "cole_sua_chave_aqui"
-#    setx OPENAI_MODEL_NAME "gpt-5.2"
-# 3. Feche e abra a IDE novamente.
-#
-# Opcao Google:
-# 1. Configure sua chave do Google GenAI:
-#    setx AI_PROVIDER "google"
-#    setx GOOGLE_API_KEY "cole_sua_chave_aqui"
-#    setx GOOGLE_MODEL_NAME "gemini-3.1-flash-lite"
-# 2. Feche e abra a IDE novamente.
-#
-# Observacoes:
-# - Nao cole sua chave no chat.
-# - Se aparecer invalid_api_key, gere uma nova chave e copie completa.
-# - Se aparecer insufficient_quota, verifique Billing, Usage e Limits da plataforma.
-# - Depois de configurar, use a aba Chat AI para conversar com o modelo.
-
-"""
-IGNORED_DIRS = {
-    ".git",
-    ".gradle",
-    ".gemini",
-    ".idea",
-    ".dart_tool",
-    ".merotec_attachments",
-    ".merotec_backups",
-    ".tool_appdata",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".venv",
-    "__pycache__",
-    "build",
-    "codex_schema_probe",
-    "coverage",
-    "dist",
-    "ephemeral",
-    "node_modules",
-    "out",
-    "venv",
-}
-IGNORED_SUFFIXES = {
-    ".bin",
-    ".dll",
-    ".exe",
-    ".ico",
-    ".jpg",
-    ".jpeg",
-    ".pyd",
-    ".pyc",
-    ".png",
-    ".webp",
-    ".zip",
-}
-
-FILE_ICON_COLORS = {
-    ".py": ("#3776ab", "#ffd343"),
-    ".js": ("#f0db4f", "#1f2328"),
-    ".ts": ("#3178c6", "#ffffff"),
-    ".tsx": ("#3178c6", "#61dafb"),
-    ".jsx": ("#1f2937", "#61dafb"),
-    ".html": ("#e44d26", "#f7f7f7"),
-    ".css": ("#264de4", "#f7f7f7"),
-    ".json": ("#d6b656", "#1f2328"),
-    ".md": ("#6f7785", "#ffffff"),
-    ".txt": ("#8ea0b8", "#ffffff"),
-    ".cmd": ("#2fbf71", "#06120c"),
-    ".ps1": ("#3a7bd5", "#ffffff"),
-    ".bat": ("#2fbf71", "#06120c"),
-}
-
-THEME = {
-    "bg": "#070a12",
-    "panel": "#0d1422",
-    "panel_alt": "#111a2b",
-    "panel_soft": "#172338",
-    "menu_bg": "#101b2d",
-    "menu_top": "#182944",
-    "menu_bottom": "#0b1424",
-    "menu_active": "#1f5f86",
-    "menu_border": "#2fbbff",
-    "button_top": "#16253c",
-    "button_shadow": "#02040a",
-    "border": "#243653",
-    "border_lift": "#2fbbff",
-    "text": "#b9c8d8",
-    "muted": "#70839e",
-    "button_text": "#c2cfdd",
-    "explorer_text": "#aebdd0",
-    "accent": "#24d7ff",
-    "accent_dark": "#137ca7",
-    "success": "#35f6a2",
-    "danger": "#ff5f7e",
-    "warning": "#ffd166",
-    "terminal": "#030711",
-}
 
 
 class UniversalApp(ctk.CTk):
@@ -299,6 +192,7 @@ class UniversalApp(ctk.CTk):
         self.explorer_visible = True
         self.sidebar_width = 228
         self.explorer_width = 270
+        self.explorer_refresh_job = None
 
         self.engine = UniversalEngine()
         self.voice = VoiceModule()
@@ -611,7 +505,7 @@ class UniversalApp(ctk.CTk):
             height=34,
         )
         self.explorer_filter.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 10))
-        self.explorer_filter.bind("<KeyRelease>", lambda _event: self.load_workspace_files())
+        self.explorer_filter.bind("<KeyRelease>", lambda _event: self.load_workspace_files(delay=180))
 
         self.explorer_tree_frame = ctk.CTkFrame(self.explorer, fg_color=THEME["panel_alt"], corner_radius=0)
         self.explorer_tree_frame.grid(row=2, column=0, sticky="nsew", padx=8, pady=(0, 10))
@@ -664,6 +558,110 @@ class UniversalApp(ctk.CTk):
         except tk.TclError:
             pass
 
+    def _hide_ctk_textbox_scrollbar(self, textbox):
+        scrollbar = getattr(textbox, "_y_scrollbar", None)
+        if scrollbar is None:
+            return
+        try:
+            scrollbar.configure(width=0, fg_color="transparent")
+            scrollbar.grid_remove()
+        except tk.TclError:
+            pass
+
+    def _sync_visible_scrollbar(self, scrollbar, first, last):
+        try:
+            scrollbar.set(first, last)
+            scrollbar.grid()
+        except (tk.TclError, ValueError):
+            pass
+
+    def _create_long_press_scroll_controls(self, parent, target_yview, scroll_once, grid_kwargs):
+        scroll_step = 4
+        hold_delay_ms = 320
+        repeat_delay_ms = 55
+        repeat_job = {"id": None, "active": False}
+
+        def scroll_target(direction):
+            scroll_once(direction * scroll_step)
+
+        def cancel_scroll_repeat():
+            repeat_job["active"] = False
+            job_id = repeat_job.get("id")
+            repeat_job["id"] = None
+            if job_id is not None:
+                try:
+                    self.after_cancel(job_id)
+                except tk.TclError:
+                    pass
+
+        def repeat_scroll(direction):
+            if not repeat_job["active"]:
+                return
+            for _ in range(6):
+                scroll_target(direction)
+            repeat_job["id"] = self.after(repeat_delay_ms, lambda: repeat_scroll(direction))
+
+        def start_scroll_press(direction):
+            cancel_scroll_repeat()
+            scroll_target(direction)
+            repeat_job["active"] = True
+            repeat_job["id"] = self.after(hold_delay_ms, lambda: repeat_scroll(direction))
+
+        def bind_long_press(button, direction):
+            button.bind("<ButtonPress-1>", lambda _event: start_scroll_press(direction), add="+")
+            button.bind("<ButtonRelease-1>", lambda _event: cancel_scroll_repeat(), add="+")
+            button.bind("<Leave>", lambda _event: cancel_scroll_repeat(), add="+")
+
+        scroll_controls = ctk.CTkFrame(parent, fg_color="#111318", width=34, corner_radius=0)
+        scroll_controls.grid(**grid_kwargs)
+        scroll_controls.grid_columnconfigure(0, weight=1)
+        scroll_controls.grid_rowconfigure(1, weight=1)
+
+        scroll_up = ctk.CTkButton(
+            scroll_controls,
+            text="↑",
+            width=30,
+            height=30,
+            corner_radius=4,
+            fg_color="#172033",
+            hover_color="#24324d",
+            text_color=THEME["accent"],
+        )
+        scroll_up.grid(row=0, column=0, sticky="ew", padx=2, pady=(2, 4))
+        bind_long_press(scroll_up, -1)
+
+        scroll_track = ctk.CTkFrame(scroll_controls, fg_color="#111318", width=30, corner_radius=0)
+        scroll_track.grid(row=1, column=0, sticky="nsew", padx=2, pady=4)
+        scroll_track.grid_columnconfigure(0, weight=1)
+        scroll_track.grid_columnconfigure(2, weight=1)
+        scroll_track.grid_rowconfigure(0, weight=1)
+
+        scroll_bar = ctk.CTkScrollbar(
+            scroll_track,
+            orientation="vertical",
+            width=18,
+            command=target_yview,
+            fg_color="#111318",
+            button_color=THEME["accent_dark"],
+            button_hover_color=THEME["accent"],
+        )
+        scroll_bar.grid(row=0, column=1, sticky="ns")
+
+        scroll_down = ctk.CTkButton(
+            scroll_controls,
+            text="↓",
+            width=30,
+            height=30,
+            corner_radius=4,
+            fg_color="#172033",
+            hover_color="#24324d",
+            text_color=THEME["accent"],
+        )
+        scroll_down.grid(row=2, column=0, sticky="ew", padx=2, pady=(4, 2))
+        bind_long_press(scroll_down, 1)
+
+        return scroll_controls, scroll_bar
+
     def _autohide_ctk_scrollable_frame_scrollbar(self, scrollable_frame):
         scrollbar = getattr(scrollable_frame, "_scrollbar", None)
         canvas = getattr(scrollable_frame, "_parent_canvas", None)
@@ -675,6 +673,42 @@ class UniversalApp(ctk.CTk):
             scrollbar.grid_remove()
         except tk.TclError:
             pass
+
+    def _show_ctk_scrollable_frame_scrollbar(self, scrollable_frame):
+        scrollbar = getattr(scrollable_frame, "_scrollbar", None)
+        canvas = getattr(scrollable_frame, "_parent_canvas", None)
+        if scrollbar is None or canvas is None:
+            return
+        canvas.configure(yscrollcommand=lambda first, last: self._sync_visible_scrollbar(scrollbar, first, last))
+        try:
+            scrollbar.configure(width=16, fg_color=THEME["panel_alt"], button_color=THEME["accent_dark"], button_hover_color=THEME["accent"])
+            scrollbar.grid()
+            self.after(1, lambda: self._sync_visible_scrollbar(scrollbar, *canvas.yview()))
+        except tk.TclError:
+            pass
+
+    def _install_chat_scroll_controls(self):
+        canvas = getattr(self.chat_history, "_parent_canvas", None)
+        if canvas is None:
+            return
+
+        def scroll_chat(units):
+            try:
+                canvas.yview_scroll(units, "units")
+                self._position_chat_background()
+            except tk.TclError:
+                pass
+
+        scroll_controls, scroll_bar = self._create_long_press_scroll_controls(
+            self.tab_chat,
+            canvas.yview,
+            scroll_chat,
+            {"row": 0, "column": 1, "sticky": "ns", "padx": (0, 8), "pady": 8},
+        )
+        self.chat_scroll_controls = scroll_controls
+        canvas.configure(yscrollcommand=lambda first, last: scroll_bar.set(first, last))
+        self.after(1, lambda: scroll_bar.set(*canvas.yview()))
+        return
 
     def _position_chat_background(self, event=None):
         canvas = getattr(self.chat_history, "_parent_canvas", None)
@@ -858,10 +892,7 @@ class UniversalApp(ctk.CTk):
             parent_frame = getattr(self.chat_history, "_parent_frame", None)
             if parent_frame is not None:
                 parent_frame.configure(fg_color="transparent")
-            scrollbar = getattr(self.chat_history, "_scrollbar", None)
-            if scrollbar is not None:
-                scrollbar.configure(width=0, fg_color="transparent")
-                scrollbar.grid_remove()
+            self._autohide_ctk_scrollable_frame_scrollbar(self.chat_history)
         except tk.TclError:
             pass
 
@@ -898,6 +929,7 @@ class UniversalApp(ctk.CTk):
         self.chat_history.tkraise()
         self._style_chat_background_layers()
         self._autohide_ctk_scrollable_frame_scrollbar(self.chat_history)
+        self._install_chat_scroll_controls()
         self.chat_history.bind("<Configure>", self._schedule_chat_background_refresh, add="+")
         self.tab_chat.bind("<Configure>", self._schedule_chat_background_refresh, add="+")
         self._refresh_chat_background()
@@ -1124,18 +1156,30 @@ class UniversalApp(ctk.CTk):
             border_width=0,
             wrap="none",
             undo=True,
+            activate_scrollbars=False,
         )
         editor.grid(row=0, column=1, sticky="nsew")
-        self._autohide_ctk_textbox_scrollbar(editor)
+        self._hide_ctk_textbox_scrollbar(editor)
         editor._line_numbers = line_numbers
         editor.tag_config("current_line", background="#20242c")
 
+        def scroll_editor(units):
+            try:
+                editor.yview_scroll(units, "units")
+                line_numbers.yview_moveto(editor.yview()[0])
+            except tk.TclError:
+                pass
+
+        _scroll_controls, scroll_bar = self._create_long_press_scroll_controls(
+            editor_frame,
+            editor.yview,
+            scroll_editor,
+            {"row": 0, "column": 2, "sticky": "ns"},
+        )
+        self.after(1, lambda: scroll_bar.set(*editor.yview()))
         def sync_scroll(first, last):
             line_numbers.yview_moveto(first)
-            try:
-                self._sync_autohide_scrollbar(editor._y_scrollbar, first, last)
-            except AttributeError:
-                pass
+            scroll_bar.set(first, last)
 
         editor.configure(yscrollcommand=sync_scroll)
         editor.bind("<KeyRelease>", lambda _event, name=tab_name: self._on_editor_content_changed(name), add="+")
@@ -1907,8 +1951,18 @@ class UniversalApp(ctk.CTk):
                 if count >= limit:
                     return
 
-    def load_workspace_files(self):
-        self.after(0, self._load_workspace_files_sync)
+    def load_workspace_files(self, delay=0):
+        previous_job = getattr(self, "explorer_refresh_job", None)
+        if previous_job:
+            try:
+                self.after_cancel(previous_job)
+            except tk.TclError:
+                pass
+        self.explorer_refresh_job = self.after(delay, self._load_workspace_files_now)
+
+    def _load_workspace_files_now(self):
+        self.explorer_refresh_job = None
+        self._load_workspace_files_sync()
 
     def _load_workspace_files_sync(self):
         self.file_tree.delete(*self.file_tree.get_children())
@@ -2080,9 +2134,10 @@ class UniversalApp(ctk.CTk):
             text="Salvar",
             width=80,
             height=28,
-            fg_color=THEME["success"],
-            hover_color="#24965a",
-            border_color="#63d99b",
+            fg_color="#16835f",
+            hover_color="#1f9d73",
+            border_color="#2fc28f",
+            text_color="#f4fff9",
             command=lambda p=str(path), t=tab_name: self.save_file(p, t),
         )
         save_button.elevation_shadow.grid(row=0, column=0, padx=4)

@@ -1,15 +1,15 @@
 @echo off
 chcp 65001 >nul
-title GERENCIAMENTO
+title INICIALIZACAO
 color 02
 cls
 
 echo =======================================================
-echo          SISTEMA DE GESTAO
+echo          MEROTEC IA
 echo =======================================================
 echo [SISTEMA] Iniciando processos locais...
 
-:: Navega ate o diretorio do projeto
+:: Navega ate o diretorio do projeto, troque pelo seu diretorio atual
 cd /d "C:\Users\Merotec\Desktop\AI_Software_Enginering"
 
 :: 2. Ativa o ambiente virtual e inicia a IDE
@@ -34,11 +34,11 @@ echo [IA] Codex usa a conta ja logada no Windows.
 echo.
 echo ********************************************************
 echo.
-echo [SISTEMA] executando sistema de gerenciamento...
+echo [SISTEMA] executando sistema...
 :: Inicia o script principal
 echo.
 python main.py
 echo [SISTEMA] sistema de gerenciamento interrompido!
 
-:: Mantem o terminal aberto e pronto para novos comandos
-cmd /k
+:: Encerra a interface atual apos o sistema finalizar
+exit

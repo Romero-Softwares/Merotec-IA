@@ -1,10 +1,16 @@
-openai
-customtkinter~=5.2.2
-Pygments~=2.19.2
-speechrecognition~=3.14.5
-pyttsx3~=2.99
-pipwin
-sounddevice~=0.5.5
-scipy~=1.17.1
-numpy~=2.4.2
-protobuf~=5.29.6
+customtkinter==5.2.2
+google-genai==2.0.1
+numpy==2.4.4
+Pillow==12.2.0
+Pygments==2.20.0
+pyttsx3==2.99
+scipy==1.17.1
+sounddevice==0.5.5
+SpeechRecognition==3.16.1
+
+# Compatibilidade de voz/audio no Windows e em Python 3.13+
+audioop-lts==0.2.2; python_version >= "3.13"
+comtypes==1.4.16; platform_system == "Windows"
+pywin32==311; platform_system == "Windows"
+standard-aifc==3.13.0; python_version >= "3.13"
+standard-chunk==3.13.0; python_version >= "3.13"

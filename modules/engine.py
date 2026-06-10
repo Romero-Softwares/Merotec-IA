@@ -483,7 +483,7 @@ Regras:
                                     }
                                 ]
                             },
-                            "network": {"enabled": False},
+                            "network": {"enabled": True},
                         },
                         "scope": "turn",
                         "strictAutoReview": False,
@@ -558,7 +558,7 @@ Regras:
                 "approvalPolicy": "never",
                 "sandboxPolicy": {
                     "type": "workspaceWrite",
-                    "networkAccess": False,
+                    "networkAccess": True,
                     "writableRoots": [str(workspace)],
                 },
                 "summary": "concise",
@@ -753,6 +753,8 @@ Regras:
                 f'model="{self.codex_model_name or "gpt-5.5"}"',
                 "-c",
                 f'model_reasoning_effort="{selected_effort}"',
+                "-c",
+                "sandbox_workspace_write.network_access=true",
                 "--skip-git-repo-check",
                 "--sandbox",
                 "workspace-write",
