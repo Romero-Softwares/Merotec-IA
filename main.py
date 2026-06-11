@@ -108,6 +108,26 @@ from modules.workspace_intelligence import WorkspaceIntelligenceMixin
 from modules.voice import VoiceModule
 
 
+MAIN_WINDOW_TITLE = f"{APP_NAME} - IA Engineering Workspace"
+
+
+def _activate_existing_instance():
+    if sys.platform != "win32":
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.FindWindowW(None, MAIN_WINDOW_TITLE)
+        if not hwnd:
+            return False
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
+
 class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, AgentActionsMixin, ctk.CTk):
     def __init__(self):
         try:
@@ -119,7 +139,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
-        self.title(f"{APP_NAME} - IA Engineering Workspace")
+        self.title(MAIN_WINDOW_TITLE)
         self.geometry("1280x780")
         self.minsize(1050, 660)
         self.configure(fg_color=THEME["bg"])
@@ -464,14 +484,12 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
         audio = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         audio.grid(row=11, column=0, sticky="ew", padx=16)
-        audio.grid_columnconfigure((0, 1, 2), weight=1)
+        audio.grid_columnconfigure((0, 1), weight=1)
 
         listen_button = self._elevated_button(audio, text="Ouvir", width=58, height=32, command=self.play_last_response)
-        pause_button = self._elevated_button(audio, text="Pausar", width=58, height=32, command=self.voice.pause)
-        resume_button = self._elevated_button(audio, text="Voltar", width=58, height=32, command=self.voice.resume)
+        stop_button = self._elevated_button(audio, text="Parar", width=58, height=32, command=self.stop_audio_playback)
         listen_button.elevation_shadow.grid(row=0, column=0, sticky="ew", padx=2)
-        pause_button.elevation_shadow.grid(row=0, column=1, sticky="ew", padx=2)
-        resume_button.elevation_shadow.grid(row=0, column=2, sticky="ew", padx=2)
+        stop_button.elevation_shadow.grid(row=0, column=1, sticky="ew", padx=2)
 
         self.sidebar.grid_rowconfigure(12, weight=1)
         self.agent_summary = ctk.CTkTextbox(
@@ -1809,6 +1827,21 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         if not command:
             return
         self.local_term_in.delete(0, "end")
+        if self.is_placeholder_command(command):
+            self.append_to_term(
+                "\n[erro] Digite um comando real. Reticencias ou texto como 'como administrador' nao sao executaveis.\n"
+            )
+            self.log_agent("Comando local recusado: placeholder.")
+            return
+        if self.is_admin_execute_request(command):
+            admin_command = self.clean_admin_command(command)
+            self._agent_execute_admin(
+                admin_command,
+                task_objective=admin_command,
+                requester="O terminal local",
+                terminal_source="via terminal local como administrador",
+            )
+            return
         self.append_to_term(f"\n{self.current_workspace}> {command}\n")
         self.log_agent(f"Comando local executado: {command}")
         self.set_terminal_busy(True, f"Executando comando local: {command[:70]}")
@@ -1823,10 +1856,19 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     cwd=self.current_workspace,
                 )
                 self.register_terminal_process(process, command)
-                self.stream_process_output(process)
+                output = self.stream_process_output(process, collect=True)
                 process.wait(timeout=120)
                 if process.returncode != 0:
                     self.append_to_term(f"\n[processo finalizado com codigo {process.returncode}]\n")
+                    if self.command_output_requires_admin(output):
+                        self.append_to_term("[permissao] comando requer administrador; solicitando autorizacao do usuario.\n")
+                        self._agent_execute_admin(
+                            command,
+                            task_objective=command,
+                            requester="O terminal local",
+                            terminal_source="via terminal local como administrador",
+                        )
+                        return
             except subprocess.TimeoutExpired:
                 self.append_to_term("[aviso] comando ainda em execucao ou demorou demais.\n")
             except Exception as exc:
@@ -2018,7 +2060,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 self.ai_live_trace_last_log_at == 0
                 or now - self.ai_live_trace_last_log_at >= 1.25
                 or current_length - self.ai_live_trace_last_length >= 360
-                or bool(re.search(r"\[(READ|WRITE|REPLACE|EXECUTE|OPEN_URL|SCREENSHOT|HUMAN_TEST|SEARCH_TEXT|SCAN_TEXT|UNDO)\s*:", chunk, re.IGNORECASE))
+                or bool(re.search(r"\[(READ|WRITE|REPLACE|EXECUTE|EXECUTE_ADMIN|OPEN_URL|SCREENSHOT|HUMAN_TEST|SEARCH_TEXT|SCAN_TEXT|UNDO)\s*:", chunk, re.IGNORECASE))
             )
             if not should_log:
                 self.update_ai_activity_from_stream(chunk)
@@ -2054,7 +2096,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
     def describe_live_ai_trace(self, trace, chunk):
         action_matches = re.findall(
-            r"\[(READ|WRITE|REPLACE|SEARCH_TEXT|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|OPEN_URL|SCREENSHOT|HUMAN_TEST)\s*:\s*([^\]]*)\]",
+            r"\[(READ|WRITE|REPLACE|SEARCH_TEXT|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|EXECUTE_ADMIN|OPEN_URL|SCREENSHOT|HUMAN_TEST)\s*:\s*([^\]]*)\]",
             trace or "",
             re.IGNORECASE,
         )
@@ -2070,6 +2112,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 "FIX_MOJIBAKE": "pediu correcao de texto",
                 "UNDO": "pediu desfazer",
                 "EXECUTE": "pediu execucao",
+                "EXECUTE_ADMIN": "pediu administrador",
                 "OPEN_URL": "pediu abertura",
                 "SCREENSHOT": "pediu print",
                 "HUMAN_TEST": "pediu teste visual",
@@ -2085,7 +2128,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         normalized = self.normalize_plain_text(text or "")
         if re.search(r"\[(write|replace|fix_mojibake|undo)\s*:", normalized):
             self.set_ai_activity("IA preparando alteracao")
-        elif re.search(r"\[(execute|open_url|screenshot|human_test)\s*:", normalized):
+        elif re.search(r"\[(execute|execute_admin|open_url|screenshot|human_test)\s*:", normalized):
             self.set_ai_activity("IA preparando validacao")
         elif re.search(r"\[(read|search_text|scan_text)\s*:", normalized):
             self.set_ai_activity("IA pedindo contexto")
@@ -2823,6 +2866,176 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
         self.after(0, run_on_ui)
 
+    def ask_codex_app_server_approval(self, method, params, workspace):
+        is_command_request = self.is_codex_command_approval_method(method)
+        command = self.extract_codex_app_server_command(params) if is_command_request else ""
+        if is_command_request and (not command or self.is_placeholder_command(command)):
+            reason = "sem comando extraivel" if not command else "comando placeholder"
+            self.log_agent(f"Permissao app-server negada: {reason} em {method}.")
+            self.add_chat_message(
+                "Erro",
+                "A IDE recusou um pedido do Codex app-server com comando vazio ou demonstrativo.",
+            )
+            self.add_chat_message(
+                "Sistema",
+                "Use um comando real. Para administrador, envie uma tag EXECUTE_ADMIN ja preenchida, por exemplo [EXECUTE_ADMIN: whoami /groups].",
+            )
+            return False
+
+        action = self.describe_codex_app_server_approval(method)
+        details = self.format_codex_app_server_approval(method, params, workspace)
+        title = "Autorizar acao do Codex?"
+        admin_notice = ""
+        if command and self.is_admin_execute_request(command):
+            admin_notice = (
+                "\n\nEste comando menciona administrador. A autorizacao da IDE libera o pedido do Codex, "
+                "mas elevacao real no Windows ainda depende do UAC. Para elevacao controlada pela IDE, "
+                "prefira uma tag EXECUTE_ADMIN ja preenchida, por exemplo [EXECUTE_ADMIN: whoami /groups]."
+            )
+        message = (
+            f"O Codex app-server pediu permissao para {action}.\n\n"
+            f"{details}\n\n"
+            "Autorizar esta acao pela IDE?"
+            f"{admin_notice}"
+        )
+        result_queue = queue.Queue(maxsize=1)
+
+        def ask():
+            try:
+                self.set_status("Aguardando autorizacao do usuario...", "busy")
+                approved = bool(messagebox.askyesno(title, message))
+                if approved:
+                    self.log_agent(f"Permissao app-server aprovada: {method}")
+                    self.add_chat_message("Sistema", f"Permissao aprovada para {action}.")
+                else:
+                    self.log_agent(f"Permissao app-server negada: {method}")
+                    self.add_chat_message("Sistema", f"Permissao negada para {action}.")
+                result_queue.put(approved)
+            except Exception as exc:
+                result_queue.put(exc)
+
+        if threading.current_thread() is threading.main_thread():
+            ask()
+        else:
+            self.after(0, ask)
+
+        result = result_queue.get()
+        if isinstance(result, Exception):
+            raise result
+        return bool(result)
+
+    def is_codex_command_approval_method(self, method):
+        normalized = self.normalize_plain_text(method or "")
+        return "command" in normalized or "exec" in normalized
+
+    def describe_codex_app_server_approval(self, method):
+        normalized = self.normalize_plain_text(method or "")
+        if self.is_codex_command_approval_method(method):
+            return "executar um comando"
+        if "permission" in normalized or "permissions" in normalized:
+            return "ampliar permissoes do app-server"
+        if "file" in normalized or "patch" in normalized:
+            return "alterar arquivos"
+        return "continuar uma acao restrita"
+
+    def format_codex_app_server_approval(self, method, params, workspace):
+        lines = [f"Metodo: {method}", f"Workspace: {workspace}"]
+        command = self.extract_codex_app_server_command(params)
+        if command:
+            lines.append(f"Comando:\n{command}")
+        else:
+            details = json.dumps(params or {}, ensure_ascii=False, indent=2)
+            if len(details) > 1800:
+                details = details[:1800].rstrip() + "\n..."
+            lines.append(f"Detalhes:\n{details}")
+        return "\n\n".join(lines)
+
+    def extract_codex_app_server_command(self, value, depth=0):
+        if depth > 5:
+            return ""
+        if isinstance(value, dict):
+            executable_keys = (
+                "program",
+                "executable",
+                "filePath",
+                "file_path",
+                "binary",
+                "shell",
+            )
+            argument_keys = (
+                "argv",
+                "args",
+                "arguments",
+                "argList",
+                "argumentList",
+                "argument_list",
+            )
+            executable = next(
+                (
+                    value[key]
+                    for key in executable_keys
+                    if key in value and value[key] not in (None, "", False)
+                ),
+                None,
+            )
+            arguments = next(
+                (
+                    value[key]
+                    for key in argument_keys
+                    if key in value and value[key] not in (None, "", [])
+                ),
+                None,
+            )
+            if executable is not None and arguments is not None:
+                command_parts = [
+                    self.compact_codex_approval_value(executable),
+                    self.compact_codex_approval_value(arguments),
+                ]
+                return " ".join(part for part in command_parts if part).strip()
+
+            preferred_keys = (
+                "command",
+                "commandLine",
+                "command_line",
+                "cmdLine",
+                "cmdline",
+                "cmd",
+                "shellCommand",
+                "shell_command",
+                "script",
+                "argv",
+                "args",
+                "arguments",
+                "argList",
+                "argumentList",
+                "argument_list",
+            )
+            for key in preferred_keys:
+                if key in value:
+                    nested_value = value[key]
+                    if isinstance(nested_value, dict):
+                        found = self.extract_codex_app_server_command(nested_value, depth + 1)
+                        if found:
+                            return found
+                    return self.compact_codex_approval_value(nested_value)
+            for nested in value.values():
+                found = self.extract_codex_app_server_command(nested, depth + 1)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for nested in value:
+                found = self.extract_codex_app_server_command(nested, depth + 1)
+                if found:
+                    return found
+        return ""
+
+    def compact_codex_approval_value(self, value):
+        if isinstance(value, list):
+            return " ".join(str(part) for part in value)
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return str(value)
+
     def _run_ai_task(self, command, image_path=None, extra_context=None, task_objective=None, action_depth=0, task_id=None):
         def process():
             retry_available = False
@@ -2892,7 +3105,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     "- Se afirmar que alterou, executou ou validou, garanta que houve acao real da IDE ou mudanca direta detectavel no workspace.\n"
                     "- Leia o contexto necessario sem entrar em loop; prefira agir quando ja houver informacao suficiente.\n"
                     "- Preserve a estrutura existente e faca alteracoes pequenas quando o projeto ja funciona.\n"
-                    "- Depois de editar, valide com [EXECUTE], [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST] quando isso for util.\n\n"
+                    "- Depois de editar, valide com uma tag EXECUTE/EXECUTE_ADMIN ja preenchida, [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST] quando isso for util.\n\n"
                     "Continue essa missao de forma autonoma. "
                     "Atue como especialista senior em desenvolvimento de sistemas, apps e jogos: diagnostique, implemente, valide e corrija ate resolver. "
                     "Se precisar de arquivo, use [READ]; o conteudo retornado pela IDE passa a ser sua memoria de trabalho. "
@@ -2901,7 +3114,10 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     "Nao desvie uma tarefa de interface, logica, camera, build ou execucao para mojibake. "
                     "Se souber a mudanca completa, use [WRITE]. "
                     "Se souber apenas um trecho a trocar, use [REPLACE]. "
-                    "Se precisar rodar, use [EXECUTE]. "
+                    "Se precisar rodar, use uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: python -m unittest]. "
+                    "Se o comando realmente exigir administrador no Windows, use uma tag EXECUTE_ADMIN ja preenchida, por exemplo [EXECUTE_ADMIN: whoami /groups]; nao escreva 'como administrador' dentro do comando. "
+                    "Nunca use reticencias, 'comando', 'comando real', texto entre sinais de menor/maior ou qualquer texto demonstrativo como se fosse comando real. "
+                    "Nunca copie literalmente 'comando concreto' nas tags [EXECUTE] ou [EXECUTE_ADMIN]; se ainda nao houver comando real, entregue uma conclusao em texto. "
                     "Para testar projeto HTML/Web, use [EXECUTE: python -m http.server 8000]; a IDE troca pelo Python real, escolhe porta livre e valida a URL. "
                     "Para abrir uma pagina validada, use [OPEN_URL: http://127.0.0.1:porta/]. "
                     "Para validar visualmente um app/jogo como usuario, use [HUMAN_TEST: auto]; a IDE executa, abre, espera a tela, captura print e devolve a imagem para voce analisar. "
@@ -2909,7 +3125,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     "Depois de analisar o print, corrija com [REPLACE] ou [WRITE] e teste novamente ate funcionar. "
                     "Para arquivo grande, prefira [READ: arquivo] uma vez; a IDE fara uma varredura completa e entregara um mapa do arquivo. "
                     "Entenda a estrutura antes de editar, mas nao fique repetindo leituras do mesmo arquivo. "
-                    "Em tarefa grande, faca no maximo algumas leituras estrategicas; depois aja com [REPLACE], [WRITE], [EXECUTE], [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST]. "
+                    "Em tarefa grande, faca no maximo algumas leituras estrategicas; depois aja com [REPLACE], [WRITE], uma tag EXECUTE/EXECUTE_ADMIN ja preenchida, [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST]. "
                     "Evite narrar intencoes vazias; avance com leitura, alteracao, validacao ou uma conclusao clara. "
                     "Nao peca o objetivo novamente enquanto houver uma missao ativa.\n\n"
                     f"Alteracoes recentes feitas pela IDE neste projeto:\n{self.format_recent_changes_for_agent(limit=8)}\n\n"
@@ -2926,6 +3142,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     code_context=context,
                     stream_callback=on_stream,
                     workspace_path=self.current_workspace,
+                    approval_callback=self.ask_codex_app_server_approval,
                 )
                 streamed_joined = "".join(streamed_text)
                 if self.is_task_cancelled(current_task_id):
@@ -3029,13 +3246,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
     def response_has_agent_action(self, text):
         if not text:
             return False
-        return bool(
-            re.search(
-                r"\[(WRITE|REPLACE|READ|SEARCH_TEXT|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|OPEN_URL|SCREENSHOT|HUMAN_TEST)\s*:",
-                text,
-                re.IGNORECASE,
-            )
-        )
+        return bool(self.extract_agent_action_names(text))
 
     def strip_agent_action_markup(self, text):
         if not text:
@@ -3048,16 +3259,10 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         for pattern in block_patterns:
             cleaned = re.sub(pattern, "", cleaned, flags=re.DOTALL | re.IGNORECASE)
         cleaned = re.sub(
-            r"^\s*\[(READ|SEARCH_TEXT|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|OPEN_URL|SCREENSHOT|HUMAN_TEST)\s*:[^\]]+\]\s*$",
+            r"^[ \t]*\[(READ|SEARCH_TEXT|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|EXECUTE_ADMIN|OPEN_URL|SCREENSHOT|HUMAN_TEST)[ \t]*:[^\]\r\n]+\][ \t]*$",
             "",
             cleaned,
             flags=re.IGNORECASE | re.MULTILINE,
-        )
-        cleaned = re.sub(
-            r"\[(READ|SEARCH_TEXT|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|OPEN_URL|SCREENSHOT|HUMAN_TEST)\s*:[^\]]+\]",
-            "",
-            cleaned,
-            flags=re.IGNORECASE,
         )
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
         return cleaned
@@ -3065,17 +3270,10 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
     def action_execution_message(self, text):
         if not text:
             return ""
-        tags = {
-            match.group(1).upper()
-            for match in re.finditer(
-                r"\[(WRITE|REPLACE|READ|SEARCH_TEXT|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|OPEN_URL|SCREENSHOT|HUMAN_TEST)\s*:",
-                text,
-                re.IGNORECASE,
-            )
-        }
+        tags = self.extract_agent_action_names(text)
         if tags & {"WRITE", "REPLACE", "FIX_MOJIBAKE", "UNDO"}:
             return "A IDE recebeu uma alteracao real e iniciou a aplicacao no projeto."
-        if tags & {"EXECUTE", "OPEN_URL", "SCREENSHOT", "HUMAN_TEST"}:
+        if tags & {"EXECUTE", "EXECUTE_ADMIN", "OPEN_URL", "SCREENSHOT", "HUMAN_TEST"}:
             return "A IDE recebeu uma execucao real e iniciou a validacao."
         if tags & {"READ", "SEARCH_TEXT", "SCAN_TEXT"}:
             return "A IDE esta coletando contexto objetivo para executar o proximo passo."
@@ -3097,7 +3295,23 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             "Nao repita o mesmo comando antes de mudar a causa provavel.",
         ]
 
-        if "generated_plugin_registrant.h" in text and ("c1083" in normalized or "no such file" in normalized):
+        if self.command_output_is_placeholder_error(command, text):
+            layer = "Comando placeholder"
+            likely_cause = "Foi executado texto incompleto ou descritivo em vez de um comando real."
+            guidance.extend([
+                "Nao repita esse comando.",
+                "Use EXECUTE_ADMIN somente com comando real ja preenchido, por exemplo [EXECUTE_ADMIN: whoami /groups].",
+                "Se ainda nao existe comando real para rodar, entregue uma conclusao direta ao usuario.",
+            ])
+        elif self.command_output_requires_admin(text):
+            layer = "Permissao / UAC do Windows"
+            likely_cause = "O comando tentou uma operacao que exige privilegios de administrador."
+            guidance.extend([
+                "A IDE pode pedir autorizacao do usuario com uma tag EXECUTE_ADMIN ja preenchida, por exemplo [EXECUTE_ADMIN: whoami /groups].",
+                "Nao execute reticencias nem escreva 'como administrador' dentro de [EXECUTE].",
+                "Se o usuario negar o UAC, entregue uma alternativa sem administrador ou explique o bloqueio.",
+            ])
+        elif "generated_plugin_registrant.h" in text and ("c1083" in normalized or "no such file" in normalized):
             layer = "Flutter Windows / C++ include"
             likely_cause = (
                 "O arquivo gerado existe ou deveria existir em windows/flutter, "
@@ -3171,7 +3385,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
     def command_failure_signature(self, command, output):
         lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
         important = []
-        markers = ("error", "erro", "fatal", "exception", "lnk", "c1083", "failed")
+        markers = ("error", "erro", "fatal", "exception", "lnk", "c1083", "failed", "denied", "negado", "elevation")
         for line in lines:
             lower = line.lower()
             if any(marker in lower for marker in markers):
@@ -3250,6 +3464,10 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         text = self.last_response.split("```")[0].strip()
         self.voice.speak(text[:3500])
 
+    def stop_audio_playback(self):
+        self.voice.stop()
+        self.set_status("Leitura de audio parada.", "ready")
+
     def upload_and_update_code(self):
         file_path = filedialog.askopenfilename(
             initialdir=self.current_workspace,
@@ -3304,5 +3522,6 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
 
 if __name__ == "__main__":
-    app = UniversalApp()
-    app.mainloop()
+    if not _activate_existing_instance():
+        app = UniversalApp()
+        app.mainloop()

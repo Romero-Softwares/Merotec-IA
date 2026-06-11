@@ -3,6 +3,7 @@ import json
 import mimetypes
 import os
 import queue
+import re
 import shutil
 import subprocess
 import tempfile
@@ -159,7 +160,8 @@ Voce pode solicitar acoes da IDE usando tags especiais:
 [SEARCH_TEXT: padrao | caminho/arquivo.py] para a IDE buscar termos ou regex em arquivo sem usar terminal.
 [SCAN_TEXT: caminho/arquivo.py] para a IDE localizar caracteres corrompidos/mojibake e problemas de texto sem usar terminal.
 [FIX_MOJIBAKE: caminho/arquivo.py] para a IDE corrigir mojibake comum com backup automatico.
-[EXECUTE: comando] para rodar comando no terminal do workspace.
+Para rodar terminal, envie uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: python -m unittest].
+Para administrador no Windows, envie uma tag EXECUTE_ADMIN ja preenchida, por exemplo [EXECUTE_ADMIN: whoami /groups].
 [OPEN_URL: http://127.0.0.1:porta/] para abrir uma URL local validada.
 [SCREENSHOT: tela] para capturar a tela atual e devolver a imagem para analise.
 [HUMAN_TEST: auto] para a IDE executar/abrir o app ou jogo, esperar a tela, capturar print real e devolver para analise visual.
@@ -171,11 +173,11 @@ Regras:
 - Ciclo obrigatorio: entender a missao, escolher poucos arquivos relevantes, aplicar alteracao quando pedida, validar com comando/print quando possivel e fechar com resumo objetivo.
 - Se a pergunta for simples e nao exigir projeto, responda diretamente sem tags.
 - Se a missao for analise/planejamento, entregue diagnostico completo em texto; nao transforme analise em execucao ou edicao.
-- Se a missao for implementacao/correcao, nao pare em "vou fazer"; use [READ], [REPLACE], [WRITE] e [EXECUTE] ate haver resultado verificavel.
+- Se a missao for implementacao/correcao, nao pare em "vou fazer"; use [READ], [REPLACE], [WRITE] e uma tag EXECUTE com comando real ate haver resultado verificavel.
 - Se for usar uma tag, responda com a tag diretamente. Nao escreva "vou", "irei" ou "preciso" antes da tag.
 - Texto de intencao sem acao sera ignorado pela IDE. Acao real ou conclusao final sao as unicas saidas validas.
 - Nunca diga que corrigiu, aplicou, alterou, rodou, testou ou validou sem enviar a tag real que faz isso.
-- Correcao so conta com [REPLACE], [WRITE], [FIX_MOJIBAKE] ou [UNDO]; validacao so conta com [EXECUTE], [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST].
+- Correcao so conta com [REPLACE], [WRITE], [FIX_MOJIBAKE] ou [UNDO]; validacao so conta com uma tag EXECUTE/EXECUTE_ADMIN ja preenchida, [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST].
 - Para projeto grande, use o mapa do workspace, arquivos-chave e buscas pontuais. Nao tente ler tudo em sequencia.
 - Depois de 2 ou 3 leituras estrategicas, tome decisao: editar, testar, abrir, capturar print ou concluir.
 - Se a IDE avisar que substituiu leitura em massa por mapa do projeto, use o mapa e entregue resultado; nao peca nova lista de arquivos.
@@ -187,23 +189,27 @@ Regras:
 - Nao revele raciocinio interno detalhado; mostre apenas a decisao, a acao e o resultado.
 - Use apenas caminhos relativos ao workspace, como `app.py`, `src/main.py` ou `style.css`.
 - Nunca use caminhos absolutos como `C:/...`.
-- Use os recursos da IDE por tags. Nao execute comandos diretamente pelo app-server quando puder usar [EXECUTE].
+- Use os recursos da IDE por tags. Nao execute comandos diretamente pelo app-server quando puder usar uma tag EXECUTE ja preenchida.
 - Terminal e apenas ferramenta de validacao/inspecao. Para corrigir problema, primeiro leia/altere arquivos com [READ]/[WRITE].
-- Nunca edite arquivos usando [EXECUTE] com PowerShell, Set-Content, -replace, redirecionamento, sed ou comandos parecidos. Edicao de arquivo deve ser sempre [WRITE] ou [REPLACE].
+- Nunca edite arquivos usando EXECUTE com PowerShell, Set-Content, -replace, redirecionamento, sed ou comandos parecidos. Edicao de arquivo deve ser sempre [WRITE] ou [REPLACE].
 - Para alterar um trecho pequeno de arquivo grande, prefira [REPLACE] com o trecho OLD exatamente como foi lido pela IDE.
 - Para procurar caracteres corrompidos, mojibake ou texto quebrado, use [SCAN_TEXT], nao Select-String, rg, grep, findstr nem python -c.
 - Para verificar se existe uma funcao, recurso, variavel, termo ou logica no arquivo, use [SEARCH_TEXT: padrao | arquivo], nao terminal.
 - Depois de receber resultado de SEARCH_TEXT para uma pergunta simples de verificacao, responda a conclusao; nao faca novas buscas parecidas.
 - Quando a varredura indicar mojibake comum, use [FIX_MOJIBAKE] antes de validar.
-- Para build, run, testes, iniciar servidor ou abrir app sem necessidade visual, responda com [EXECUTE: comando].
+- Para build, run, testes, iniciar servidor ou abrir app sem necessidade visual, responda com uma tag EXECUTE contendo o comando real.
+- Para comandos que realmente exigem administrador no Windows, responda com uma tag EXECUTE_ADMIN contendo o comando real. Nao escreva "como administrador" dentro de [EXECUTE].
+- Nunca use reticencias, "comando", "comando real", texto entre sinais de menor/maior ou qualquer texto demonstrativo como se fosse comando real.
+- Nunca copie literalmente `comando concreto` nas tags [EXECUTE] ou [EXECUTE_ADMIN]; se ainda nao houver comando real, entregue uma conclusao em texto.
+- Nunca chame terminal, ferramenta de shell ou app-server com comando `...`, `comando`, `como administrador`, `--admin` ou outro placeholder; se nao houver comando real, entregue uma conclusao final.
 - Para testar como usuario, validar tela, jogo, layout, print, fluxo visual ou "teste real", responda com [HUMAN_TEST: auto] em vez de ficar lendo arquivos.
 - Para apps Flutter, `flutter run -d windows` ja faz build antes de executar no Windows.
-- Para comandos que podem ficar rodando, como `flutter run`, `npm run dev` ou servidores locais, use [EXECUTE] e finalize sua resposta; a IDE mantem o terminal aberto.
+- Para comandos que podem ficar rodando, como `flutter run`, `npm run dev` ou servidores locais, use uma tag EXECUTE com o comando real e finalize sua resposta; a IDE mantem o terminal aberto.
 - Se um comando falhar, nao repita o mesmo comando antes de aplicar [WRITE] em pelo menos um arquivo suspeito ou ler um arquivo novo que explique a falha.
 - Antes de alterar arquivo que voce ainda nao leu, use apenas [READ: caminho].
 - Se a IDE informar que o arquivo e grande, use o indice recebido e peca intervalos com [READ: arquivo | linhas inicio-fim] ate ter contexto suficiente.
 - Nunca tente reescrever um arquivo grande inteiro usando apenas o resumo; primeiro leia os intervalos exatos que serao alterados.
-- Se a IDE informar "Leitura bloqueada para evitar ciclo infinito", pare de pedir READ desse arquivo e avance com [WRITE], [EXECUTE] ou uma conclusao objetiva.
+- Se a IDE informar "Leitura bloqueada para evitar ciclo infinito", pare de pedir READ desse arquivo e avance com [WRITE], uma tag EXECUTE com comando real ou uma conclusao objetiva.
 - Para arquivos grandes em uma unica pagina, como HTML com CSS/JS embutidos, apos mapear cabecalho, estilos, estado principal e loop/renderizacao, pare de ler e execute a alteracao pedida.
 - Prefira alteracoes pequenas, claras e verificaveis.
 - Explique o resultado em portugues direto, sem enrolar.
@@ -252,7 +258,15 @@ Regras:
         except Exception:
             return None
 
-    def generate_solution(self, prompt, image_path=None, code_context=None, stream_callback=None, workspace_path=None):
+    def generate_solution(
+        self,
+        prompt,
+        image_path=None,
+        code_context=None,
+        stream_callback=None,
+        workspace_path=None,
+        approval_callback=None,
+    ):
         self.cancel_requested = False
         if self.provider == "codex":
             return self._generate_codex_solution(
@@ -261,12 +275,21 @@ Regras:
                 code_context,
                 stream_callback=stream_callback,
                 workspace_path=workspace_path,
+                approval_callback=approval_callback,
             )
         if self.provider == "openai":
             return self._generate_openai_solution(prompt, image_path, code_context)
         return self._generate_google_solution(prompt, image_path, code_context)
 
-    def _generate_codex_solution(self, prompt, image_path=None, code_context=None, stream_callback=None, workspace_path=None):
+    def _generate_codex_solution(
+        self,
+        prompt,
+        image_path=None,
+        code_context=None,
+        stream_callback=None,
+        workspace_path=None,
+        approval_callback=None,
+    ):
         executable = self._find_codex_executable()
         if not executable:
             return (
@@ -288,6 +311,7 @@ Regras:
                 stream_callback=stream_callback,
                 reasoning_effort=effort,
                 workspace_path=workspace_path,
+                approval_callback=approval_callback,
             )
             if app_server_response:
                 if self._is_capacity_message(app_server_response):
@@ -299,6 +323,7 @@ Regras:
                         stream_callback=stream_callback,
                         reasoning_effort=effort,
                         workspace_path=workspace_path,
+                        approval_callback=approval_callback,
                     )
                     if fallback_response:
                         return fallback_response
@@ -327,7 +352,17 @@ Regras:
                 efforts.append(effort)
         return efforts
 
-    def _try_codex_fallback_models(self, executable, prompt, image_path=None, code_context=None, stream_callback=None, reasoning_effort=None, workspace_path=None):
+    def _try_codex_fallback_models(
+        self,
+        executable,
+        prompt,
+        image_path=None,
+        code_context=None,
+        stream_callback=None,
+        reasoning_effort=None,
+        workspace_path=None,
+        approval_callback=None,
+    ):
         fallback_models = ["gpt-5.4-mini", "gpt-5.3-codex-spark"]
         requested = self.codex_model_name.strip()
         for model in fallback_models:
@@ -342,6 +377,7 @@ Regras:
                 stream_callback=stream_callback,
                 reasoning_effort=reasoning_effort,
                 workspace_path=workspace_path,
+                approval_callback=approval_callback,
             )
             if response and not self._is_capacity_message(response) and not self._is_codex_error_message(response):
                 return f"[Codex alternativo: {model}]\n\n{response}"
@@ -381,6 +417,7 @@ Regras:
         stream_callback=None,
         reasoning_effort=None,
         workspace_path=None,
+        approval_callback=None,
     ):
         workspace = Path(workspace_path).resolve() if workspace_path else Path.cwd()
         selected_model = model_override or self.codex_model_name or "gpt-5.5"
@@ -392,12 +429,15 @@ Regras:
             "Responda com resultado final ou acao real. Nao escreva promessas como 'vou fazer' antes de executar.\n"
             "Se for usar uma tag da IDE, envie a tag diretamente, sem texto narrando intencao antes dela.\n"
             "Prefira acionar os recursos da IDE por tags quando isso for suficiente, pois a IDE mostra essas acoes ao usuario.\n"
-            "Use [READ], [WRITE], [REPLACE], [SEARCH_TEXT], [SCAN_TEXT], [FIX_MOJIBAKE], [EXECUTE], [OPEN_URL], [SCREENSHOT], [HUMAN_TEST] e [UNDO].\n"
+            "Use [READ], [WRITE], [REPLACE], [SEARCH_TEXT], [SCAN_TEXT], [FIX_MOJIBAKE], tags EXECUTE/EXECUTE_ADMIN ja preenchidas, [OPEN_URL], [SCREENSHOT], [HUMAN_TEST] e [UNDO].\n"
             "Se as tags da IDE estiverem limitando a conclusao da tarefa e o app-server disponibilizar ferramentas diretas, voce pode agir diretamente no workspace como Codex, mantendo as mudancas dentro da pasta do projeto e relatando o que fez.\n"
             "Quando a tarefa for correcao/alteracao, priorize [READ], [SEARCH_TEXT], [SCAN_TEXT], [FIX_MOJIBAKE], [REPLACE] e [WRITE]. "
-            "Use [EXECUTE] para validar depois da correcao ou quando o pedido for apenas rodar/iniciar; use [HUMAN_TEST: auto] quando precisar abrir, capturar print e avaliar a tela como usuario.\n"
+            "Use uma tag EXECUTE com comando real para validar depois da correcao ou quando o pedido for apenas rodar/iniciar; use EXECUTE_ADMIN com comando real somente quando precisar UAC/administrador no Windows; use [HUMAN_TEST: auto] quando precisar abrir, capturar print e avaliar a tela como usuario.\n"
+            "Nunca use reticencias, 'comando', 'comando real', texto entre sinais de menor/maior ou qualquer texto demonstrativo como se fosse comando real.\n"
+            "Nunca copie literalmente 'comando concreto' nas tags [EXECUTE] ou [EXECUTE_ADMIN]; se ainda nao houver comando real, entregue uma conclusao em texto.\n"
+            "Nunca chame terminal, ferramenta de shell ou app-server com comando `...`, `comando`, `como administrador`, `--admin` ou outro placeholder; se nao houver comando real, entregue uma conclusao final.\n"
             "Nunca diga que corrigiu, aplicou, alterou, rodou, testou ou validou sem uma acao real: "
-            "[REPLACE]/[WRITE] para mudar arquivo, [EXECUTE] para rodar, [HUMAN_TEST] quando precisar testar visualmente como usuario, [OPEN_URL]/[SCREENSHOT] quando a tela ja estiver aberta.\n\n"
+            "[REPLACE]/[WRITE] para mudar arquivo, EXECUTE com comando real para rodar, EXECUTE_ADMIN com comando real para pedir permissao de administrador, [HUMAN_TEST] quando precisar testar visualmente como usuario, [OPEN_URL]/[SCREENSHOT] quando a tela ja estiver aberta.\n\n"
             f"{self._message_payload(prompt, code_context)}"
         )
 
@@ -459,18 +499,44 @@ Regras:
             process.stdin.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
             process.stdin.flush()
 
+        def ask_approval(method, params):
+            if approval_callback is None:
+                return True
+            try:
+                return bool(approval_callback(method, params or {}, str(workspace)))
+            except Exception:
+                return False
+
         def handle_server_request(message):
             request_id = message.get("id")
             method = message.get("method", "")
+            params = message.get("params") or {}
             if request_id is None or not method:
                 return False
             if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
-                respond(request_id, {"decision": "acceptForSession"})
+                approved = False if self._app_server_message_has_placeholder_command(method, params) else ask_approval(method, params)
+                decision = "acceptForSession" if approved else "reject"
+                respond(request_id, {"decision": decision})
                 return True
             if method in {"execCommandApproval", "applyPatchApproval"}:
-                respond(request_id, {"decision": "approved_for_session"})
+                approved = False if self._app_server_message_has_placeholder_command(method, params) else ask_approval(method, params)
+                decision = "approved_for_session" if approved else "denied"
+                respond(request_id, {"decision": decision})
                 return True
             if method == "item/permissions/requestApproval":
+                if not ask_approval(method, params):
+                    respond(
+                        request_id,
+                        {
+                            "permissions": {
+                                "fileSystem": {"entries": []},
+                                "network": {"enabled": False},
+                            },
+                            "scope": "turn",
+                            "strictAutoReview": True,
+                        },
+                    )
+                    return True
                 respond(
                     request_id,
                     {
@@ -530,7 +596,7 @@ Regras:
                 "cwd": str(workspace),
                 "developerInstructions": self.system_instruction,
                 "sandbox": "workspace-write",
-                "approvalPolicy": "never",
+                "approvalPolicy": "on-request",
                 "approvalsReviewer": "user",
                 "personality": "friendly",
                 "threadSource": "user",
@@ -555,7 +621,7 @@ Regras:
                 "threadId": thread_id,
                 "input": input_items,
                 "cwd": str(workspace),
-                "approvalPolicy": "never",
+                "approvalPolicy": "on-request",
                 "sandboxPolicy": {
                     "type": "workspaceWrite",
                     "networkAccess": True,
@@ -607,6 +673,20 @@ Regras:
 
                 if handle_server_request(message):
                     continue
+
+                if self._app_server_message_has_placeholder_command(method, params):
+                    last_error = (
+                        "Codex app-server tentou executar um comando placeholder. "
+                        "A IDE bloqueou a rodada para nao repetir reticencias no terminal."
+                    )
+                    break
+
+                if self._app_server_output_is_placeholder_error(method, params):
+                    last_error = (
+                        "O app-server recebeu um placeholder como comando. "
+                        "A IDE interrompeu a repeticao; use um comando real ou conclua em texto."
+                    )
+                    break
 
                 if method.endswith("agentMessage/delta") or method == "agentMessageDelta":
                     delta = params.get("delta", "")
@@ -688,6 +768,178 @@ Regras:
             return f"\nStatus: {status}\n"
 
         return ""
+
+    def _app_server_message_has_placeholder_command(self, method, params):
+        lower_method = (method or "").lower()
+        if not any(marker in lower_method for marker in ("command", "exec", "shell")):
+            return False
+        command = self._extract_app_server_command_text(params)
+        return bool(command and self._is_placeholder_command_text(command))
+
+    def _app_server_output_is_placeholder_error(self, method, params):
+        lower_method = (method or "").lower()
+        if not any(marker in lower_method for marker in ("raw", "output", "error", "warning", "command", "exec")):
+            return False
+        text = (
+            params.get("output")
+            or params.get("text")
+            or params.get("message")
+            or params.get("delta")
+            or ""
+        )
+        normalized = str(text or "").lower()
+        if not normalized:
+            return False
+        return bool(
+            re.search(r"'\s*(?:\.{3}|\u2026|`+)\s*'.*(?:reconhecido|recognized)", normalized)
+            or re.search(r"'\s*(?:comando|command)(?:\s+(?:real|concreto|concrete|here))?\s*'.*(?:reconhecido|recognized)", normalized)
+        )
+
+    def _extract_app_server_command_text(self, value, depth=0):
+        if depth > 5:
+            return ""
+        if isinstance(value, dict):
+            executable = self._first_present_app_server_value(
+                value,
+                ("program", "executable", "filePath", "file_path", "binary", "shell"),
+            )
+            arguments = self._first_present_app_server_value(
+                value,
+                ("argv", "args", "arguments", "argList", "argumentList", "argument_list"),
+            )
+            if executable is not None and arguments is not None:
+                parts = [
+                    self._compact_app_server_command_value(executable),
+                    self._compact_app_server_command_value(arguments),
+                ]
+                return " ".join(part for part in parts if part).strip()
+
+            preferred_keys = (
+                "command",
+                "commandLine",
+                "command_line",
+                "cmdLine",
+                "cmdline",
+                "cmd",
+                "shellCommand",
+                "shell_command",
+                "script",
+                "argv",
+                "args",
+                "arguments",
+                "argList",
+                "argumentList",
+                "argument_list",
+            )
+            for key in preferred_keys:
+                if key not in value:
+                    continue
+                nested = value[key]
+                if isinstance(nested, dict):
+                    found = self._extract_app_server_command_text(nested, depth + 1)
+                    if found:
+                        return found
+                return self._compact_app_server_command_value(nested)
+            for nested in value.values():
+                found = self._extract_app_server_command_text(nested, depth + 1)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            return self._compact_app_server_command_value(value)
+        return ""
+
+    def _first_present_app_server_value(self, values, keys):
+        for key in keys:
+            if key in values and values[key] not in (None, "", [], False):
+                return values[key]
+        return None
+
+    def _compact_app_server_command_value(self, value):
+        if isinstance(value, list):
+            return " ".join(str(part) for part in value)
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return str(value)
+
+    def _is_placeholder_command_text(self, command):
+        raw = str(command or "").strip().strip("`\"'").strip()
+        lowered = raw.lower().strip()
+        if not lowered:
+            return True
+
+        placeholders = {
+            "...",
+            "\u2026",
+            "?",
+            "`",
+            "``",
+            "```",
+            "e termine com",
+            "termine com",
+            "comece com",
+            "comece com e termine com",
+            "start with",
+            "start with and end with",
+            "end with",
+            "comando",
+            "comando real",
+            "comando concreto",
+            "comando completo",
+            "comando aqui",
+            "comando concreto aqui",
+            "command",
+            "command here",
+            "concrete command",
+            "complete command",
+            "your command",
+            "your command here",
+            "como administrador",
+            "run as administrator",
+            "--admin",
+            "/admin",
+        }
+        lowered_without_ticks = lowered.replace("`", "").strip()
+        core = re.sub(r"[\s.<>\[\]{}()_`\-./\\:;|&=\u2026?]+", "", lowered_without_ticks)
+        placeholder_cores = {
+            re.sub(r"[\s.<>\[\]{}()_`\-./\\:;|&=\u2026?]+", "", item)
+            for item in placeholders
+        }
+        if lowered in placeholders or lowered_without_ticks in placeholders or core in placeholder_cores:
+            return True
+
+        shell_payload_patterns = (
+            r"^(?:/[ck]\s+)(.+)$",
+            r"^(?:cmd(?:\.exe)?\s+/[ck]\s+)(.+)$",
+            r"^(?:(?:powershell|pwsh)(?:\.exe)?\b.*?(?:-command|-c)\s+)(.+)$",
+        )
+        for pattern in shell_payload_patterns:
+            match = re.match(pattern, lowered)
+            if not match:
+                continue
+            payload = match.group(1).strip().strip("`\"'").strip()
+            if payload and payload != lowered and self._is_placeholder_command_text(payload):
+                return True
+
+        patterns = (
+            r"^(?:o\s+|um\s+)?comando(?:\s+(?:real|completo|concreto|aqui|do\s+projeto|preenchido))+$",
+            r"^(?:seu|your)\s+comando(?:\s+aqui)?$",
+            r"^<[^>]*(?:comando|command)[^>]*>$",
+            r"^(?:e\s+)?termine\s+com$",
+            r"^(?:comece|comeca)\s+com(?:\s+e\s+termine\s+com)?$",
+            r"^start\s+with(?:\s+and\s+end\s+with)?$",
+            r"^end\s+with$",
+            r"^(?:cmd(?:\.exe)?\s+)?/[ck]\s+['\"]?(?:\.{3}|\u2026|comando|command)(?:\s+(?:real|completo|concreto|here|concrete|complete))?['\"]?$",
+            r"^cmd(?:\.exe)?\s+/[ck]\s+['\"]?(?:\.{3}|\u2026|comando|command)(?:\s+(?:real|completo|concreto|here|concrete|complete))?['\"]?$",
+            r"^(?:powershell|pwsh)(?:\.exe)?\s+.*(?:-command|-c)\s+['\"]?(?:\.{3}|\u2026|comando|command)(?:\s+(?:real|completo|concreto|here|concrete|complete))?['\"]?$",
+        )
+        if any(
+            re.fullmatch(pattern, candidate)
+            for candidate in (lowered, lowered_without_ticks)
+            for pattern in patterns
+        ):
+            return True
+
+        return False
 
     def _extract_app_server_final_message(self, turn):
         messages = []

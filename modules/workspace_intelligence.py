@@ -201,10 +201,211 @@ class WorkspaceIntelligenceMixin:
         if image_path:
             return None
 
+        discovery_reply = self.local_autonomous_discovery_reply(command, normalized)
+        if discovery_reply:
+            return discovery_reply
+
         if self.is_zoom_mobile_verification_request(normalized):
             return self.verify_zoom_mobile_locally(command)
 
         return None
+
+    def local_autonomous_discovery_reply(self, command, normalized=None):
+        normalized = normalized or self.normalize_plain_text(command)
+        if not self.is_autonomous_discovery_request(normalized):
+            return None
+
+        categories = self.autonomous_discovery_trigger_categories()
+        selected_key = self.classify_autonomous_discovery_trigger(normalized)
+        selected = categories[selected_key]
+        validation_command = self.autonomous_discovery_validation_command()
+        project_signal = self.autonomous_discovery_project_signal()
+
+        category_lines = []
+        for category in categories.values():
+            category_lines.append(
+                f"- {category['label']}: {category['definition']} "
+                f"Acao: {category['action']}"
+            )
+
+        return (
+            "**Descoberta Autonoma**\n\n"
+            "A etapa de descoberta fica sem pergunta inicial ao usuario: a IDE classifica o gatilho, "
+            "usa o mapa local do workspace e escolhe a proxima acao segura.\n\n"
+            "Tres categorias de gatilho:\n"
+            + "\n".join(category_lines)
+            + "\n\n"
+            f"Gatilho dominante nesta missao: {selected['label']}.\n"
+            f"Acao autonoma escolhida: {selected['action']}\n"
+            f"Validacao padrao sugerida: `{validation_command or 'sem comando automatico seguro'}`.\n\n"
+            "Sinal atual do projeto:\n"
+            f"{project_signal}\n\n"
+            "Regra operacional: se o pedido vier incompleto, a IDE nao devolve pergunta aberta; "
+            "ela transforma a ambiguidade em uma leitura minima, uma validacao real ou um diagnostico fechado."
+        )
+
+    def is_autonomous_discovery_request(self, normalized):
+        words = set(re.findall(r"[a-z0-9_]+", normalized or ""))
+        autonomy_terms = {
+            "autonomo",
+            "autonoma",
+            "autonomamente",
+            "sozinho",
+            "sem",
+            "retirar",
+            "remover",
+        }
+        discovery_terms = {
+            "descoberta",
+            "descobrir",
+            "interacao",
+            "interacoes",
+            "gatilho",
+            "gatilhos",
+            "stress",
+            "estresse",
+            "teste",
+            "testes",
+            "mapear",
+            "mapeamento",
+            "mercado",
+            "ciclo",
+            "clube",
+        }
+        human_terms = {"humano", "humanos", "usuario", "pessoa", "interacao", "interacoes"}
+        has_autonomy = bool(words & autonomy_terms) or "sem humano" in normalized or "sem o humano" in normalized
+        has_discovery = bool(words & discovery_terms)
+        asks_three_triggers = (
+            ("tres categorias" in normalized or "3 categorias" in normalized)
+            and ("gatilho" in normalized or "gatilhos" in normalized)
+        )
+        removes_human = bool(words & {"retirar", "remover"}) and bool(words & human_terms)
+        return (has_autonomy and has_discovery) or asks_three_triggers or (removes_human and has_discovery)
+
+    def autonomous_discovery_trigger_categories(self):
+        return {
+            "intencao": {
+                "label": "Gatilho de intencao",
+                "definition": "pedido, meta, requisito ou demanda de produto que inicia trabalho sem precisar de pergunta extra.",
+                "action": "converter o objetivo em arquivos provaveis, menor mudanca e criterio de aceite.",
+                "terms": {
+                    "pedido",
+                    "meta",
+                    "objetivo",
+                    "requisito",
+                    "demanda",
+                    "feature",
+                    "funcionalidade",
+                    "usuario",
+                    "cliente",
+                    "brief",
+                    "historia",
+                    "interacao",
+                },
+            },
+            "evidencia": {
+                "label": "Gatilho de evidencia",
+                "definition": "erro, log, teste, build, screenshot ou stress test que revela o proximo ponto de investigacao.",
+                "action": "rodar a validacao mais barata, ler o diagnostico e corrigir a causa provavel.",
+                "terms": {
+                    "erro",
+                    "erros",
+                    "falha",
+                    "falhas",
+                    "log",
+                    "logs",
+                    "teste",
+                    "testes",
+                    "stress",
+                    "estresse",
+                    "build",
+                    "validacao",
+                    "resultado",
+                    "screenshot",
+                    "print",
+                    "diagnostico",
+                    "descoberta",
+                    "descobrir",
+                    "mapear",
+                },
+            },
+            "restricao": {
+                "label": "Gatilho de restricao",
+                "definition": "permissao, administrador, login, sandbox, limite, dependencia ou politica que bloqueia a execucao normal.",
+                "action": "rotear para alternativa segura, comando elevado real ou conclusao objetiva quando nao houver acao possivel.",
+                "terms": {
+                    "admin",
+                    "administrador",
+                    "permissao",
+                    "permissoes",
+                    "privilegio",
+                    "privilegios",
+                    "uac",
+                    "sandbox",
+                    "limite",
+                    "capacidade",
+                    "login",
+                    "chave",
+                    "api",
+                    "dependencia",
+                    "bloqueio",
+                    "bloqueado",
+                    "seguranca",
+                },
+            },
+        }
+
+    def classify_autonomous_discovery_trigger(self, normalized):
+        normalized = self.normalize_plain_text(normalized or "")
+        words = set(re.findall(r"[a-z0-9_]+", normalized))
+        categories = self.autonomous_discovery_trigger_categories()
+        scores = {}
+        for key, category in categories.items():
+            score = 0
+            for term in category["terms"]:
+                if " " in term:
+                    score += 1 if term in normalized else 0
+                else:
+                    score += 1 if term in words else 0
+            scores[key] = score
+
+        if not any(scores.values()):
+            return "intencao"
+        return max(categories.keys(), key=lambda key: (scores[key], -list(categories.keys()).index(key)))
+
+    def autonomous_discovery_validation_command(self):
+        workspace = Path(self.current_workspace)
+        if (workspace / "pubspec.yaml").exists():
+            return "flutter analyze"
+        package_json = workspace / "package.json"
+        if package_json.exists():
+            text = package_json.read_text(encoding="utf-8", errors="replace")
+            if '"test"' in text:
+                return "npm test"
+            if '"build"' in text:
+                return "npm run build"
+            return "npm install --dry-run"
+        if (workspace / "pyproject.toml").exists() or (workspace / "requirements.txt").exists() or any(workspace.glob("*.py")):
+            return f'"{sys.executable}" -m compileall .'
+        if (workspace / "index.html").exists() or any(workspace.glob("*.html")):
+            return "python -m http.server 8000"
+        return ""
+
+    def autonomous_discovery_project_signal(self):
+        workspace = Path(self.current_workspace)
+        try:
+            summary = self.local_project_summary()
+        except Exception:
+            kind = self.detect_run_kind(workspace) or "generico"
+            return f"Projeto atual: {workspace.name}\nTipo detectado: {kind}"
+
+        lines = summary.splitlines()
+        compact = []
+        for line in lines:
+            compact.append(line)
+            if len(compact) >= 12:
+                break
+        return "\n".join(compact)
 
     def is_zoom_mobile_verification_request(self, normalized):
         words = set(re.findall(r"[a-z0-9_]+", normalized))

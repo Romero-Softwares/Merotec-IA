@@ -18,7 +18,7 @@ def _normalizar_texto_para_fala(text):
     texto = str(text or "")
     texto = re.sub(r"```.*?```", " ", texto, flags=re.DOTALL)
     texto = re.sub(
-        r"\[(?:READ|WRITE|REPLACE|SEARCH_TEXT|SCAN_TEXT|FIX_MOJIBAKE|EXECUTE|OPEN_URL|SCREENSHOT|HUMAN_TEST|UNDO):[^\]]+\]",
+        r"\[(?:READ|WRITE|REPLACE|SEARCH_TEXT|SCAN_TEXT|FIX_MOJIBAKE|EXECUTE|EXECUTE_ADMIN|OPEN_URL|SCREENSHOT|HUMAN_TEST|UNDO):[^\]]+\]",
         " ",
         texto,
     )
@@ -46,6 +46,8 @@ class VoiceModule:
         self.is_recording = False
         self.is_paused = False
         self.stop_requested = False
+        self.speech_lock = threading.Lock()
+        self.current_speech_engine = None
         self.keyword_listener_active = False
         self.keyword_listener_thread = None
         self.keyword_stop_event = threading.Event()
@@ -122,11 +124,14 @@ class VoiceModule:
         """Lê o texto completo reconstruindo o motor para evitar travamentos"""
 
         def run_speech():
+            engine = None
             self.stop_requested = False
             try:
                 # Criamos o motor dentro da thread de forma isolada
                 engine = pyttsx3.init()
                 engine.setProperty('rate', 180)
+                with self.speech_lock:
+                    self.current_speech_engine = engine
 
                 # Limpamos o texto de caracteres que fazem o motor parar cedo
                 texto_limpo = _normalizar_texto_para_fala(text)
@@ -150,20 +155,32 @@ class VoiceModule:
                 print(f"Erro na fala: {e}")
             finally:
                 # Garante que o motor seja liberado
-                try:
-                    engine.stop()
-                except:
-                    pass
+                if engine is not None:
+                    try:
+                        engine.stop()
+                    except:
+                        pass
+                with self.speech_lock:
+                    if self.current_speech_engine is engine:
+                        self.current_speech_engine = None
 
         # Inicia a thread de fala
         threading.Thread(target=run_speech, daemon=True).start()
 
     def stop(self):
         """Interrompe a fala atual imediatamente"""
+        self.is_paused = False
         self.stop_requested = True
         # Força o esvaziamento da fila
         with self.queue.mutex:
             self.queue.queue.clear()
+        with self.speech_lock:
+            engine = self.current_speech_engine
+        if engine is not None:
+            try:
+                engine.stop()
+            except Exception:
+                pass
 
     def pause(self):
         self.is_paused = True

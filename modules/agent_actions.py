@@ -170,6 +170,55 @@ class AgentActionsMixin:
 
         return None
 
+    def iter_agent_action_lines(self, response_text, action_names=None):
+        if not response_text:
+            return
+        if action_names is None:
+            action_names = (
+                "READ",
+                "SEARCH_TEXT",
+                "SCAN_TEXT",
+                "FIX_MOJIBAKE",
+                "UNDO",
+                "EXECUTE",
+                "EXECUTE_ADMIN",
+                "OPEN_URL",
+                "SCREENSHOT",
+                "HUMAN_TEST",
+            )
+        action_names = tuple(str(name).upper() for name in action_names)
+        action_pattern = "|".join(re.escape(name) for name in action_names)
+        line_pattern = re.compile(
+            rf"^[ \t]*\[({action_pattern})[ \t]*:[ \t]*([^\]\r\n]+?)[ \t]*\][ \t]*$",
+            re.IGNORECASE,
+        )
+        in_fenced_block = False
+        for line in str(response_text).splitlines():
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                in_fenced_block = not in_fenced_block
+                continue
+            if in_fenced_block:
+                continue
+            match = line_pattern.match(line)
+            if match:
+                yield match.group(1).upper(), match.group(2).strip()
+
+    def extract_agent_action_values(self, response_text, action_name):
+        return [
+            value
+            for found_action, value in self.iter_agent_action_lines(response_text, (action_name,))
+            if found_action == action_name.upper()
+        ]
+
+    def extract_agent_action_names(self, response_text):
+        names = {action for action, _value in self.iter_agent_action_lines(response_text)}
+        if re.search(r"\[WRITE:\s*.+?\].*?\[/WRITE\]", response_text or "", re.DOTALL | re.IGNORECASE):
+            names.add("WRITE")
+        if re.search(r"\[REPLACE:\s*.+?\].*?\[/REPLACE\]", response_text or "", re.DOTALL | re.IGNORECASE):
+            names.add("REPLACE")
+        return names
+
     def parse_and_execute_agent_actions(self, response_text, task_objective=None, action_depth=0, task_id=None, direct_action_happened=False):
         if not response_text:
             return
@@ -213,7 +262,7 @@ class AgentActionsMixin:
                 task_objective=task_objective,
             )
 
-        fix_paths = re.findall(r"\[FIX_MOJIBAKE:\s*(.+?)\]", response_text, re.IGNORECASE)
+        fix_paths = self.extract_agent_action_values(response_text, "FIX_MOJIBAKE")
         if fix_paths and not self.objective_allows_text_repair(task_objective or self.active_ai_objective or ""):
             self.redirect_unrelated_text_repair(
                 "FIX_MOJIBAKE",
@@ -228,20 +277,18 @@ class AgentActionsMixin:
             self.mark_ai_active_action("write", task_id=task_id)
             self._agent_fix_mojibake(raw_path, task_id=task_id)
 
-        read_paths = re.findall(r"\[READ:\s*(.+?)\]", response_text, re.IGNORECASE)
+        read_paths = self.extract_agent_action_values(response_text, "READ")
         has_action = has_action or bool(read_paths)
         if (
             not direct_action_happened
             and not self.task_has_real_action(task_id)
             and self.claims_concrete_result_without_real_action(response_text, task_objective=task_objective)
         ):
-            self.redirect_claimed_action_to_real_action(
+            self.warn_claimed_action_without_real_action(
                 response_text,
                 task_objective=task_objective,
-                action_depth=action_depth,
                 task_id=task_id,
             )
-            return
         if read_paths:
             if self.should_use_project_map_instead_of_mass_read(read_paths, task_objective):
                 self.redirect_mass_read_to_project_map(
@@ -254,19 +301,22 @@ class AgentActionsMixin:
             if self.should_block_passive_ai_action("READ", read_paths, task_objective, action_depth, task_id):
                 return
             self._agent_read_many(read_paths, task_objective=task_objective, action_depth=action_depth, task_id=task_id)
-            if re.search(r"\[EXECUTE:\s*(.+?)\]", response_text, re.IGNORECASE):
+            if (
+                self.extract_agent_action_values(response_text, "EXECUTE")
+                or self.extract_agent_action_values(response_text, "EXECUTE_ADMIN")
+            ):
                 self.add_chat_message(
                     "Merotec AI",
                     "Leitura priorizada antes da execucao, para agir com base no arquivo correto.",
                 )
-            if re.search(r"\[SEARCH_TEXT:\s*(.+?)\]", response_text, re.IGNORECASE):
+            if self.extract_agent_action_values(response_text, "SEARCH_TEXT"):
                 self.add_chat_message(
                     "Merotec AI",
                     "Leitura priorizada antes da busca, para editar com base concreta.",
                 )
             return
 
-        search_requests = re.findall(r"\[SEARCH_TEXT:\s*(.+?)\]", response_text, re.IGNORECASE)
+        search_requests = self.extract_agent_action_values(response_text, "SEARCH_TEXT")
         has_action = has_action or bool(search_requests)
         if search_requests:
             if self.should_block_passive_ai_action("SEARCH_TEXT", search_requests, task_objective, action_depth, task_id):
@@ -279,7 +329,7 @@ class AgentActionsMixin:
             )
             return
 
-        scan_paths = re.findall(r"\[SCAN_TEXT:\s*(.+?)\]", response_text, re.IGNORECASE)
+        scan_paths = self.extract_agent_action_values(response_text, "SCAN_TEXT")
         if scan_paths and not self.objective_allows_text_repair(task_objective or self.active_ai_objective or ""):
             self.redirect_unrelated_text_repair(
                 "SCAN_TEXT",
@@ -301,19 +351,19 @@ class AgentActionsMixin:
             )
             return
 
-        undo_paths = re.findall(r"\[UNDO:\s*(.+?)\]", response_text, re.IGNORECASE)
+        undo_paths = self.extract_agent_action_values(response_text, "UNDO")
         has_action = has_action or bool(undo_paths)
         for raw_path in undo_paths:
             self.mark_ai_active_action("write", task_id=task_id)
             self._agent_undo(raw_path)
 
-        open_urls = re.findall(r"\[OPEN_URL:\s*(.+?)\]", response_text, re.IGNORECASE)
+        open_urls = self.extract_agent_action_values(response_text, "OPEN_URL")
         has_action = has_action or bool(open_urls)
         for raw_url in open_urls:
             self.mark_ai_active_action("open_url", task_id=task_id)
             self._agent_open_url(raw_url)
 
-        screenshot_requests = re.findall(r"\[SCREENSHOT:\s*(.+?)\]", response_text, re.IGNORECASE)
+        screenshot_requests = self.extract_agent_action_values(response_text, "SCREENSHOT")
         has_action = has_action or bool(screenshot_requests)
         for request in screenshot_requests:
             self.mark_ai_active_action("screenshot", task_id=task_id)
@@ -324,7 +374,7 @@ class AgentActionsMixin:
                 task_id=task_id,
             )
 
-        human_test_requests = re.findall(r"\[HUMAN_TEST:\s*(.+?)\]", response_text, re.IGNORECASE)
+        human_test_requests = self.extract_agent_action_values(response_text, "HUMAN_TEST")
         has_action = has_action or bool(human_test_requests)
         for request in human_test_requests:
             self.mark_ai_active_action("human_test", task_id=task_id)
@@ -335,9 +385,19 @@ class AgentActionsMixin:
                 task_id=task_id,
             )
 
-        execute_commands = re.findall(r"\[EXECUTE:\s*(.+?)\]", response_text, re.IGNORECASE)
+        admin_execute_commands = self.extract_agent_action_values(response_text, "EXECUTE_ADMIN")
+        has_action = has_action or bool(admin_execute_commands)
+        for command in admin_execute_commands:
+            if self.reject_placeholder_execute_action("EXECUTE_ADMIN", command):
+                continue
+            self.mark_ai_active_action("execute", task_id=task_id)
+            self._agent_execute_admin(command, task_objective=task_objective, action_depth=action_depth, task_id=task_id)
+
+        execute_commands = self.extract_agent_action_values(response_text, "EXECUTE")
         has_action = has_action or bool(execute_commands)
         for command in execute_commands:
+            if self.reject_placeholder_execute_action("EXECUTE", command):
+                continue
             if self.should_route_execute_to_human_test(command, task_objective):
                 self.mark_ai_active_action("human_test", task_id=task_id)
                 self._agent_human_test(
@@ -401,8 +461,8 @@ class AgentActionsMixin:
             self.add_chat_message("Sistema", "A IA respondeu com intencao, mas nao executou uma acao. Reforcando a tarefa.")
             self._run_ai_task(
                 "A resposta anterior nao executou nenhuma acao. Continue a missao agora usando uma tag real da IDE "
-                "([READ], [SEARCH_TEXT], [SCAN_TEXT], [FIX_MOJIBAKE], [REPLACE], [WRITE], [EXECUTE], [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST]) "
-                "ou entregue uma conclusao final direta se a tarefa ja estiver respondida.",
+                "([READ], [SEARCH_TEXT], [SCAN_TEXT], [FIX_MOJIBAKE], [REPLACE], [WRITE], EXECUTE/EXECUTE_ADMIN ja preenchido, [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST]) "
+                "usando comando real quando houver execucao, ou entregue uma conclusao final direta se a tarefa ja estiver respondida.",
                 extra_context=(
                     f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or ''}\n\n"
                     f"Resposta anterior sem acao:\n{response_text}"
@@ -717,10 +777,37 @@ class AgentActionsMixin:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def resolve_human_test_workspace(self, workspace, objective):
+        workspace = Path(workspace).resolve()
+        current_kind = self.detect_run_kind(workspace)
+        browser_terms = ("browser", "canvas", "game", "html", "jogo", "navegador", "pagina", "site", "web")
+        wants_browser_target = any(term in objective for term in browser_terms)
+
+        try:
+            candidates = [
+                Path(candidate).resolve()
+                for candidate in self.find_runnable_workspaces()
+                if str(Path(candidate).resolve()).startswith(str(workspace))
+            ]
+        except Exception:
+            candidates = []
+
+        if current_kind and not (current_kind == "python" and wants_browser_target):
+            return workspace
+
+        if wants_browser_target:
+            for candidate in candidates:
+                if candidate != workspace and self.detect_run_kind(candidate) in {"html", "node", "flutter"}:
+                    return candidate
+
+        if not current_kind and candidates:
+            return candidates[0]
+
+        return workspace
+
     def build_human_test_plan(self, request, task_objective=None, requested_command=None):
         workspace = Path(self.current_workspace).resolve()
         objective = self.normalize_plain_text((request or "") + "\n" + (task_objective or self.active_ai_objective or ""))
-        kind = self.detect_run_kind(workspace)
         if requested_command:
             url = self.extract_first_local_url(requested_command)
             if not url and "web-port" in requested_command:
@@ -736,6 +823,9 @@ class AgentActionsMixin:
                 "ready_timeout": 110,
                 "screenshot_delay": 5.0,
             }
+
+        workspace = self.resolve_human_test_workspace(workspace, objective)
+        kind = self.detect_run_kind(workspace)
 
         if kind == "flutter":
             if (workspace / "web").exists() and any(term in objective for term in ("web", "chrome", "print", "visual", "tela", "jogo", "game", "teste real")):
@@ -1088,7 +1178,7 @@ class AgentActionsMixin:
                 "PROXIMA RESPOSTA OBRIGATORIA:\n"
                 "- Entregue a analise completa em texto agora.\n"
                 "- Inclua arquitetura, fluxo principal, arquivos importantes, riscos, pontos fortes e proximas implementacoes recomendadas.\n"
-                "- Nao use [READ], [SEARCH_TEXT], [SCAN_TEXT], [EXECUTE], [REPLACE] ou [WRITE] nesta resposta.\n"
+                "- Nao use [READ], [SEARCH_TEXT], [SCAN_TEXT], EXECUTE, [REPLACE] ou [WRITE] nesta resposta.\n"
                 "- Nao diga que vai analisar: apresente o resultado."
             )
             self._run_ai_task(
@@ -1114,7 +1204,7 @@ class AgentActionsMixin:
             "A partir de agora, a IDE nao vai aceitar nova leitura/busca como proxima acao desta mesma missao.\n\n"
             "PROXIMA RESPOSTA OBRIGATORIA:\n"
             "- Se a missao pede implementar/corrigir, responda com [REPLACE] pequeno e exato ou [WRITE] apenas para arquivo novo/reescrita pedida.\n"
-            "- Se a missao pede executar/testar, responda com [EXECUTE].\n"
+            "- Se a missao pede executar/testar, responda com uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: python -m unittest].\n"
             "- Se precisa validar visualmente, responda com [HUMAN_TEST: auto].\n"
             "- Se ja sabe que nao da para fazer com seguranca, entregue conclusao curta dizendo exatamente o bloqueio.\n"
             "- Nao use [READ], [SEARCH_TEXT], [SCAN_TEXT] ou comando de inspecao na proxima resposta."
@@ -1216,7 +1306,7 @@ class AgentActionsMixin:
                     f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or 'Continuar tarefa atual'}\n\n"
                     f"A IDE capturou a tela para validacao visual: {path.name}\n"
                     "Analise o print como evidência do estado atual do app. "
-                    "Se houver erro visual, comportamento quebrado ou tela vazia, corrija autonomamente com [READ], [REPLACE], [WRITE] ou [EXECUTE]. "
+                "Se houver erro visual, comportamento quebrado ou tela vazia, corrija autonomamente com [READ], [REPLACE], [WRITE] ou uma tag EXECUTE ja preenchida. "
                     "Se estiver correto, entregue uma conclusao objetiva."
                 )
                 self._run_ai_task(
@@ -1263,7 +1353,7 @@ class AgentActionsMixin:
             return False
         return bool(
             re.search(
-                r"\[(WRITE|REPLACE|FIX_MOJIBAKE|UNDO|EXECUTE|OPEN_URL|SCREENSHOT|HUMAN_TEST)\s*:",
+                r"\[(WRITE|REPLACE|FIX_MOJIBAKE|UNDO|EXECUTE|EXECUTE_ADMIN|OPEN_URL|SCREENSHOT|HUMAN_TEST)\s*:",
                 text,
                 re.IGNORECASE,
             )
@@ -1288,43 +1378,23 @@ class AgentActionsMixin:
         return self.looks_like_claimed_concrete_result(text)
 
     def redirect_claimed_action_to_real_action(self, response_text, task_objective=None, action_depth=0, task_id=None):
-        objective = task_objective or self.active_ai_objective or "Continuar tarefa atual"
-        metrics = self.get_ai_task_metrics(task_id)
-        metrics["protocol_violations"] = metrics.get("protocol_violations", 0) + 1
-
-        self.log_agent("Resposta bloqueada: a IA afirmou execucao sem acao real.")
-        if metrics["protocol_violations"] > 2 or action_depth >= 8:
-            self.add_chat_message(
-                "Erro",
-                "A IA insistiu em narrar acao sem executar. A IDE parou para evitar alteracoes falsas. Envie o pedido novamente de forma direta.",
-            )
-            self.set_status("Acao real exigida.", "warning")
-            return
-
-        self.add_chat_message(
-            "Sistema",
-            "A IDE bloqueou a resposta porque a IA disse que corrigiu/executou, mas nao enviou WRITE, REPLACE ou EXECUTE.",
-        )
-        self._run_ai_task(
-            "A resposta anterior afirmou que executou ou corrigiu algo, mas nao houve acao real na IDE. "
-            "Continue a missao agora com uma tag executavel. "
-            "Correcao so conta com [REPLACE], [WRITE], [FIX_MOJIBAKE] ou [UNDO]. "
-            "Validacao so conta com [EXECUTE], [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST]. "
-            "Nao escreva que corrigiu, aplicou, rodou ou validou sem incluir a tag correspondente.",
-            extra_context=(
-                f"MISSAO ORIGINAL:\n{objective}\n\n"
-                "RESPOSTA BLOQUEADA POR PROMESSA/FALSA EXECUCAO:\n"
-                f"{response_text}\n\n"
-                "PROXIMA RESPOSTA OBRIGATORIA:\n"
-                "- Se precisa alterar arquivo, envie [REPLACE] ou [WRITE] completo.\n"
-                "- Se precisa testar/rodar, envie [EXECUTE: comando].\n"
-                "- Se precisa ver a tela ou testar como usuario, envie [HUMAN_TEST: auto].\n"
-                "- Se a tarefa era apenas pergunta simples, responda o resultado final sem fingir execucao."
-            ),
-            task_objective=objective,
-            action_depth=action_depth + 1,
+        self.warn_claimed_action_without_real_action(
+            response_text,
+            task_objective=task_objective,
             task_id=task_id,
         )
+
+    def warn_claimed_action_without_real_action(self, response_text, task_objective=None, task_id=None):
+        metrics = self.get_ai_task_metrics(task_id)
+        metrics["soft_protocol_warnings"] = metrics.get("soft_protocol_warnings", 0) + 1
+        preview = self.normalize_plain_text(response_text or "")[:180]
+        objective = self.normalize_plain_text(task_objective or self.active_ai_objective or "")[:180]
+        self.log_agent(
+            "Aviso nao bloqueante: resposta parece afirmar acao sem tag executavel. "
+            f"objetivo='{objective}' resposta='{preview}'"
+        )
+        if metrics["soft_protocol_warnings"] == 1:
+            self.set_status("Aviso: resposta sem acao real detectavel.", "warning")
 
     def objective_allows_text_repair(self, objective):
         normalized = self.normalize_plain_text(objective or "")
@@ -1362,7 +1432,7 @@ class AgentActionsMixin:
                 "Proxima resposta obrigatoria:\n"
                 "- Se precisa entender codigo, use [READ: arquivo | linhas inicio-fim].\n"
                 "- Se ja sabe a mudanca, use [REPLACE] ou [WRITE].\n"
-                "- Se precisa validar, use [EXECUTE].\n\n"
+                "- Se precisa validar, use uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: python -m unittest].\n\n"
                 f"Resposta desviada:\n{response_text}"
             ),
             task_objective=objective,
@@ -1453,7 +1523,7 @@ class AgentActionsMixin:
         self.log_agent(f"Comando de mutacao redirecionado para WRITE: {command}")
         context = (
             f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or 'Continuar tarefa atual'}\n\n"
-            "A IA tentou modificar arquivo usando [EXECUTE], o que pode nao alterar nada na IDE.\n"
+            "A IA tentou modificar arquivo usando EXECUTE, o que pode nao alterar nada na IDE.\n"
             f"Comando recusado como edicao:\n```\n{command}\n```\n\n"
             "Proxima resposta obrigatoria:\n"
             "- Se for arquivo pequeno ou criacao nova, use [WRITE: caminho] conteudo completo [/WRITE].\n"
@@ -1573,7 +1643,7 @@ class AgentActionsMixin:
                 "Use as linhas encontradas acima para decidir a proxima acao real.\n"
                 "- Se a missao pede alterar/corrigir/remover/adicionar, responda agora com [READ] de um intervalo exato ainda necessario, [REPLACE] ou [WRITE].\n"
                 "- Se ja souber o trecho a mudar, prefira [REPLACE].\n"
-                "- Se a missao pede executar/testar, responda com [EXECUTE].\n"
+                "- Se a missao pede executar/testar, responda com uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: python -m unittest].\n"
                 "- Nao repita [SEARCH_TEXT] para o mesmo arquivo/padrao.\n"
             )
         else:
@@ -2166,8 +2236,8 @@ class AgentActionsMixin:
                 "Nao diga apenas que vai ler/comparar; agora decida a acao concreta. "
                 "A IDE consolidou leituras repetidas por arquivo; nao peca novamente os mesmos trechos. "
                 "Se a tarefa for corrigir, preservar ou restaurar comportamento, use [REPLACE] pequeno e exato. "
-                "Se a tarefa for implementar algo, aplique [REPLACE] ou [WRITE] agora e depois use [EXECUTE] para validar. "
-                "Se ja tiver informacao suficiente, responda com [REPLACE], [WRITE] ou [EXECUTE]. "
+                "Se a tarefa for implementar algo, aplique [REPLACE] ou [WRITE] agora e depois use uma tag EXECUTE ja preenchida para validar. "
+                "Se ja tiver informacao suficiente, responda com [REPLACE], [WRITE] ou uma tag EXECUTE com comando real. "
                 "Nao use nova rodada de [READ] como proxima acao, exceto para um unico intervalo exato indispensavel."
             )
             self.set_ai_activity("IA analisando leitura")
@@ -2486,7 +2556,7 @@ class AgentActionsMixin:
             "ORIENTACAO PARA A IA:\n"
             "- Use o contexto ja lido para tomar uma decisao produtiva.\n"
             "- Se a tarefa for modificar, use [REPLACE] ou [WRITE].\n"
-            "- Se a tarefa for validar, use [EXECUTE] ou [HUMAN_TEST].\n"
+            "- Se a tarefa for validar, use uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: python -m unittest], ou [HUMAN_TEST].\n"
             "- Se realmente faltar informacao essencial, leia outro ponto especifico e siga trabalhando."
         )
 
@@ -2686,11 +2756,487 @@ class AgentActionsMixin:
         except Exception as exc:
             self.add_chat_message("Erro", f"Falha ao desfazer: {exc}")
 
+    def is_admin_execute_request(self, command):
+        normalized = self.normalize_plain_text(command or "")
+        admin_markers = (
+            "como administrador",
+            "modo administrador",
+            "permissao de administrador",
+            "permissoes de administrador",
+            "privilegio de administrador",
+            "privilegios de administrador",
+            "permissao elevada",
+            "permissoes elevadas",
+            "privilegio elevado",
+            "privilegios elevados",
+            "as administrator",
+            "run as administrator",
+            "elevated",
+            "elevado",
+            "-verb runas",
+        )
+        admin_switch = re.search(r"(?:^|\s)(?:--admin|/admin)(?:\s|$)", normalized)
+        admin_fuzzy = re.search(
+            r"(?:permiss.o|permiss.es|privilegi(?:o|os)|privil.gi(?:o|os))\s+(?:de\s+administrador|elevad[oa]s?)",
+            normalized,
+        )
+        return (
+            any(marker in normalized for marker in admin_markers)
+            or bool(admin_switch)
+            or bool(admin_fuzzy)
+            or normalized.startswith(("admin:", "elevated:"))
+        )
+
+    def clean_admin_command(self, command):
+        cleaned = (command or "").strip()
+        cleaned = re.sub(r"^\s*(?:admin|elevated)\s*:\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^\s*(?:como|modo)\s+administrador\s*[:,-]?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^\s*(?:as|run\s+as)\s+administrator\s*[:,-]?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^\s*(?:elevado|elevated)\s*[:,-]\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"(?:^|\s+)(?:com\s+)?(?:permiss(?:a|ã|\?)o|permiss(?:o|õ|\?)es)\s+de\s+administrador\s*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        trailing_admin_patterns = (
+            r"(?:^|\s+)(?:com\s+)?permiss(?:ao|oes|aoes|aos|\?o|\?es)\s+de\s+administrador\s*$",
+            r"(?:^|\s+)(?:com\s+)?(?:privilegi|privil\?gi)(?:o|os)\s+de\s+administrador\s*$",
+            r"(?:^|\s+)(?:com\s+)?(?:privilegi|privil\?gi)(?:o|os)\s+elevad(?:o|os)\s*$",
+            r"(?:^|\s+)(?:com\s+)?permiss(?:ao|oes|aoes|aos|\?o|\?es)\s+elevad(?:a|as)\s*$",
+        )
+        for pattern in trailing_admin_patterns:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"(?:^|\s+)(?:com\s+)?(?:permiss(?:a|ã|\?)o|permiss(?:o|õ|\?)es)\s+de\s+administrador\s*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"(?:^|\s+)(?:como|modo)\s+administrador\s*$", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"(?:^|\s+)(?:as|run\s+as)\s+administrator\s*$", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"(?:^|\s+)(?:elevado|elevated)\s*$", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"(?:^|\s+)(?:--admin|/admin)\s*$", "", cleaned, flags=re.IGNORECASE)
+        admin_suffix_patterns = (
+            r"(?:^|\s+)(?:com\s+)?permiss(?:ao|oes|\?o|\?es|\u00e3o|\u00f5es)\s+de\s+administrador\s*$",
+            r"(?:^|\s+)(?:com\s+)?privil(?:e|\u00e9)gi(?:o|os)\s+de\s+administrador\s*$",
+            r"(?:^|\s+)(?:com\s+)?privil(?:e|\u00e9)gi(?:o|os)\s+elevad(?:o|os)\s*$",
+            r"(?:^|\s+)(?:com\s+)?permiss(?:ao|oes|\u00e3o|\u00f5es)\s+elevad(?:a|as)\s*$",
+            r"(?:^|\s+)(?:como|modo)\s+administrador\s*$",
+            r"(?:^|\s+)(?:as|run\s+as)\s+administrator\s*$",
+            r"(?:^|\s+)(?:elevado|elevated)\s*$",
+            r"(?:^|\s+)-verb\s+runas\s*$",
+            r"(?:^|\s+)(?:--admin|/admin)\s*$",
+        )
+        for pattern in admin_suffix_patterns:
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+
+        normalized_suffixes = (
+            " com permissao de administrador",
+            " permissao de administrador",
+            " permissoes de administrador",
+            " com privilegio de administrador",
+            " privilegio de administrador",
+            " privilegios de administrador",
+            " com privilegio elevado",
+            " privilegio elevado",
+            " privilegios elevados",
+            " com permissao elevada",
+            " permissao elevada",
+            " permissoes elevadas",
+        )
+        normalized = self.normalize_plain_text(cleaned)
+        for suffix in normalized_suffixes:
+            if normalized.endswith(suffix):
+                cleaned = cleaned[: max(0, len(cleaned) - len(suffix))].rstrip()
+                break
+        return cleaned.strip()
+
+    def is_placeholder_command(self, command):
+        candidates = [command, self.clean_admin_command(command)]
+        raw_text = str(command or "").strip().strip("`\"'").strip()
+        tag_match = re.fullmatch(
+            r"\[(?:EXECUTE|EXECUTE_ADMIN)\s*:\s*(.*?)\]",
+            raw_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if tag_match:
+            candidates.append(tag_match.group(1))
+        inline_tag_match = re.fullmatch(
+            r"(?:EXECUTE|EXECUTE_ADMIN)\s*:\s*(.*?)",
+            raw_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if inline_tag_match:
+            candidates.append(inline_tag_match.group(1))
+        placeholders = {
+            "...",
+            "\u2026",
+            "?",
+            "`",
+            "``",
+            "```",
+            "admin:",
+            "administrator",
+            "as administrator",
+            "como administrador",
+            "e termine com",
+            "termine com",
+            "comece com",
+            "comece com e termine com",
+            "start with and end with",
+            "start with",
+            "end with",
+            "comando",
+            "<comando>",
+            "o comando",
+            "comando real",
+            "o comando real",
+            "<comando real>",
+            "comando completo",
+            "o comando completo",
+            "<comando completo>",
+            "comando concreto",
+            "o comando concreto",
+            "<comando concreto>",
+            "comando real do projeto",
+            "comando completo do projeto",
+            "comando concreto do projeto",
+            "comando completo aqui",
+            "comando concreto aqui",
+            "comando aqui",
+            "um comando real",
+            "um comando concreto",
+            "command",
+            "<command>",
+            "command here",
+            "complete command",
+            "<complete command>",
+            "concrete command",
+            "<concrete command>",
+            "elevated:",
+            "modo administrador",
+            "run as administrator",
+            "seu comando",
+            "seu comando aqui",
+            "your command",
+            "your command here",
+            "--admin",
+            "/admin",
+        }
+        placeholder_cores = {
+            re.sub(r"[\s.<>\[\]{}()_\-\u2026?]+", "", item)
+            for item in placeholders
+        }
+        placeholder_patterns = (
+            r"^(?:o\s+|um\s+)?comando(?:\s+(?:real|completo|concreto|aqui|do\s+projeto|ja\s+preenchido|preenchido))+$",
+            r"^(?:seu|your)\s+comando(?:\s+aqui)?$",
+            r"^<[^>]*(?:comando|command)[^>]*>$",
+            r"^\[[^\]]*(?:\.\.\.|\u2026|comando|command)[^\]]*\]$",
+            r"^(?:cmd(?:\.exe)?\s+)?/[ck]\s+['\"]?(?:\.{3}|\u2026|comando|command)['\"]?$",
+            r"^cmd(?:\.exe)?\s+/[ck]\s+['\"]?(?:\.{3}|\u2026|comando|command)['\"]?$",
+            r"^(?:powershell|pwsh)(?:\.exe)?\s+.*(?:-command|-c)\s+['\"]?(?:\.{3}|\u2026|comando|command)['\"]?$",
+            r"^(?:shell|terminal|exec|execute|executar|rodar)\s*[:=-]?\s*(?:\.{3}|\u2026|comando|command)$",
+            r"^(?:e\s+)?termine\s+com$",
+            r"^(?:comece|comeca)\s+com(?:\s+e\s+termine\s+com)?$",
+            r"^start\s+with(?:\s+and\s+end\s+with)?$",
+            r"^end\s+with$",
+        )
+        for candidate in candidates:
+            raw_candidate = str(candidate or "").strip()
+            for variant in {raw_candidate, raw_candidate.replace("`", "")}:
+                text = variant.strip().strip("`\"'").strip()
+                lowered = re.sub(r"\s+", " ", self.normalize_plain_text(text)).strip()
+                shell_core = re.sub(r"[\s.<>\[\]{}()_`\-\u2026?]+", "", lowered)
+                if not shell_core or lowered in placeholders or shell_core in placeholder_cores:
+                    return True
+                if any(re.fullmatch(pattern, lowered) for pattern in placeholder_patterns):
+                    return True
+                if self.shell_payload_is_placeholder(lowered):
+                    return True
+        return False
+
+    def shell_payload_is_placeholder(self, normalized_command):
+        text = (normalized_command or "").strip()
+        if not text:
+            return True
+        shell_payload_patterns = (
+            r"^(?:/[ck]\s+)(.+)$",
+            r"^(?:cmd(?:\.exe)?\s+/[ck]\s+)(.+)$",
+            r"^(?:(?:powershell|pwsh)(?:\.exe)?\b.*?(?:-command|-c)\s+)(.+)$",
+        )
+        for pattern in shell_payload_patterns:
+            match = re.match(pattern, text)
+            if not match:
+                continue
+            payload = match.group(1).strip().strip("`\"'").strip()
+            payload_placeholders = {
+                "...",
+                "\u2026",
+                "?",
+                "comando",
+                "comando real",
+                "comando completo",
+                "comando concreto",
+                "comando aqui",
+                "comando completo aqui",
+                "comando concreto aqui",
+                "um comando real",
+                "um comando concreto",
+                "seu comando",
+                "seu comando aqui",
+                "command",
+                "command here",
+                "complete command",
+                "concrete command",
+                "your command",
+                "your command here",
+            }
+            payload_placeholder_cores = {
+                re.sub(r"[\s.<>\[\]{}()_\-./\\:;|&=\u2026?]+", "", item)
+                for item in payload_placeholders
+            }
+            payload_patterns = (
+                r"^(?:o\s+|um\s+)?comando(?:\s+(?:real|completo|concreto|aqui|do\s+projeto|ja\s+preenchido|preenchido))+$",
+                r"^(?:seu|your)\s+comando(?:\s+aqui)?$",
+                r"^<[^>]*(?:comando|command)[^>]*>$",
+                r"^command(?:\s+(?:real|complete|concrete|here))?$",
+            )
+            payload_core = re.sub(r"[\s.<>\[\]{}()_\-./\\:;|&=\u2026?]+", "", payload)
+            if (
+                not payload_core
+                or payload in payload_placeholders
+                or payload_core in payload_placeholder_cores
+                or any(re.fullmatch(pattern, payload) for pattern in payload_patterns)
+            ):
+                return True
+        return False
+
+    def reject_placeholder_execute_action(self, action_name, command):
+        if not self.is_placeholder_command(command):
+            return False
+        action_name = (action_name or "EXECUTE").upper()
+        if action_name == "EXECUTE_ADMIN":
+            self.add_chat_message(
+                "Erro",
+                "EXECUTE_ADMIN precisa receber um comando real. A IDE recusou reticencias ou texto demonstrativo antes de abrir UAC.",
+            )
+            self.add_chat_message(
+                "Sistema",
+                "Para pedir administrador, envie uma tag EXECUTE_ADMIN ja preenchida, por exemplo [EXECUTE_ADMIN: whoami /groups].",
+            )
+            self.log_agent("Execucao elevada recusada no parser: comando placeholder.")
+            return True
+        self.add_chat_message(
+            "Erro",
+            "EXECUTE precisa receber um comando real. A IDE recusou reticencias ou texto demonstrativo antes do terminal.",
+        )
+        self.add_chat_message(
+            "Sistema",
+            "A IDE bloqueou um comando sem conteudo real. Isso evita repetir placeholders no terminal.",
+        )
+        self.log_agent("Execucao recusada no parser: comando placeholder.")
+        return True
+
+    def command_output_is_placeholder_error(self, command, output):
+        if self.is_placeholder_command(command):
+            return True
+        normalized = self.normalize_plain_text(output or "")
+        if (
+            any(token in normalized for token in ("...", "\u2026", "'comando'", "'command'"))
+            and any(marker in normalized for marker in ("reconhecido", "recognized"))
+        ):
+            return True
+        placeholder_error_patterns = (
+            r"'\s*(?:\.\.\.|\u2026)\s*'.*nao e reconhecido",
+            r"'\s*(?:\.\.\.|\u2026)\s*'.*not recognized",
+            r"'\s*comando(?:\s+(?:real|completo|concreto|aqui))?\s*'.*nao e reconhecido",
+            r"'\s*command(?:\s+(?:real|complete|concrete|here))?\s*'.*not recognized",
+            r"'\s*(?:comando|command)\s*'.*nao e reconhecido",
+            r"'\s*(?:comando|command)\s*'.*not recognized",
+            r"'\s*`+\s*'.*nao e reconhecido",
+            r"'\s*`+\s*'.*not recognized",
+            r"(?:^|\s)(?:\.{3}|\u2026)(?:\s|$).*nao e reconhecido",
+            r"(?:^|\s)(?:\.{3}|\u2026)(?:\s|$).*not recognized",
+        )
+        return any(re.search(pattern, normalized) for pattern in placeholder_error_patterns)
+
+    def command_output_requires_admin(self, output):
+        normalized = self.normalize_plain_text(output or "")
+        markers = (
+            "requires elevation",
+            "requested operation requires elevation",
+            "operation requires elevation",
+            "error 740",
+            "erro 740",
+            "winerror 5",
+            "access is denied",
+            "access denied",
+            "acesso negado",
+            "permission denied",
+            "privilegios de administrador",
+            "privilegio de administrador",
+            "administrator privileges",
+            "administrative privileges",
+            "run as administrator",
+            "execute como administrador",
+            "requer eleva",
+            "requer elevacao",
+            "requer privilegios elevados",
+            "permissao elevada",
+            "permissoes elevadas",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def powershell_quote(self, value):
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def ask_admin_command_approval(self, command, requester="A IA"):
+        requester = requester or "A IA"
+        title = "Autorizar comando como administrador?"
+        message = (
+            f"{requester} pediu para executar um comando com privilegios de administrador.\n\n"
+            f"Comando:\n{command}\n\n"
+            "Se voce aceitar, o Windows ainda vai mostrar o prompt UAC."
+        )
+        if threading.current_thread() is threading.main_thread():
+            return messagebox.askyesno(title, message)
+
+        result_queue = queue.Queue(maxsize=1)
+
+        def ask():
+            try:
+                result_queue.put(bool(messagebox.askyesno(title, message)))
+            except Exception as exc:
+                result_queue.put(exc)
+
+        self.after(0, ask)
+        result = result_queue.get()
+        if isinstance(result, Exception):
+            raise result
+        return bool(result)
+
+    def _agent_execute_admin(
+        self,
+        command,
+        task_objective=None,
+        action_depth=0,
+        task_id=None,
+        requester="A IA",
+        terminal_source="via IA como administrador",
+    ):
+        if self.is_task_cancelled(task_id):
+            self.log_agent(f"Comando elevado ignorado apos cancelamento: {command}")
+            return
+        command = self.clean_admin_command(command)
+        if self.is_placeholder_command(command):
+            self.add_chat_message(
+                "Erro",
+                "EXECUTE_ADMIN precisa receber um comando real. Nao use reticencias nem texto como 'como administrador'.",
+            )
+            self.log_agent("Execucao elevada recusada: comando vazio ou placeholder.")
+            self.add_chat_message(
+                "Sistema",
+                "A IDE bloqueou um pedido de administrador sem comando real. Para elevar, envie uma tag EXECUTE_ADMIN ja preenchida, por exemplo [EXECUTE_ADMIN: whoami /groups].",
+            )
+            return
+        if os.name != "nt":
+            self.add_chat_message("Erro", "EXECUTE_ADMIN esta implementado para Windows/UAC neste momento.")
+            return
+
+        try:
+            approved = self.ask_admin_command_approval(command, requester=requester)
+        except Exception as exc:
+            self.add_chat_message("Erro", f"Falha ao pedir autorizacao de administrador: {exc}")
+            return
+
+        if not approved:
+            self.add_chat_message("Sistema", "Execucao elevada cancelada pelo usuario.")
+            self.log_agent(f"Execucao elevada negada pelo usuario: {command}")
+            return
+
+        self.log_agent(f"Solicitando UAC para comando: {command}")
+        self.append_to_term(f"\n> {command} ({terminal_source})\n")
+        self.tabview.set("Terminal Local")
+        self.set_ai_busy(True)
+        self.set_ai_activity("IA aguardando autorizacao do Windows")
+        self.set_terminal_busy(True, f"Admin: {command[:70]}")
+
+        def run():
+            try:
+                workspace = str(Path(self.current_workspace).resolve())
+                elevated_command = (
+                    f'cd /d "{workspace}" && {command} '
+                    "& echo. & echo [Merotec IA] Comando elevado finalizado. "
+                    "& echo Feche esta janela quando terminar."
+                )
+                script = (
+                    "$argList = @('/k', "
+                    f"{self.powershell_quote(elevated_command)}"
+                    "); "
+                    "Start-Process -FilePath 'cmd.exe' -ArgumentList $argList -Verb RunAs"
+                )
+                process = subprocess.Popen(
+                    ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    cwd=self.current_workspace,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                )
+                output, _ = process.communicate(timeout=30)
+                if output:
+                    self.append_to_term(output)
+                if process.returncode == 0:
+                    self.append_to_term("\n[pedido UAC enviado ao Windows]\n")
+                    self.add_chat_message(
+                        "Sistema",
+                        "Pedido de administrador enviado. Confirme o UAC do Windows para o comando rodar em uma janela elevada.",
+                    )
+                else:
+                    self.append_to_term(f"\n[falha ao solicitar UAC: codigo {process.returncode}]\n")
+                    self.add_chat_message(
+                        "Erro",
+                        f"Nao consegui abrir o prompt de administrador.\n\n{(output or '').strip()}",
+                    )
+            except subprocess.TimeoutExpired:
+                self.append_to_term("\n[timeout ao solicitar UAC]\n")
+                self.add_chat_message("Erro", "O pedido de administrador demorou demais para responder.")
+            except Exception as exc:
+                self.add_chat_message("Erro", f"Falha na execucao elevada: {exc}")
+            finally:
+                self.set_terminal_busy(False)
+                self.set_ai_busy(False)
+
+        threading.Thread(target=run, daemon=True).start()
+
     def _agent_execute(self, command, task_objective=None, action_depth=0, task_id=None):
         if self.is_task_cancelled(task_id):
             self.log_agent(f"Comando ignorado apos cancelamento: {command}")
             return
         command = command.strip()
+        if self.is_placeholder_command(command):
+            self.add_chat_message(
+                "Erro",
+                "EXECUTE precisa receber um comando real. A IDE recusou reticencias ou placeholder.",
+            )
+            self.log_agent("Execucao recusada: comando vazio ou placeholder.")
+            self.add_chat_message(
+                "Sistema",
+                "A IDE bloqueou um comando sem conteudo real. Isso evita repetir reticencias no terminal.",
+            )
+            return
+        if self.is_admin_execute_request(command):
+            admin_command = self.clean_admin_command(command)
+            self._agent_execute_admin(
+                admin_command,
+                task_objective=task_objective,
+                action_depth=action_depth,
+                task_id=task_id,
+            )
+            return
         if self.is_http_server_command(command):
             self._agent_start_http_server(command, task_objective=task_objective, action_depth=action_depth, task_id=task_id)
             return
@@ -2722,6 +3268,28 @@ class AgentActionsMixin:
                 diagnostic = ""
                 if process.returncode != 0:
                     diagnostic = self.build_command_failure_diagnostic(command, output, process.returncode)
+                    if self.command_output_is_placeholder_error(command, output):
+                        self.add_chat_message(
+                            "Sistema",
+                            "A IDE interrompeu a repeticao: o terminal recebeu um placeholder em vez de um comando real.",
+                        )
+                        self.add_chat_message(
+                            "Merotec AI",
+                            "Para pedir administrador, use EXECUTE_ADMIN somente com comando real ja preenchido, por exemplo [EXECUTE_ADMIN: whoami /groups]. Sem comando real, a resposta correta e concluir em texto.",
+                        )
+                        return
+                    if self.command_output_requires_admin(output):
+                        self.add_chat_message(
+                            "Sistema",
+                            "O comando falhou por permissao/elevacao. A IDE vai pedir autorizacao de administrador ao usuario.",
+                        )
+                        self._agent_execute_admin(
+                            command,
+                            task_objective=task_objective,
+                            action_depth=action_depth,
+                            task_id=task_id,
+                        )
+                        return
                 context = (
                     f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or command}\n\n"
                     f"Comando executado: {command}\n"
