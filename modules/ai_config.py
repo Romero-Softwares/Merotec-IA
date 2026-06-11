@@ -6,6 +6,7 @@ from pathlib import Path
 
 import customtkinter as ctk
 
+from modules.app_constants import IGNORED_DIRS, IGNORED_SUFFIXES, PROJECT_ROOT
 from modules.engine import UniversalEngine
 from modules.ui_theme import THEME
 

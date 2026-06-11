@@ -184,6 +184,8 @@ class AppStateMixin:
 
         self.current_workspace = str(resolved)
         os.chdir(self.current_workspace)
+        if hasattr(self, "memory_subnet"):
+            self.memory_subnet.reset_workspace(resolved)
         self.workspace_label.configure(text=self._workspace_title())
         self.load_workspace_files()
         self._write_history(self.current_workspace)

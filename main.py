@@ -101,6 +101,7 @@ from modules.agent_actions import AgentActionsMixin
 from modules.app_state import AppStateMixin
 from modules.engine import UniversalEngine
 from modules.executor import CodeExecutor
+from modules.memory import MemorySubnet
 from modules.project_manager import ProjectManager
 from modules.ui_theme import THEME
 from modules.workspace_intelligence import WorkspaceIntelligenceMixin
@@ -140,6 +141,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.command_failure_signatures = {}
         self.ai_read_history = {}
         self.ai_search_history = {}
+        self.memory_subnet = MemorySubnet(self.current_workspace)
         self.ai_task_metrics = {}
         self.ai_passive_action_count = 0
         self.max_ai_passive_actions = 18

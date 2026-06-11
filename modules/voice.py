@@ -14,6 +14,19 @@ import difflib
 from queue import Empty, Queue
 
 
+def _normalizar_texto_para_fala(text):
+    texto = str(text or "")
+    texto = re.sub(r"```.*?```", " ", texto, flags=re.DOTALL)
+    texto = re.sub(
+        r"\[(?:READ|WRITE|REPLACE|SEARCH_TEXT|SCAN_TEXT|FIX_MOJIBAKE|EXECUTE|OPEN_URL|SCREENSHOT|HUMAN_TEST|UNDO):[^\]]+\]",
+        " ",
+        texto,
+    )
+    texto = texto.replace("```", " ")
+    texto = re.sub(r"[*_`>#|\[\]{}]", " ", texto)
+    texto = re.sub(r"\s+", " ", texto)
+    return texto.strip()
+
 class VoiceModule:
     def __init__(self):
         self.recognizer = sr.Recognizer()
@@ -71,11 +84,11 @@ class VoiceModule:
         self.keyword_min_command_seconds = 1.4
         self.queue = Queue()
 
-        # Worker que gerencia o motor de voz sem conflitos
+        # Processo auxiliar que gerencia o motor de voz sem conflitos
         threading.Thread(target=self._worker, daemon=True).start()
 
     def _worker(self):
-        """Worker simplificado para gerenciar pedidos de fala"""
+        """Processo auxiliar simplificado para gerenciar pedidos de fala"""
         while True:
             texto_completo = self.queue.get()
             if texto_completo is None: break
@@ -116,10 +129,10 @@ class VoiceModule:
                 engine.setProperty('rate', 180)
 
                 # Limpamos o texto de caracteres que fazem o motor parar cedo
-                texto_limpo = text.replace('\n', ' ').replace('```', '').strip()
+                texto_limpo = _normalizar_texto_para_fala(text)
 
                 # Dividimos apenas em partes grandes (parágrafos)
-                partes = texto_limpo.split('. ')
+                partes = [texto_limpo] if texto_limpo else []
 
                 for parte in partes:
                     if self.stop_requested:

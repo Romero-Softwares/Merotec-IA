@@ -9,6 +9,7 @@ from decimal import Decimal, DivisionByZero, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
 from modules.app_constants import IGNORED_DIRS, IGNORED_SUFFIXES
+from modules.memory import MemorySubnet
 
 
 class WorkspaceIntelligenceMixin:
@@ -698,6 +699,12 @@ class WorkspaceIntelligenceMixin:
         key_files = self.local_key_files(files, limit=14)
         manifest = self.build_project_manifest(files, limit=130 if deep else 90)
         subprojects = self.detect_subprojects(files, limit=40 if deep else 20)
+        recent_changes = []
+        if hasattr(self, "recent_change_records"):
+            recent_changes = self.recent_change_records(limit=10)
+        self.memory_subnet = MemorySubnet(workspace)
+        self.memory_subnet.ingest_project_signals(files, summary=summary, recent_changes=recent_changes)
+        memory_subnet = self.memory_subnet.format_for_agent(limit=14 if deep else 10)
         run_hints = []
         if (workspace / "pubspec.yaml").exists():
             run_hints.extend([
@@ -722,6 +729,8 @@ class WorkspaceIntelligenceMixin:
             f"{subprojects}\n\n"
             "Historico recente que deve ser lembrado:\n"
             f"{self.format_recent_changes_for_agent(limit=10)}\n\n"
+            "Sub-rede de memoria do projeto:\n"
+            f"{memory_subnet}\n\n"
             "Direcionamento de trabalho:\n"
             + "\n".join(run_hints)
             + "\n- Entenda o projeto como um todo antes de editar, mas nao repita leitura do mesmo arquivo em loop.\n"
