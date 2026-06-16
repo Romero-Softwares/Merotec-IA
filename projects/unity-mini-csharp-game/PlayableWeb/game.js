@@ -141,6 +141,7 @@
       player.grounded = false;
     }
   }
+  
 
   function movePlayer() {
     player.vx *= world.friction;

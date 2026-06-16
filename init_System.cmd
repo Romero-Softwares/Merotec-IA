@@ -30,7 +30,7 @@ set "TCL_LIBRARY=%LOCALAPPDATA%\Programs\Python\Python314\tcl\tcl8.6"
 set "TK_LIBRARY=%LOCALAPPDATA%\Programs\Python\Python314\tcl\tk8.6"
 if "%AI_PROVIDER%"=="" set "AI_PROVIDER=codex"
 echo [IA] motor principal: %AI_PROVIDER%
-echo [IA] Codex usa a conta ja logada no Windows.
+echo [IA] O Codex usa a conta ja logada no Windows.
 echo.
 echo ********************************************************
 echo.

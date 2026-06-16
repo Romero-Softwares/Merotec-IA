@@ -2,21 +2,26 @@ from pathlib import Path
 
 
 APP_NAME = "Merotec IA IDE"
-CHAT_TAB_NAME = "Chat AI"
+CHAT_TAB_NAME = "Chat IA"
 CORE_TABS = {CHAT_TAB_NAME, "Chat IA", "Scratchpad", "Terminal Local", "Log do Agente"}
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_WORKSPACE = PROJECT_ROOT / "projects"
+PROJECTS_DIR = PROJECT_ROOT / "projects"
+DEFAULT_WORKSPACE = PROJECT_ROOT
 APP_SETTINGS_FILE = PROJECT_ROOT / "ide_settings.json"
 APP_HISTORY_FILE = PROJECT_ROOT / "history.json"
 APP_CHANGE_HISTORY_FILE = PROJECT_ROOT / "change_history.json"
+MEROTEC_SYSTEM_AI_DIR = PROJECT_ROOT / ".merotec_system_ai"
 
 DEFAULT_APP_SETTINGS = {
     "last_workspace": "",
     "recent_projects": [],
     "ai_provider": "codex",
     "codex_model_name": "",
-    "codex_reasoning_effort": "xhigh",
+    "codex_reasoning_effort": "high",
+    "autonomous_unrestricted_mode": True,
+    "codex_auto_approve_app_server_requests": True,
+    "codex_app_server_approval_policy": "on-request",
 }
 
 SCRATCHPAD_DEFAULT_TEXT = """# Como configurar um modelo de IA nesta IDE
@@ -31,7 +36,7 @@ SCRATCHPAD_DEFAULT_TEXT = """# Como configurar um modelo de IA nesta IDE
 # 2. Configure as variaveis no PowerShell:
 #    setx AI_PROVIDER "openai"
 #    setx OPENAI_API_KEY "cole_sua_chave_aqui"
-#    setx OPENAI_MODEL_NAME "gpt-5.2"
+#    setx OPENAI_MODEL_NAME "gpt-5.5"
 # 3. Feche e abra a IDE novamente.
 #
 # Opcao Google:
@@ -57,6 +62,8 @@ IGNORED_DIRS = {
     ".dart_tool",
     ".merotec_attachments",
     ".merotec_backups",
+    ".merotec_local_ai",
+    ".merotec_system_ai",
     ".tool_appdata",
     ".mypy_cache",
     ".pytest_cache",

@@ -43,6 +43,10 @@ class UniversalEngine:
         self.active_process = None
         self.cancel_requested = False
         self.model_id = self._resolve_model_id()
+        self.latest_rate_limits = None
+        self.latest_token_usage = None
+        self.latest_quota_problem = ""
+        self.latest_quota_updated_at = 0
         self.system_instruction = self._build_system_instruction()
         self.generation_config = self._build_google_generation_config()
 
@@ -80,6 +84,202 @@ class UniversalEngine:
             key_state = "chave ok" if self.client else "sem chave"
         effort = f" | raciocinio {self.codex_reasoning_effort}" if self.provider == "codex" else ""
         return f"{self.provider.upper()} | {self.model_id}{effort} | {key_state}"
+
+    def quota_status_text(self):
+        model = self.model_id or "modelo atual"
+        if self.provider == "codex" and self.codex_reasoning_effort:
+            model = f"{model}/{self.codex_reasoning_effort}"
+        prefix = f"{self.provider.upper()} {model}"
+
+        if self.latest_quota_problem:
+            return f"{prefix} | {self.latest_quota_problem}"
+
+        rate_text = self._format_rate_limit_status(self.latest_rate_limits)
+        token_text = self._format_token_usage_status(self.latest_token_usage)
+        if rate_text and token_text:
+            return f"{prefix} | {rate_text} | {token_text}"
+        if rate_text:
+            return f"{prefix} | {rate_text}"
+        if token_text:
+            return f"{prefix} | {token_text}"
+        return f"{prefix} | uso aguardando"
+
+    def _remember_rate_limits(self, payload):
+        if not isinstance(payload, dict):
+            return
+        rate_limits = payload.get("rateLimits") if "rateLimits" in payload else payload
+        by_limit = payload.get("rateLimitsByLimitId")
+        if isinstance(by_limit, dict):
+            rate_limits = by_limit.get("codex") or rate_limits or next(iter(by_limit.values()), None)
+        if isinstance(rate_limits, dict):
+            self.latest_rate_limits = rate_limits
+            self.latest_quota_updated_at = time.time()
+            reached = str(rate_limits.get("rateLimitReachedType") or "").strip()
+            credits = rate_limits.get("credits") or {}
+            if reached:
+                self.latest_quota_problem = self._human_rate_limit_reached(reached)
+            elif isinstance(credits, dict) and credits.get("hasCredits") is False and not credits.get("unlimited"):
+                self.latest_quota_problem = "creditos esgotados"
+            else:
+                self.latest_quota_problem = ""
+
+    def _remember_token_usage(self, payload):
+        if not isinstance(payload, dict):
+            return
+        token_usage = payload.get("tokenUsage") if "tokenUsage" in payload else payload
+        if isinstance(token_usage, dict):
+            self.latest_token_usage = token_usage
+            self.latest_quota_updated_at = time.time()
+
+    def _remember_openai_usage(self, usage):
+        if not isinstance(usage, dict):
+            return
+        input_tokens = usage.get("input_tokens", usage.get("inputTokens", 0)) or 0
+        output_tokens = usage.get("output_tokens", usage.get("outputTokens", 0)) or 0
+        total_tokens = usage.get("total_tokens", usage.get("totalTokens"))
+        if total_tokens is None:
+            try:
+                total_tokens = int(input_tokens) + int(output_tokens)
+            except (TypeError, ValueError):
+                total_tokens = 0
+        self._remember_token_usage(
+            {
+                "last": {
+                    "cachedInputTokens": usage.get("cached_input_tokens", usage.get("cachedInputTokens", 0)) or 0,
+                    "inputTokens": input_tokens,
+                    "outputTokens": output_tokens,
+                    "reasoningOutputTokens": usage.get(
+                        "reasoning_output_tokens",
+                        usage.get("reasoningOutputTokens", 0),
+                    ) or 0,
+                    "totalTokens": total_tokens,
+                },
+                "total": {
+                    "cachedInputTokens": usage.get("cached_input_tokens", usage.get("cachedInputTokens", 0)) or 0,
+                    "inputTokens": input_tokens,
+                    "outputTokens": output_tokens,
+                    "reasoningOutputTokens": usage.get(
+                        "reasoning_output_tokens",
+                        usage.get("reasoningOutputTokens", 0),
+                    ) or 0,
+                    "totalTokens": total_tokens,
+                },
+            }
+        )
+
+    def _remember_quota_error(self, payload):
+        if not isinstance(payload, dict):
+            return
+        error = payload.get("error") or payload
+        if not isinstance(error, dict):
+            return
+        text = " ".join(
+            str(value)
+            for value in (
+                error.get("message"),
+                error.get("additionalDetails"),
+                error.get("codexErrorInfo"),
+            )
+            if value
+        ).lower()
+        if "usagelimitexceeded" in text or "usage limit" in text or "rate limit" in text:
+            self.latest_quota_problem = "sem cota/limite atingido"
+            self.latest_quota_updated_at = time.time()
+
+    def _remember_app_server_quota_message(self, method, params):
+        lower_method = (method or "").lower()
+        if "ratelimits" in lower_method:
+            self._remember_rate_limits(params)
+        if "tokenusage" in lower_method or "token_usage" in lower_method:
+            self._remember_token_usage(params)
+        if lower_method in {"error", "warning"} or lower_method.endswith("/error"):
+            self._remember_quota_error(params)
+
+    def _human_rate_limit_reached(self, value):
+        labels = {
+            "rate_limit_reached": "limite de taxa atingido",
+            "workspace_owner_credits_depleted": "creditos do workspace esgotados",
+            "workspace_member_credits_depleted": "creditos do membro esgotados",
+            "workspace_owner_usage_limit_reached": "limite do workspace atingido",
+            "workspace_member_usage_limit_reached": "limite do membro atingido",
+        }
+        return labels.get(value, value.replace("_", " "))
+
+    def _format_rate_limit_status(self, rate_limits):
+        if not isinstance(rate_limits, dict):
+            return ""
+        pieces = []
+        plan = rate_limits.get("planType")
+        if plan and plan != "unknown":
+            pieces.append(str(plan))
+        limit_name = rate_limits.get("limitName") or rate_limits.get("limitId")
+        if limit_name:
+            pieces.append(str(limit_name))
+        for label, key in (("janela", "primary"), ("extra", "secondary")):
+            window = rate_limits.get(key)
+            if not isinstance(window, dict):
+                continue
+            used = window.get("usedPercent")
+            if used is None:
+                continue
+            window_text = f"{label} {used}%"
+            reset_text = self._format_reset_time(window.get("resetsAt"))
+            if reset_text:
+                window_text += f" reset {reset_text}"
+            pieces.append(window_text)
+        credits = rate_limits.get("credits")
+        if isinstance(credits, dict):
+            if credits.get("unlimited"):
+                pieces.append("creditos ilimitados")
+            elif credits.get("balance"):
+                pieces.append(f"creditos {credits.get('balance')}")
+        return " | ".join(pieces)
+
+    def _format_token_usage_status(self, token_usage):
+        if not isinstance(token_usage, dict):
+            return ""
+        total = token_usage.get("total") or {}
+        last = token_usage.get("last") or {}
+        total_tokens = total.get("totalTokens") if isinstance(total, dict) else None
+        last_tokens = last.get("totalTokens") if isinstance(last, dict) else None
+        context_window = token_usage.get("modelContextWindow")
+        if total_tokens is not None and context_window:
+            return f"ctx {self._compact_number(total_tokens)}/{self._compact_number(context_window)}"
+        if total_tokens is not None:
+            return f"tokens {self._compact_number(total_tokens)}"
+        if last_tokens is not None:
+            return f"ultima {self._compact_number(last_tokens)} tokens"
+        return ""
+
+    def _format_reset_time(self, value):
+        try:
+            timestamp = int(value)
+        except (TypeError, ValueError):
+            return ""
+        if timestamp <= 0:
+            return ""
+        if timestamp > 10_000_000_000:
+            timestamp = timestamp // 1000
+        seconds = max(0, int(timestamp - time.time()))
+        if seconds <= 0:
+            return "agora"
+        minutes = max(1, round(seconds / 60))
+        if minutes < 60:
+            return f"{minutes}min"
+        hours = minutes // 60
+        minutes = minutes % 60
+        return f"{hours}h{minutes:02d}"
+
+    def _compact_number(self, value):
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if number >= 1_000_000:
+            return f"{number / 1_000_000:.1f}M"
+        if number >= 1_000:
+            return f"{number / 1_000:.1f}k"
+        return str(number)
 
     def _find_codex_executable(self):
         candidates = []
@@ -158,6 +358,7 @@ Voce pode solicitar acoes da IDE usando tags especiais:
 [WRITE: caminho/arquivo.py] ... [/WRITE] para criar ou sobrescrever arquivo com backup automatico.
 [REPLACE: caminho/arquivo.py] [OLD] trecho atual exato [/OLD] [NEW] trecho novo [/NEW] [/REPLACE] para trocar um trecho pequeno com backup automatico.
 [SEARCH_TEXT: padrao | caminho/arquivo.py] para a IDE buscar termos ou regex em arquivo sem usar terminal.
+[WEB_SEARCH: consulta objetiva] para a IDE buscar na internet quando a solucao depender de documentacao externa, fatos atuais ou erro desconhecido.
 [SCAN_TEXT: caminho/arquivo.py] para a IDE localizar caracteres corrompidos/mojibake e problemas de texto sem usar terminal.
 [FIX_MOJIBAKE: caminho/arquivo.py] para a IDE corrigir mojibake comum com backup automatico.
 Para rodar terminal, envie uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: python -m unittest].
@@ -189,13 +390,15 @@ Regras:
 - Nao revele raciocinio interno detalhado; mostre apenas a decisao, a acao e o resultado.
 - Use apenas caminhos relativos ao workspace, como `app.py`, `src/main.py` ou `style.css`.
 - Nunca use caminhos absolutos como `C:/...`.
-- Use os recursos da IDE por tags. Nao execute comandos diretamente pelo app-server quando puder usar uma tag EXECUTE ja preenchida.
-- Terminal e apenas ferramenta de validacao/inspecao. Para corrigir problema, primeiro leia/altere arquivos com [READ]/[WRITE].
-- Nunca edite arquivos usando EXECUTE com PowerShell, Set-Content, -replace, redirecionamento, sed ou comandos parecidos. Edicao de arquivo deve ser sempre [WRITE] ou [REPLACE].
+- Use tags da IDE ou ferramentas diretas do app-server; escolha o caminho real mais confiavel para concluir a tarefa.
+- Terminal e app-server podem ser usados para inspecao, validacao e comandos reais dentro do workspace.
+- Para edicoes pequenas, prefira [WRITE]/[REPLACE]; se usar ferramenta direta do app-server, mantenha tudo dentro do workspace e relate o que mudou.
 - Para alterar um trecho pequeno de arquivo grande, prefira [REPLACE] com o trecho OLD exatamente como foi lido pela IDE.
-- Para procurar caracteres corrompidos, mojibake ou texto quebrado, use [SCAN_TEXT], nao Select-String, rg, grep, findstr nem python -c.
-- Para verificar se existe uma funcao, recurso, variavel, termo ou logica no arquivo, use [SEARCH_TEXT: padrao | arquivo], nao terminal.
+- Para procurar caracteres corrompidos, mojibake ou texto quebrado, use [SCAN_TEXT] ou uma inspecao direta equivalente.
+- Para verificar se existe uma funcao, recurso, variavel, termo ou logica no arquivo, use [SEARCH_TEXT: padrao | arquivo] ou busca direta equivalente.
 - Depois de receber resultado de SEARCH_TEXT para uma pergunta simples de verificacao, responda a conclusao; nao faca novas buscas parecidas.
+- Para resolver problema que dependa de informacao atual, documentacao externa, erro desconhecido ou comportamento de biblioteca/servico que pode ter mudado, use [WEB_SEARCH: consulta objetiva] antes de concluir.
+- Depois de receber resultado de WEB_SEARCH, use as fontes encontradas para decidir a proxima acao; nao repita a mesma busca sem motivo.
 - Quando a varredura indicar mojibake comum, use [FIX_MOJIBAKE] antes de validar.
 - Para build, run, testes, iniciar servidor ou abrir app sem necessidade visual, responda com uma tag EXECUTE contendo o comando real.
 - Para comandos que realmente exigem administrador no Windows, responda com uma tag EXECUTE_ADMIN contendo o comando real. Nao escreva "como administrador" dentro de [EXECUTE].
@@ -206,9 +409,9 @@ Regras:
 - Para apps Flutter, `flutter run -d windows` ja faz build antes de executar no Windows.
 - Para comandos que podem ficar rodando, como `flutter run`, `npm run dev` ou servidores locais, use uma tag EXECUTE com o comando real e finalize sua resposta; a IDE mantem o terminal aberto.
 - Se um comando falhar, nao repita o mesmo comando antes de aplicar [WRITE] em pelo menos um arquivo suspeito ou ler um arquivo novo que explique a falha.
-- Antes de alterar arquivo que voce ainda nao leu, use apenas [READ: caminho].
+- Antes de alterar arquivo que voce ainda nao leu, prefira ler o trecho relevante por [READ] ou ferramenta direta equivalente.
 - Se a IDE informar que o arquivo e grande, use o indice recebido e peca intervalos com [READ: arquivo | linhas inicio-fim] ate ter contexto suficiente.
-- Nunca tente reescrever um arquivo grande inteiro usando apenas o resumo; primeiro leia os intervalos exatos que serao alterados.
+- Evite reescrever um arquivo grande inteiro usando apenas o resumo; primeiro leia os intervalos exatos quando isso reduzir risco.
 - Se a IDE informar "Leitura bloqueada para evitar ciclo infinito", pare de pedir READ desse arquivo e avance com [WRITE], uma tag EXECUTE com comando real ou uma conclusao objetiva.
 - Para arquivos grandes em uma unica pagina, como HTML com CSS/JS embutidos, apos mapear cabecalho, estilos, estado principal e loop/renderizacao, pare de ler e execute a alteracao pedida.
 - Prefira alteracoes pequenas, claras e verificaveis.
@@ -422,16 +625,23 @@ Regras:
         workspace = Path(workspace_path).resolve() if workspace_path else Path.cwd()
         selected_model = model_override or self.codex_model_name or "gpt-5.5"
         selected_effort = (reasoning_effort or self.codex_reasoning_effort or "xhigh").strip().lower()
+        approval_policy = (
+            os.getenv("MEROTEC_CODEX_APP_SERVER_APPROVAL_POLICY", "on-request").strip()
+            or "on-request"
+        )
+        if approval_policy not in {"on-request", "on-failure", "never", "untrusted"}:
+            approval_policy = "on-request"
         prompt_text = (
             "Voce esta respondendo dentro da Merotec IA IDE via Codex app-server.\n"
             f"Use raciocinio altissimo nesta tarefa: effort={selected_effort}.\n"
             "Use o workspace atual como projeto ativo.\n"
             "Responda com resultado final ou acao real. Nao escreva promessas como 'vou fazer' antes de executar.\n"
             "Se for usar uma tag da IDE, envie a tag diretamente, sem texto narrando intencao antes dela.\n"
-            "Prefira acionar os recursos da IDE por tags quando isso for suficiente, pois a IDE mostra essas acoes ao usuario.\n"
-            "Use [READ], [WRITE], [REPLACE], [SEARCH_TEXT], [SCAN_TEXT], [FIX_MOJIBAKE], tags EXECUTE/EXECUTE_ADMIN ja preenchidas, [OPEN_URL], [SCREENSHOT], [HUMAN_TEST] e [UNDO].\n"
-            "Se as tags da IDE estiverem limitando a conclusao da tarefa e o app-server disponibilizar ferramentas diretas, voce pode agir diretamente no workspace como Codex, mantendo as mudancas dentro da pasta do projeto e relatando o que fez.\n"
-            "Quando a tarefa for correcao/alteracao, priorize [READ], [SEARCH_TEXT], [SCAN_TEXT], [FIX_MOJIBAKE], [REPLACE] e [WRITE]. "
+            "Use tags da IDE ou ferramentas diretas do app-server; escolha o caminho real mais confiavel para concluir a tarefa.\n"
+            "Use [READ], [WRITE], [REPLACE], [SEARCH_TEXT], [WEB_SEARCH], [SCAN_TEXT], [FIX_MOJIBAKE], tags EXECUTE/EXECUTE_ADMIN ja preenchidas, [OPEN_URL], [SCREENSHOT], [HUMAN_TEST] e [UNDO].\n"
+            "Se as tags da IDE estiverem limitando a conclusao da tarefa e o app-server disponibilizar ferramentas diretas, aja diretamente no workspace como Codex, mantendo as mudancas dentro da pasta do projeto e relatando o que fez.\n"
+            "Quando a tarefa for correcao/alteracao, use [READ], [SEARCH_TEXT], [WEB_SEARCH], [SCAN_TEXT], [FIX_MOJIBAKE], [REPLACE], [WRITE] ou ferramentas diretas equivalentes. "
+            "Quando a solucao depender de documentacao externa, informacao atual ou erro desconhecido, use [WEB_SEARCH: consulta objetiva] para a IDE buscar na internet.\n"
             "Use uma tag EXECUTE com comando real para validar depois da correcao ou quando o pedido for apenas rodar/iniciar; use EXECUTE_ADMIN com comando real somente quando precisar UAC/administrador no Windows; use [HUMAN_TEST: auto] quando precisar abrir, capturar print e avaliar a tela como usuario.\n"
             "Nunca use reticencias, 'comando', 'comando real', texto entre sinais de menor/maior ou qualquer texto demonstrativo como se fosse comando real.\n"
             "Nunca copie literalmente 'comando concreto' nas tags [EXECUTE] ou [EXECUTE_ADMIN]; se ainda nao houver comando real, entregue uma conclusao em texto.\n"
@@ -591,17 +801,24 @@ Regras:
             wait_for_response(next_id, timeout=20)
             next_id += 1
             send("initialized", {})
+            try:
+                send("account/rateLimits/read", {}, next_id)
+                rate_limit_result = wait_for_response(next_id, timeout=8)
+                self._remember_rate_limits(rate_limit_result)
+                next_id += 1
+            except Exception:
+                next_id += 1
 
             thread_params = {
                 "cwd": str(workspace),
                 "developerInstructions": self.system_instruction,
                 "sandbox": "workspace-write",
-                "approvalPolicy": "on-request",
                 "approvalsReviewer": "user",
                 "personality": "friendly",
                 "threadSource": "user",
                 "ephemeral": True,
                 "modelReasoningEffort": selected_effort,
+                "approvalPolicy": approval_policy,
             }
             if selected_model:
                 thread_params["model"] = selected_model
@@ -621,7 +838,7 @@ Regras:
                 "threadId": thread_id,
                 "input": input_items,
                 "cwd": str(workspace),
-                "approvalPolicy": "on-request",
+                "approvalPolicy": approval_policy,
                 "sandboxPolicy": {
                     "type": "workspaceWrite",
                     "networkAccess": True,
@@ -670,6 +887,7 @@ Regras:
 
                 method = message.get("method", "")
                 params = message.get("params") or {}
+                self._remember_app_server_quota_message(method, params)
 
                 if handle_server_request(message):
                     continue
@@ -709,6 +927,7 @@ Regras:
                     turn = params.get("turn") or {}
                     if turn.get("status") == "failed":
                         error = turn.get("error") or {}
+                        self._remember_quota_error({"error": error})
                         last_error = error.get("message") or str(error)
                     else:
                         final_from_items = self._extract_app_server_final_message(turn)
@@ -1153,6 +1372,7 @@ Regras:
             )
             with urllib.request.urlopen(request, timeout=120) as response:
                 data = json.loads(response.read().decode("utf-8"))
+            self._remember_openai_usage(data.get("usage"))
             return self._extract_openai_text(data)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
@@ -1176,6 +1396,8 @@ Regras:
             )
 
         if status_code == 429 and code == "insufficient_quota":
+            self.latest_quota_problem = "sem cota disponivel"
+            self.latest_quota_updated_at = time.time()
             return (
                 "Sua chave foi aceita, mas a conta/projeto esta sem cota disponivel. "
                 "Verifique Billing, Usage e Limits na plataforma da OpenAI."

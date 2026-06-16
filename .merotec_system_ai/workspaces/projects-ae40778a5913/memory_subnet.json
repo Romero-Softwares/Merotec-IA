@@ -1,0 +1,148 @@
+{
+  "root_path": "C:\\Users\\Merotec\\Desktop\\AI_Software_Enginering\\projects",
+  "created_at": "2026-06-16T16:53:15",
+  "nodes": {
+    "workspace": {
+      "key": "workspace",
+      "kind": "workspace",
+      "label": "projects",
+      "weight": 3,
+      "metadata": {},
+      "updated_at": "2026-06-16T16:53:15"
+    },
+    "summary": {
+      "key": "summary",
+      "kind": "summary",
+      "label": "Projeto atual: projects",
+      "weight": 1,
+      "metadata": {
+        "text": "Projeto atual: projects\nTipo detectado: Web\nArquivos analisaveis: 8\nTamanho aproximado: 19.6 KB\nExtensoes principais: .cs: 4, .md: 1, .js: 1, .html: 1, .css: 1\n\nPastas principais:\n- unity-mini-csharp-game: 8 arquivo(s)\n\nArquivos-chave:\n- unity-mini-csharp-game/README.md\n- unity-mini-csharp-game/Assets/Scripts/Coin.cs\n- unity-mini-csharp-game/Assets/Scripts/EnemyPatrol.cs\n- unity-mini-csharp-game/Assets/Scripts/GameManager.cs\n- unity-mini-csharp-game/Assets/Scripts/PlayerController.cs\n- unity-mini-csharp-game/PlayableWeb/game.js\n- unity-mini-csharp-game/PlayableWeb/index.html\n- unity-mini-csharp-game/PlayableWeb/style.css\n\nObservacoes:\n- A estrutura esta limpa para leitura inicial."
+      },
+      "updated_at": "2026-06-16T16:53:15"
+    },
+    "unity-mini-csharp-game/README.md": {
+      "key": "unity-mini-csharp-game/README.md",
+      "kind": "file",
+      "label": "unity-mini-csharp-game/README.md",
+      "weight": 4,
+      "metadata": {
+        "suffix": ".md"
+      },
+      "updated_at": "2026-06-16T16:53:15"
+    },
+    "unity-mini-csharp-game/PlayableWeb/index.html": {
+      "key": "unity-mini-csharp-game/PlayableWeb/index.html",
+      "kind": "file",
+      "label": "unity-mini-csharp-game/PlayableWeb/index.html",
+      "weight": 4,
+      "metadata": {
+        "suffix": ".html"
+      },
+      "updated_at": "2026-06-16T16:53:15"
+    },
+    "ext:.cs": {
+      "key": "ext:.cs",
+      "kind": "extension",
+      "label": ".cs",
+      "weight": 4,
+      "metadata": {},
+      "updated_at": "2026-06-16T16:53:15"
+    },
+    "ext:.md": {
+      "key": "ext:.md",
+      "kind": "extension",
+      "label": ".md",
+      "weight": 1,
+      "metadata": {},
+      "updated_at": "2026-06-16T16:53:15"
+    },
+    "ext:.js": {
+      "key": "ext:.js",
+      "kind": "extension",
+      "label": ".js",
+      "weight": 1,
+      "metadata": {},
+      "updated_at": "2026-06-16T16:53:15"
+    },
+    "ext:.html": {
+      "key": "ext:.html",
+      "kind": "extension",
+      "label": ".html",
+      "weight": 1,
+      "metadata": {},
+      "updated_at": "2026-06-16T16:53:15"
+    },
+    "ext:.css": {
+      "key": "ext:.css",
+      "kind": "extension",
+      "label": ".css",
+      "weight": 1,
+      "metadata": {},
+      "updated_at": "2026-06-16T16:53:15"
+    },
+    "folder:unity-mini-csharp-game": {
+      "key": "folder:unity-mini-csharp-game",
+      "kind": "folder",
+      "label": "unity-mini-csharp-game",
+      "weight": 8,
+      "metadata": {},
+      "updated_at": "2026-06-16T16:53:15"
+    }
+  },
+  "edges": [
+    {
+      "source": "workspace",
+      "relation": "has_summary",
+      "target": "summary",
+      "weight": 2
+    },
+    {
+      "source": "workspace",
+      "relation": "entry_file",
+      "target": "unity-mini-csharp-game/README.md",
+      "weight": 3
+    },
+    {
+      "source": "workspace",
+      "relation": "entry_file",
+      "target": "unity-mini-csharp-game/PlayableWeb/index.html",
+      "weight": 3
+    },
+    {
+      "source": "workspace",
+      "relation": "uses_extension",
+      "target": "ext:.cs",
+      "weight": 4
+    },
+    {
+      "source": "workspace",
+      "relation": "uses_extension",
+      "target": "ext:.md",
+      "weight": 1
+    },
+    {
+      "source": "workspace",
+      "relation": "uses_extension",
+      "target": "ext:.js",
+      "weight": 1
+    },
+    {
+      "source": "workspace",
+      "relation": "uses_extension",
+      "target": "ext:.html",
+      "weight": 1
+    },
+    {
+      "source": "workspace",
+      "relation": "uses_extension",
+      "target": "ext:.css",
+      "weight": 1
+    },
+    {
+      "source": "workspace",
+      "relation": "has_folder",
+      "target": "folder:unity-mini-csharp-game",
+      "weight": 8
+    }
+  ]
+}

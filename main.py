@@ -1,4 +1,5 @@
 import json
+import keyword
 import locale
 import os
 import re
@@ -13,6 +14,7 @@ import textwrap
 import urllib.error
 import urllib.request
 import webbrowser
+import builtins
 import ctypes
 import unicodedata
 import difflib
@@ -76,10 +78,12 @@ _bootstrap_tcl_paths()
 import customtkinter as ctk
 import pygments
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+import tkinter.font as tkfont
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from PIL import Image, ImageDraw, ImageGrab, ImageTk
 from pygments.lexers import get_lexer_for_filename
 from pygments.styles import get_style_by_name
+from pygments.util import ClassNotFound
 
 from modules.app_constants import (
     APP_CHANGE_HISTORY_FILE,
@@ -93,6 +97,7 @@ from modules.app_constants import (
     FILE_ICON_COLORS,
     IGNORED_DIRS,
     IGNORED_SUFFIXES,
+    PROJECTS_DIR,
     PROJECT_ROOT,
     SCRATCHPAD_DEFAULT_TEXT,
 )
@@ -108,10 +113,38 @@ from modules.workspace_intelligence import WorkspaceIntelligenceMixin
 from modules.voice import VoiceModule
 
 
-MAIN_WINDOW_TITLE = f"{APP_NAME} - IA Engineering Workspace"
+BASE_MAIN_WINDOW_TITLE = f"{APP_NAME} - IA Engineering Workspace"
+
+
+def _truthy_env(name):
+    value = os.environ.get(name, "")
+    return str(value).strip().lower() in {"1", "true", "yes", "sim", "on"}
+
+
+def _single_instance_bypass_requested():
+    return (
+        _truthy_env("MEROTEC_FORCE_NEW_INSTANCE")
+        or _truthy_env("MEROTEC_HUMAN_TEST_INSTANCE")
+        or _truthy_env("MEROTEC_VISUAL_TEST_INSTANCE")
+        or bool(os.environ.get("MEROTEC_INSTANCE_TITLE_SUFFIX", "").strip())
+    )
+
+
+def _instance_title_suffix():
+    suffix = os.environ.get("MEROTEC_INSTANCE_TITLE_SUFFIX", "").strip()
+    if suffix:
+        return suffix
+    if _truthy_env("MEROTEC_HUMAN_TEST_INSTANCE") or _truthy_env("MEROTEC_VISUAL_TEST_INSTANCE"):
+        return f" - teste visual {os.getpid()}"
+    return ""
+
+
+MAIN_WINDOW_TITLE = f"{BASE_MAIN_WINDOW_TITLE}{_instance_title_suffix()}"
 
 
 def _activate_existing_instance():
+    if _single_instance_bypass_requested():
+        return False
     if sys.platform != "win32":
         return False
     try:
@@ -140,8 +173,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         ctk.set_default_color_theme("blue")
 
         self.title(MAIN_WINDOW_TITLE)
-        self.geometry("1280x780")
-        self.minsize(1050, 660)
+        self._configure_initial_window_size()
         self.configure(fg_color=THEME["bg"])
         self.protocol("WM_DELETE_WINDOW", self.request_app_close)
 
@@ -219,10 +251,20 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.sidebar_width = 228
         self.explorer_width = 270
         self.explorer_refresh_job = None
+        self.editor_font_size = 14
+        self.editor_tab_spaces = 4
+        self.editor_completion_popup = None
+        self.editor_completion_listbox = None
+        self.editor_completion_items = []
+        self.editor_completion_context = None
+        self.editor_completion_prefix = ""
+        self.editor_completion_job = None
+        self.editor_symbol_cache = []
+        self.editor_symbol_cache_signature = None
 
         self.engine = UniversalEngine()
         self.voice = VoiceModule()
-        self.pm = ProjectManager(str(DEFAULT_WORKSPACE))
+        self.pm = ProjectManager(str(PROJECTS_DIR))
         self.executor = CodeExecutor()
 
         self.style = get_style_by_name("monokai")
@@ -232,8 +274,38 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self._bind_shortcuts()
         self.load_workspace_files()
         self.set_status("Pronto para trabalhar.", "ready")
+        self.after(450, self.show_local_subnet_status)
         self.after(900, self.ensure_codex_ready)
         self.after(1400, self.start_voice_keyword_listener)
+
+    def _available_screen_area(self):
+        if sys.platform == "win32":
+            try:
+                class Rect(ctypes.Structure):
+                    _fields_ = [
+                        ("left", ctypes.c_long),
+                        ("top", ctypes.c_long),
+                        ("right", ctypes.c_long),
+                        ("bottom", ctypes.c_long),
+                    ]
+
+                rect = Rect()
+                if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
+                    width = max(1, rect.right - rect.left)
+                    height = max(1, rect.bottom - rect.top)
+                    return rect.left, rect.top, width, height
+            except Exception:
+                pass
+        return 0, 0, self.winfo_screenwidth(), self.winfo_screenheight()
+
+    def _configure_initial_window_size(self):
+        left, top, work_width, work_height = self._available_screen_area()
+        width = min(1280, max(1050, work_width - 80))
+        height = min(820, max(690, work_height - 72))
+        x = left + max(0, (work_width - width) // 2)
+        y = top + max(0, (work_height - height) // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.minsize(min(1050, max(900, work_width - 80)), min(620, max(560, work_height - 80)))
 
     def _build_menu(self):
         self._configure_native_menu_style()
@@ -258,6 +330,9 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         editor_menu = self._native_menu()
         editor_menu.add_command(label="Fechar aba atual", accelerator="Ctrl+W", command=self.close_current_tab)
         editor_menu.add_command(label="Executar Python atual", accelerator="Ctrl+R", command=self.run_current_python_file)
+        editor_menu.add_separator()
+        editor_menu.add_command(label="Sugestoes de codigo", accelerator="Ctrl+Espaco", command=self.show_editor_completion)
+        editor_menu.add_command(label="Buscar classe/metodo", accelerator="Ctrl+Shift+O", command=self.show_symbol_palette)
         self.menu.add_cascade(label="Editor", menu=editor_menu)
 
         self.visual_menus = [file_menu, view_menu, editor_menu]
@@ -389,7 +464,6 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 self.set_status(f"Erro em {label}.", "error")
                 self.add_chat_message("Erro", f"Falha ao executar {label}: {exc}")
                 self.log_agent(f"Erro no botao {label}: {exc}")
-
         return run
 
     def _build_layout(self):
@@ -445,7 +519,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
         self.ai_status_label = ctk.CTkLabel(
             self.sidebar,
-            text=self.engine.status_text(),
+            text=self.ai_status_text(),
             font=("Segoe UI", 11),
             text_color=THEME["muted"],
             wraplength=180,
@@ -454,11 +528,9 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.ai_status_label.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 12))
 
         buttons = [
-            ("Abrir Projeto", self.open_project),
             ("Configurar IA", self.configure_ai),
             ("Entrar Codex", self.launch_codex_login),
             ("Atualizar Explorer", self.load_workspace_files),
-            ("Anexar Arquivo", self.upload_and_update_code),
             ("Comando por Voz", self.voice_command),
         ]
 
@@ -502,8 +574,9 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             wrap="word",
         )
         self.agent_summary.grid(row=13, column=0, sticky="ew", padx=18, pady=(10, 18))
+        self._style_text_surface(self.agent_summary, THEME["panel_alt"], THEME["muted"])
         self._show_ctk_textbox_scrollbar(self.agent_summary)
-        self._replace_text(self.agent_summary, "Acoes do agente aparecem aqui.")
+        self._replace_text(self.agent_summary, "Ações do agente aparecem aqui.")
 
     def _build_explorer(self):
         self.explorer = ctk.CTkFrame(self, fg_color=THEME["panel_alt"], corner_radius=0)
@@ -592,6 +665,301 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         except tk.TclError:
             pass
 
+    def _style_text_surface(self, widget, bg=None, fg=None):
+        target = getattr(widget, "_textbox", widget)
+        try:
+            target.configure(
+                background=bg or THEME["panel_alt"],
+                foreground=fg or THEME["text"],
+                insertbackground=THEME["accent"],
+                selectbackground=THEME["accent_dark"],
+                selectforeground="#ffffff",
+                inactiveselectbackground="#22364f",
+                highlightthickness=0,
+                borderwidth=0,
+                relief="flat",
+            )
+        except tk.TclError:
+            pass
+
+    def _configure_editor_tabs(self, editor):
+        tab = " " * max(1, int(getattr(self, "editor_tab_spaces", 4)))
+        try:
+            font = tkfont.Font(font=editor.cget("font"))
+            editor.configure(tabs=(font.measure(tab),))
+        except tk.TclError:
+            pass
+
+    def _current_editor_info(self):
+        try:
+            tab_name = self.tabview.get()
+        except (tk.TclError, AttributeError):
+            tab_name = "Scratchpad"
+        info = self.open_editors.get(tab_name)
+        if info:
+            return tab_name, info
+        if "Scratchpad" in self.open_editors:
+            return "Scratchpad", self.open_editors["Scratchpad"]
+        return None, None
+
+    def _current_editor(self):
+        _tab_name, info = self._current_editor_info()
+        return info.get("widget") if info else None
+
+    def _selected_editor_lines(self, editor):
+        try:
+            first = editor.index("sel.first linestart")
+            last = editor.index("sel.last lineend")
+            return first, last, True
+        except tk.TclError:
+            return editor.index("insert linestart"), editor.index("insert lineend"), False
+
+    def indent_editor_selection(self, tab_name, event=None):
+        info = self.open_editors.get(tab_name)
+        if not info:
+            return "break"
+        editor = info["widget"]
+        indent = " " * max(1, int(getattr(self, "editor_tab_spaces", 4)))
+        first, last, had_selection = self._selected_editor_lines(editor)
+        try:
+            start_line = int(first.split(".")[0])
+            end_line = int(last.split(".")[0])
+            for line in range(start_line, end_line + 1):
+                editor.insert(f"{line}.0", indent)
+            if had_selection:
+                editor.tag_add("sel", f"{start_line}.0", f"{end_line}.end")
+            self._on_editor_key(event, tab_name)
+            self._on_editor_content_changed(tab_name)
+        except tk.TclError:
+            pass
+        return "break"
+
+    def outdent_editor_selection(self, tab_name, event=None):
+        info = self.open_editors.get(tab_name)
+        if not info:
+            return "break"
+        editor = info["widget"]
+        width = max(1, int(getattr(self, "editor_tab_spaces", 4)))
+        first, last, had_selection = self._selected_editor_lines(editor)
+        try:
+            start_line = int(first.split(".")[0])
+            end_line = int(last.split(".")[0])
+            for line in range(start_line, end_line + 1):
+                line_start = f"{line}.0"
+                text = editor.get(line_start, f"{line}.0+{width}c")
+                remove_count = len(text) - len(text.lstrip(" "))
+                if remove_count:
+                    editor.delete(line_start, f"{line}.0+{min(remove_count, width)}c")
+            if had_selection:
+                editor.tag_add("sel", f"{start_line}.0", f"{end_line}.end")
+            self._on_editor_key(event, tab_name)
+            self._on_editor_content_changed(tab_name)
+        except tk.TclError:
+            pass
+        return "break"
+
+    def smart_editor_return(self, tab_name, event=None):
+        info = self.open_editors.get(tab_name)
+        if not info:
+            return None
+        editor = info["widget"]
+        try:
+            line = editor.get("insert linestart", "insert")
+            indent = re.match(r"\s*", line).group(0)
+            extra = " " * max(1, int(getattr(self, "editor_tab_spaces", 4))) if line.rstrip().endswith(":") else ""
+            before = editor.get("insert-1c", "insert")
+            after = editor.get("insert", "insert+1c")
+            if (before, after) in {("{", "}"), ("[", "]"), ("(", ")")}:
+                inner = indent + " " * max(1, int(getattr(self, "editor_tab_spaces", 4)))
+                editor.insert("insert", "\n" + inner + "\n" + indent)
+                editor.mark_set("insert", "insert-1l lineend")
+            else:
+                editor.insert("insert", "\n" + indent + extra)
+            self._on_editor_key(event, tab_name)
+            self._on_editor_content_changed(tab_name)
+            return "break"
+        except tk.TclError:
+            return None
+
+    def editor_auto_pair(self, tab_name, event=None):
+        if event is None or getattr(event, "state", 0) & 0x4:
+            return None
+        pairs = {"(": ")", "[": "]", "{": "}", '"': '"', "'": "'"}
+        info = self.open_editors.get(tab_name)
+        if not info:
+            return None
+        editor = info["widget"]
+        char = getattr(event, "char", "")
+        keysym = getattr(event, "keysym", "")
+        try:
+            if keysym == "BackSpace":
+                before = editor.get("insert-1c", "insert")
+                after = editor.get("insert", "insert+1c")
+                if pairs.get(before) == after:
+                    editor.delete("insert-1c", "insert+1c")
+                    self._on_editor_key(event, tab_name)
+                    self._on_editor_content_changed(tab_name)
+                    return "break"
+                return None
+
+            if char in pairs.values() and editor.get("insert", "insert+1c") == char:
+                editor.mark_set("insert", "insert+1c")
+                self.update_editor_markers(tab_name)
+                return "break"
+
+            closing = pairs.get(char)
+            if not closing:
+                return None
+            try:
+                selected = editor.get("sel.first", "sel.last")
+                editor.delete("sel.first", "sel.last")
+                editor.insert("insert", char + selected + closing)
+                editor.tag_add("sel", "insert-%dc" % (len(selected) + 1), "insert-1c")
+            except tk.TclError:
+                editor.insert("insert", char + closing)
+                editor.mark_set("insert", "insert-1c")
+            self._on_editor_key(event, tab_name)
+            self._on_editor_content_changed(tab_name)
+            return "break"
+        except tk.TclError:
+            return None
+
+    def toggle_editor_comment(self, tab_name, event=None):
+        info = self.open_editors.get(tab_name)
+        if not info:
+            return "break"
+        editor = info["widget"]
+        first, last, had_selection = self._selected_editor_lines(editor)
+        try:
+            start_line = int(first.split(".")[0])
+            end_line = int(last.split(".")[0])
+            lines = [editor.get(f"{line}.0", f"{line}.end") for line in range(start_line, end_line + 1)]
+            non_empty = [line for line in lines if line.strip()]
+            should_uncomment = bool(non_empty) and all(line.lstrip().startswith("#") for line in non_empty)
+            for line_no in range(start_line, end_line + 1):
+                text = editor.get(f"{line_no}.0", f"{line_no}.end")
+                if not text.strip():
+                    continue
+                indent = len(text) - len(text.lstrip(" "))
+                pos = f"{line_no}.{indent}"
+                if should_uncomment:
+                    if editor.get(pos, f"{line_no}.{indent + 2}") == "# ":
+                        editor.delete(pos, f"{line_no}.{indent + 2}")
+                    elif editor.get(pos, f"{line_no}.{indent + 1}") == "#":
+                        editor.delete(pos, f"{line_no}.{indent + 1}")
+                else:
+                    editor.insert(pos, "# ")
+            if had_selection:
+                editor.tag_add("sel", f"{start_line}.0", f"{end_line}.end")
+            self._on_editor_key(event, tab_name)
+            self._on_editor_content_changed(tab_name)
+        except tk.TclError:
+            pass
+        return "break"
+
+    def show_editor_completion(self, event=None):
+        """Exibe a janela popup com sugestões de código para o editor atual."""
+        tab_name, info = self._current_editor_info()
+        if not info:
+            return "break"
+
+        editor = info["widget"]
+        self.set_status("A carregar sugestões de código...", "ready")
+
+        # TODO: Implementar a lógica que preenche as sugestões baseadas no contexto
+        # Exemplo temporário para testar se o menu funciona sem falhar:
+        print("Atalho de sugestões de código acionado com sucesso!")
+        return "break"
+
+    def show_symbol_palette(self, event=None):
+        """Exibe a paleta de busca para classes e métodos no arquivo atual."""
+        tab_name, info = self._current_editor_info()
+        if not info:
+            return "break"
+
+        self.set_status("Abrindo busca de símbolos...", "ready")
+
+        # TODO: Implementar a lógica da paleta de símbolos (parsing de classes/funções)
+        print("Atalho de busca de classe/método (Ctrl+Shift+O) acionado com sucesso!")
+        return "break"
+
+    def show_editor_find_bar(self, event=None):
+        tab_name, info = self._current_editor_info()
+        if not info:
+            return "break"
+        editor = info["widget"]
+        try:
+            initial = editor.get("sel.first", "sel.last")
+        except tk.TclError:
+            initial = getattr(editor, "_search_query", "")
+        query = simpledialog.askstring(APP_NAME, "Buscar no editor:", initialvalue=initial, parent=self)
+        if query is not None:
+            editor._search_query = query
+            self.find_in_current_editor(1)
+        return "break"
+
+    def find_in_current_editor(self, direction=1):
+        tab_name, info = self._current_editor_info()
+        if not info:
+            return "break"
+        editor = info["widget"]
+        query = getattr(editor, "_search_query", "")
+        if not query:
+            return self.show_editor_find_bar()
+
+        try:
+            editor.tag_remove("search_match", "1.0", "end")
+            editor.tag_remove("search_current", "1.0", "end")
+            matches = []
+            start = "1.0"
+            while True:
+                pos = editor.search(query, start, stopindex="end", nocase=True)
+                if not pos:
+                    break
+                end = f"{pos}+{len(query)}c"
+                matches.append((pos, end))
+                editor.tag_add("search_match", pos, end)
+                start = end
+
+            editor._search_matches = matches
+            if not matches:
+                editor._search_match_index = -1
+                self.set_status("Busca sem resultados.", "warning")
+                return "break"
+
+            current = getattr(editor, "_search_match_index", -1)
+            current = (current + (1 if direction >= 0 else -1)) % len(matches)
+            editor._search_match_index = current
+            pos, end = matches[current]
+            editor.tag_add("search_current", pos, end)
+            editor.mark_set("insert", pos)
+            editor.see(pos)
+            self.set_status(f"{current + 1}/{len(matches)} resultado(s) em {tab_name}.", "ready")
+        except tk.TclError:
+            pass
+        return "break"
+
+    def zoom_current_editor(self, delta):
+        if delta == 0:
+            self.editor_font_size = 14
+        else:
+            self.editor_font_size = max(9, min(28, self.editor_font_size + delta))
+        editor_font = ("Consolas", self.editor_font_size)
+        for info in self.open_editors.values():
+            editor = info.get("widget")
+            if not editor:
+                continue
+            try:
+                editor.configure(font=editor_font)
+                self._configure_editor_tabs(editor)
+                line_numbers = getattr(editor, "_line_numbers", None)
+                if line_numbers is not None:
+                    line_numbers.configure(font=editor_font)
+            except tk.TclError:
+                pass
+        self.update_editor_markers(self._current_editor_info()[0] or "Scratchpad")
+        return "break"
+
     def _sync_visible_scrollbar(self, scrollbar, first, last):
         try:
             scrollbar.set(first, last)
@@ -643,7 +1011,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
         scroll_up = ctk.CTkButton(
             scroll_controls,
-            text="↑",
+            text="^",
             width=30,
             height=30,
             corner_radius=4,
@@ -673,7 +1041,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
         scroll_down = ctk.CTkButton(
             scroll_controls,
-            text="↓",
+            text="v",
             width=30,
             height=30,
             corner_radius=4,
@@ -974,6 +1342,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             wrap="word",
         )
         self.local_term_out.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 4))
+        self._style_text_surface(self.local_term_out, THEME["terminal"], "#62f28f")
         self._autohide_ctk_textbox_scrollbar(self.local_term_out)
         self._bind_terminal_interrupt_shortcuts(self.local_term_out)
 
@@ -1023,6 +1392,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             wrap="word",
         )
         self.agent_log.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        self._style_text_surface(self.agent_log, THEME["terminal"], "#d7dee9")
         self._show_ctk_textbox_scrollbar(self.agent_log)
         self._replace_text(self.agent_log, "Log iniciado.\n")
 
@@ -1065,11 +1435,25 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             wrap="word",
         )
         self.text_input.grid(row=1, column=0, sticky="ew", padx=(10, 8), pady=10)
+        self._style_text_surface(self.text_input, THEME["panel_alt"], THEME["text"])
         self._autohide_ctk_textbox_scrollbar(self.text_input)
         self.text_input.insert("1.0", "")
+        self.input_placeholder = ctk.CTkLabel(
+            self.text_input,
+            text="Digite a tarefa para a IA...",
+            text_color=THEME["muted"],
+            fg_color=THEME["panel_alt"],
+            font=("Segoe UI", 14),
+            anchor="w",
+        )
+        self.input_placeholder.place(x=12, y=10)
+        self.input_placeholder.bind("<Button-1>", lambda _event: self.text_input.focus_set())
         self.text_input.bind("<Control-Return>", lambda _event: self.text_command())
         self.text_input.bind("<Control-v>", self.paste_into_chat)
         self.text_input.bind("<Control-V>", self.paste_into_chat)
+        self.text_input.bind("<KeyRelease>", self._update_input_placeholder, add="+")
+        self.text_input.bind("<FocusIn>", self._update_input_placeholder, add="+")
+        self.text_input.bind("<FocusOut>", self._update_input_placeholder, add="+")
 
         actions = ctk.CTkFrame(self.input_frame, fg_color="transparent")
         actions.grid(row=1, column=1, sticky="ns", padx=(0, 10), pady=10)
@@ -1107,9 +1491,25 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.ai_progress.grid(row=2, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 8))
         self.ai_progress.grid_remove()
 
+    def _update_input_placeholder(self, event=None):
+        placeholder = getattr(self, "input_placeholder", None)
+        textbox = getattr(self, "text_input", None)
+        if placeholder is None or textbox is None:
+            return
+        try:
+            has_text = bool(textbox.get("1.0", "end-1c").strip())
+        except tk.TclError:
+            return
+        if has_text:
+            placeholder.place_forget()
+        else:
+            placeholder.place(x=12, y=10)
+            placeholder.tkraise()
+
     def _build_status_bar(self):
-        self.status_bar = ctk.CTkFrame(self, fg_color=THEME["panel_alt"], height=30, corner_radius=0)
-        self.status_bar.grid(row=3, column=2, sticky="ew", padx=12, pady=(0, 12))
+        self.status_bar = ctk.CTkFrame(self, fg_color=THEME["panel_alt"], height=34, corner_radius=0)
+        self.status_bar.grid(row=3, column=2, sticky="ew", padx=12, pady=(0, 8))
+        self.status_bar.grid_propagate(False)
         self.status_bar.grid_columnconfigure(0, weight=1)
 
         self.status_label = ctk.CTkLabel(
@@ -1119,7 +1519,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             text_color=THEME["muted"],
             anchor="w",
         )
-        self.status_label.grid(row=0, column=0, sticky="ew", padx=10)
+        self.status_label.grid(row=0, column=0, sticky="nsew", padx=10, pady=5)
 
     def _bind_shortcuts(self):
         self.bind_all("<Control-s>", self.save_current_tab)
@@ -1131,6 +1531,15 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.bind_all("<Control-r>", self.run_current_python_file)
         self.bind_all("<Control-R>", self.run_current_python_file)
         self.bind_all("<F5>", lambda _event: self.load_workspace_files())
+        self.bind_all("<Control-f>", self.show_editor_find_bar)
+        self.bind_all("<Control-F>", self.show_editor_find_bar)
+        self.bind_all("<F3>", lambda event: self.find_in_current_editor(-1 if event.state & 0x1 else 1))
+        self.bind_all("<Control-space>", self.show_editor_completion)
+        self.bind_all("<Control-Shift-O>", self.show_symbol_palette)
+        self.bind_all("<Control-Shift-o>", self.show_symbol_palette)
+        self.bind_all("<Control-plus>", lambda _event: self.zoom_current_editor(1))
+        self.bind_all("<Control-minus>", lambda _event: self.zoom_current_editor(-1))
+        self.bind_all("<Control-0>", lambda _event: self.zoom_current_editor(0))
 
     def _bind_terminal_interrupt_shortcuts(self, widget):
         for sequence in ("<Control-c>", "<Control-C>", "<Control-Break>", "<Break>", "<Cancel>"):
@@ -1152,6 +1561,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         editor_frame = ctk.CTkFrame(parent, fg_color="#16181d", border_width=0, corner_radius=0)
         editor_frame.grid_columnconfigure(1, weight=1)
         editor_frame.grid_rowconfigure(0, weight=1)
+        editor_font = ("Consolas", self.editor_font_size)
 
         line_numbers = tk.Text(
             editor_frame,
@@ -1164,11 +1574,12 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             fg=THEME["muted"],
             insertwidth=0,
             takefocus=False,
-            font=("Consolas", 14),
+            font=editor_font,
             wrap="none",
             state="disabled",
         )
         line_numbers.grid(row=0, column=0, sticky="ns")
+        self._style_text_surface(line_numbers, "#111318", THEME["muted"])
         line_numbers.tag_configure("right", justify="right")
         line_numbers.tag_configure("current", background="#242832", foreground=THEME["text"])
 
@@ -1176,16 +1587,24 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             editor_frame,
             fg_color="#16181d",
             text_color=THEME["text"],
-            font=("Consolas", 14),
+            font=editor_font,
             border_width=0,
             wrap="none",
             undo=True,
             activate_scrollbars=False,
         )
+        self._configure_editor_tabs(editor)
         editor.grid(row=0, column=1, sticky="nsew")
+        self._style_text_surface(editor, "#16181d", THEME["text"])
         self._hide_ctk_textbox_scrollbar(editor)
         editor._line_numbers = line_numbers
+        editor._editor_tab_name = tab_name
         editor.tag_config("current_line", background="#20242c")
+        editor.tag_config("search_match", background="#61520b", foreground="#ffffff")
+        editor.tag_config("search_current", background="#0f7a9e", foreground="#ffffff")
+        editor.tag_config("brace_match", background="#31594a", foreground="#ffffff")
+        editor.tag_config("brace_mismatch", background="#7c2525", foreground="#ffffff")
+        editor.tag_config("identifier_match", background="#26384d")
 
         def scroll_editor(units):
             try:
@@ -1205,7 +1624,61 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             line_numbers.yview_moveto(first)
             scroll_bar.set(first, last)
 
+        status_strip = ctk.CTkFrame(editor_frame, fg_color="#111827", height=28, corner_radius=0)
+        status_strip.grid(row=1, column=0, columnspan=3, sticky="ew")
+        status_strip.grid_columnconfigure(0, weight=1)
+        status_strip.grid_propagate(False)
+
+        status_label = ctk.CTkLabel(
+            status_strip,
+            text="Pronto",
+            font=("Segoe UI", 11),
+            text_color=THEME["muted"],
+            anchor="w",
+        )
+        status_label.grid(row=0, column=0, sticky="ew", padx=(10, 8))
+        symbol_label = ctk.CTkLabel(
+            status_strip,
+            text="",
+            font=("Segoe UI", 11),
+            text_color=THEME["muted"],
+        )
+        symbol_label.grid(row=0, column=1, sticky="e", padx=8)
+        position_label = ctk.CTkLabel(
+            status_strip,
+            text="Ln 1, Col 1",
+            font=("Segoe UI", 11),
+            text_color=THEME["text"],
+        )
+        position_label.grid(row=0, column=2, sticky="e", padx=8)
+        language_label = ctk.CTkLabel(
+            status_strip,
+            text="Texto",
+            font=("Segoe UI", 11),
+            text_color=THEME["muted"],
+        )
+        language_label.grid(row=0, column=3, sticky="e", padx=(8, 10))
+        editor._status_label = status_label
+        editor._symbol_label = symbol_label
+        editor._position_label = position_label
+        editor._language_label = language_label
+        editor._search_query = ""
+        editor._search_matches = []
+        editor._search_match_index = -1
+
         editor.configure(yscrollcommand=sync_scroll)
+        editor.bind("<KeyPress-Tab>", lambda event, name=tab_name: self.indent_editor_selection(name, event), add="+")
+        editor.bind("<ISO_Left_Tab>", lambda event, name=tab_name: self.outdent_editor_selection(name, event), add="+")
+        editor.bind("<Shift-Tab>", lambda event, name=tab_name: self.outdent_editor_selection(name, event), add="+")
+        editor.bind("<Return>", lambda event, name=tab_name: self.smart_editor_return(name, event), add="+")
+        editor.bind("<KeyPress>", lambda event, name=tab_name: self.editor_auto_pair(name, event), add="+")
+        editor.bind("<Control-slash>", lambda event, name=tab_name: self.toggle_editor_comment(name, event), add="+")
+        editor.bind("<Control-question>", lambda event, name=tab_name: self.toggle_editor_comment(name, event), add="+")
+        editor.bind("<Control-space>", lambda event, name=tab_name: self.show_editor_completion(event, name), add="+")
+        editor.bind("<Control-Shift-O>", lambda event: self.show_symbol_palette(event), add="+")
+        editor.bind("<Control-Shift-o>", lambda event: self.show_symbol_palette(event), add="+")
+        editor.bind("<Escape>", lambda event: self._hide_editor_completion(), add="+")
+        editor.bind("<FocusOut>", lambda event: self.after(120, self._hide_editor_completion), add="+")
         editor.bind("<KeyRelease>", lambda _event, name=tab_name: self._on_editor_content_changed(name), add="+")
         editor.bind("<ButtonRelease-1>", lambda _event, name=tab_name: self.update_editor_markers(name), add="+")
         editor.bind("<MouseWheel>", lambda _event, name=tab_name: self.after(1, lambda: self.update_editor_markers(name)), add="+")
@@ -1222,6 +1695,8 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         widget.delete("1.0", "end")
         widget.insert("1.0", text)
         widget.configure(state="disabled" if widget in [getattr(self, "agent_summary", None)] else "normal")
+        if widget is getattr(self, "text_input", None):
+            self._update_input_placeholder()
 
     def paste_into_chat(self, event=None):
         image = self._clipboard_image()
@@ -1360,11 +1835,43 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
         def update():
             if mode == "ready" and self.agent_busy:
-                self.status_label.configure(text="IA trabalhando...", text_color=THEME["warning"])
+                self.status_label.configure(
+                    text=self.status_with_ai_quota("IA trabalhando..."),
+                    text_color=THEME["warning"],
+                )
+                self.refresh_ai_status()
                 return
-            self.status_label.configure(text=text, text_color=colors.get(mode, THEME["muted"]))
+            self.status_label.configure(
+                text=self.status_with_ai_quota(text),
+                text_color=colors.get(mode, THEME["muted"]),
+            )
+            self.refresh_ai_status()
 
         self.after(0, update)
+
+    def status_with_ai_quota(self, text):
+        status = str(text or "")
+        if "Cota:" in status:
+            return status
+        quota = ""
+        try:
+            quota_status = getattr(self.engine, "quota_status_text", None)
+            if callable(quota_status):
+                quota = quota_status()
+        except Exception:
+            quota = ""
+        if not quota:
+            return status
+        return f"{status} | Cota: {quota}" if status else f"Cota: {quota}"
+
+    def show_local_subnet_status(self):
+        status = self.ensure_local_training_subnet_ready()
+        self.add_chat_message("Sistema", status)
+        mode = "ready" if "Sub-rede local: pronta" in status else "warning"
+        self.set_status(
+            "Sub-rede local pronta para contexto/RAG." if mode == "ready" else "Sub-rede local ainda nao preparada.",
+            mode,
+        )
 
     def set_ai_activity(self, text):
         self.ai_activity_text = text or "IA trabalhando"
@@ -1392,9 +1899,10 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         dots = "." * ((self.ai_activity_step % 3) + 1)
         self.ai_activity_step += 1
         self.status_label.configure(
-            text=f"{self.ai_activity_text}{dots} {elapsed}s",
+            text=self.status_with_ai_quota(f"{self.ai_activity_text}{dots} {elapsed}s"),
             text_color=THEME["warning"],
         )
+        self.refresh_ai_status()
 
     def run_ai_heartbeat(self):
         if not self.agent_busy:
@@ -1667,6 +2175,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
     def _on_editor_content_changed(self, tab_name):
         self.highlight_code(tab_name)
         self.update_editor_markers(tab_name)
+        self._schedule_editor_completion(tab_name)
 
     def update_editor_markers(self, tab_name):
         info = self.open_editors.get(tab_name)
@@ -1680,7 +2189,8 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
         try:
             line_count = int(editor.index("end-1c").split(".")[0])
-            current_line = int(editor.index("insert").split(".")[0])
+            insert_index = editor.index("insert")
+            current_line, current_col = (int(part) for part in insert_index.split("."))
         except tk.TclError:
             return
 
@@ -1696,6 +2206,141 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
         editor.tag_remove("current_line", "1.0", "end")
         editor.tag_add("current_line", "insert linestart", "insert lineend+1c")
+        self._update_editor_status_context(tab_name, editor, current_line, current_col)
+        self._highlight_matching_brace(editor)
+        self._highlight_current_identifier(editor)
+
+    def _update_editor_status_context(self, tab_name, editor, current_line, current_col):
+        info = self.open_editors.get(tab_name, {})
+        path = info.get("path") or tab_name
+        language = self._editor_language_name(path)
+        dirty = "Alterado" if info.get("dirty") else "Salvo" if info.get("path") else "Rascunho"
+        try:
+            # Tenta obter o texto selecionado e conta os caracteres
+            selection_text = editor.get("sel.first", "sel.last")
+            selected = len(selection_text)
+        except Exception:
+            # Se não houver nada selecionado, o Tkinter joga uma exceção. Defina como 0.
+            selected = 0
+        try:
+            editor._position_label.configure(text=f"Ln {current_line}, Col {current_col + 1}{selected}")
+            editor._language_label.configure(text=language)
+            editor._status_label.configure(text=f"{dirty} | {Path(path).name if path else tab_name}")
+            editor._symbol_label.configure(text=self._current_symbol_path(editor, current_line))
+        except (AttributeError, tk.TclError):
+            pass
+
+    def _editor_language_name(self, path):
+        suffix = Path(str(path)).suffix.lower()
+        names = {
+            ".py": "Python",
+            ".js": "JavaScript",
+            ".jsx": "React JSX",
+            ".ts": "TypeScript",
+            ".tsx": "React TSX",
+            ".html": "HTML",
+            ".css": "CSS",
+            ".json": "JSON",
+            ".md": "Markdown",
+            ".cs": "C#",
+            ".java": "Java",
+            ".dart": "Dart",
+            ".cpp": "C++",
+            ".c": "C",
+            ".h": "C/C++",
+        }
+        return names.get(suffix, "Texto")
+
+    def _current_symbol_path(self, editor, current_line):
+        symbols = []
+        try:
+            start = max(1, current_line - 220)
+            for line_no in range(start, current_line + 1):
+                text = editor.get(f"{line_no}.0", f"{line_no}.end")
+                match = re.match(
+                    r"\s*(?:class|def|async\s+def|function|const|let|var|public\s+(?:class|void|async|static)|private\s+(?:void|async|static)|protected\s+(?:void|async|static))\s+([A-Za-z_$][\w$]*)",
+                    text,
+                )
+                if match:
+                    symbols.append(match.group(1))
+        except tk.TclError:
+            return ""
+        return " > ".join(symbols[-3:])
+
+    def _highlight_matching_brace(self, editor):
+        pairs = {"(": ")", "[": "]", "{": "}"}
+        reverse = {value: key for key, value in pairs.items()}
+        try:
+            editor.tag_remove("brace_match", "1.0", "end")
+            editor.tag_remove("brace_mismatch", "1.0", "end")
+            candidates = [("insert-1c", editor.get("insert-1c", "insert")), ("insert", editor.get("insert", "insert+1c"))]
+            for index, char in candidates:
+                if char in pairs:
+                    match = self._find_matching_brace(editor, index, char, pairs[char], 1)
+                    tag = "brace_match" if match else "brace_mismatch"
+                    editor.tag_add(tag, index, f"{index}+1c")
+                    if match:
+                        editor.tag_add(tag, match, f"{match}+1c")
+                    return
+                if char in reverse:
+                    match = self._find_matching_brace(editor, index, reverse[char], char, -1)
+                    tag = "brace_match" if match else "brace_mismatch"
+                    editor.tag_add(tag, index, f"{index}+1c")
+                    if match:
+                        editor.tag_add(tag, match, f"{match}+1c")
+                    return
+        except tk.TclError:
+            pass
+
+    def _find_matching_brace(self, editor, start_index, opening, closing, direction):
+        depth = 0
+        try:
+            if direction > 0:
+                pos = start_index
+                end = editor.index("end-1c")
+                while editor.compare(pos, "<=", end):
+                    char = editor.get(pos, f"{pos}+1c")
+                    if char == opening:
+                        depth += 1
+                    elif char == closing:
+                        depth -= 1
+                        if depth == 0:
+                            return editor.index(pos)
+                    pos = editor.index(f"{pos}+1c")
+            else:
+                pos = start_index
+                while editor.compare(pos, ">=", "1.0"):
+                    char = editor.get(pos, f"{pos}+1c")
+                    if char == closing:
+                        depth += 1
+                    elif char == opening:
+                        depth -= 1
+                        if depth == 0:
+                            return editor.index(pos)
+                    pos = editor.index(f"{pos}-1c")
+        except tk.TclError:
+            return None
+        return None
+
+    def _highlight_current_identifier(self, editor):
+        try:
+            editor.tag_remove("identifier_match", "1.0", "end")
+            word = editor.get("insert wordstart", "insert wordend").strip()
+            if len(word) < 3 or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", word):
+                return
+            start = "1.0"
+            while True:
+                pos = editor.search(word, start, stopindex="end", regexp=False)
+                if not pos:
+                    break
+                end = f"{pos}+{len(word)}c"
+                before = editor.get(f"{pos}-1c", pos)
+                after = editor.get(end, f"{end}+1c")
+                if not re.match(r"\w", before or "") and not re.match(r"\w", after or ""):
+                    editor.tag_add("identifier_match", pos, end)
+                start = end
+        except tk.TclError:
+            pass
 
     def close_current_tab(self, event=None):
         try:
@@ -2060,7 +2705,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 self.ai_live_trace_last_log_at == 0
                 or now - self.ai_live_trace_last_log_at >= 1.25
                 or current_length - self.ai_live_trace_last_length >= 360
-                or bool(re.search(r"\[(READ|WRITE|REPLACE|EXECUTE|EXECUTE_ADMIN|OPEN_URL|SCREENSHOT|HUMAN_TEST|SEARCH_TEXT|SCAN_TEXT|UNDO)\s*:", chunk, re.IGNORECASE))
+                or bool(re.search(r"\[(READ|WRITE|REPLACE|EXECUTE|EXECUTE_ADMIN|OPEN_URL|SCREENSHOT|HUMAN_TEST|SEARCH_TEXT|WEB_SEARCH|SCAN_TEXT|UNDO)\s*:", chunk, re.IGNORECASE))
             )
             if not should_log:
                 self.update_ai_activity_from_stream(chunk)
@@ -2096,7 +2741,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
     def describe_live_ai_trace(self, trace, chunk):
         action_matches = re.findall(
-            r"\[(READ|WRITE|REPLACE|SEARCH_TEXT|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|EXECUTE_ADMIN|OPEN_URL|SCREENSHOT|HUMAN_TEST)\s*:\s*([^\]]*)\]",
+            r"\[(READ|WRITE|REPLACE|SEARCH_TEXT|WEB_SEARCH|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|EXECUTE_ADMIN|OPEN_URL|SCREENSHOT|HUMAN_TEST)\s*:\s*([^\]]*)\]",
             trace or "",
             re.IGNORECASE,
         )
@@ -2108,6 +2753,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 "WRITE": "pediu escrita",
                 "REPLACE": "pediu substituicao",
                 "SEARCH_TEXT": "pediu busca",
+                "WEB_SEARCH": "pediu busca web",
                 "SCAN_TEXT": "pediu varredura",
                 "FIX_MOJIBAKE": "pediu correcao de texto",
                 "UNDO": "pediu desfazer",
@@ -2130,7 +2776,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             self.set_ai_activity("IA preparando alteracao")
         elif re.search(r"\[(execute|execute_admin|open_url|screenshot|human_test)\s*:", normalized):
             self.set_ai_activity("IA preparando validacao")
-        elif re.search(r"\[(read|search_text|scan_text)\s*:", normalized):
+        elif re.search(r"\[(read|search_text|web_search|scan_text)\s*:", normalized):
             self.set_ai_activity("IA pedindo contexto")
         elif any(term in normalized for term in ("patch", "filechange", "apply", "alterando", "escrevendo")):
             self.set_ai_activity("Codex alterando arquivos")
@@ -2274,7 +2920,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
         frame = ctk.CTkFrame(
             self.chat_history,
-            fg_color="transparent",
+            fg_color=THEME["panel"],
             border_width=1,
             border_color=border_color,
             corner_radius=6,
@@ -2292,13 +2938,14 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
         textbox = ctk.CTkTextbox(
             frame,
-            fg_color="transparent",
+            fg_color=THEME["panel"],
             text_color=THEME["text"],
             font=font,
             wrap="word",
             height=42,
         )
         textbox.pack(fill="x", padx=10, pady=(0, 8))
+        self._style_text_surface(textbox, THEME["panel"], THEME["text"])
         self._autohide_ctk_textbox_scrollbar(textbox)
         textbox.insert("1.0", display_text)
         textbox.configure(state="disabled")
@@ -2315,7 +2962,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
         frame = ctk.CTkFrame(
             self.chat_history,
-            fg_color="transparent",
+            fg_color=THEME["panel"],
             border_width=1,
             border_color=border_color,
             corner_radius=6,
@@ -2335,13 +2982,14 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         if display_text:
             textbox = ctk.CTkTextbox(
                 frame,
-                fg_color="transparent",
+                fg_color=THEME["panel"],
                 text_color=THEME["text"],
                 font=self.chat_text_font(display_text),
                 wrap="word",
                 height=42,
             )
             textbox.pack(fill="x", padx=10, pady=(0, 6))
+            self._style_text_surface(textbox, THEME["panel"], THEME["text"])
             self._autohide_ctk_textbox_scrollbar(textbox)
             textbox.insert("1.0", display_text)
             textbox.configure(state="disabled")
@@ -2508,7 +3156,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
         frame = ctk.CTkFrame(
             self.chat_history,
-            fg_color="transparent",
+            fg_color=THEME["panel"],
             border_width=1,
             border_color=border_color,
             corner_radius=6,
@@ -2526,13 +3174,14 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
         textbox = ctk.CTkTextbox(
             frame,
-            fg_color="transparent",
+            fg_color=THEME["panel"],
             text_color=THEME["text"],
             font=("Segoe UI", 14),
             wrap="word",
             height=42,
         )
         textbox.pack(fill="x", padx=10, pady=(0, 8))
+        self._style_text_surface(textbox, THEME["panel"], THEME["text"])
         self._autohide_ctk_textbox_scrollbar(textbox)
         textbox.configure(state="disabled")
         self.streaming_textbox = textbox
@@ -2697,6 +3346,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             self.terminal_activity_frame.grid_remove()
             self.btn_send.configure(state="normal", text="Enviar")
             self.status_label.configure(text="Cancelado.", text_color=THEME["warning"])
+            self.refresh_ai_status()
 
         self.after(0, update)
 
@@ -2883,6 +3533,11 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             return False
 
         action = self.describe_codex_app_server_approval(method)
+        if self.codex_auto_approve_app_server_enabled():
+            self.log_agent(f"Permissao app-server autoaprovada: {method}")
+            self.add_chat_message("Sistema", f"Permissao autoaprovada para {action}.")
+            return True
+
         details = self.format_codex_app_server_approval(method, params, workspace)
         title = "Autorizar acao do Codex?"
         admin_notice = ""
@@ -3101,19 +3756,19 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     "- Para analise/planejamento, entregue diagnostico completo em texto e nao execute/edite sem pedido claro.\n"
                     "- Para implementacao/correcao, avance ate uma mudanca aplicada e uma verificacao plausivel.\n"
                     "- Trabalhe de forma produtiva: responda com conclusao util, diagnostico objetivo ou acao real quando precisar mexer no projeto.\n"
-                    "- Use tags da IDE quando elas forem o caminho mais confiavel, mas nao bloqueie uma resposta tecnica util so por nao conter tag.\n"
+                    "- Use tags da IDE ou ferramentas diretas do app-server; escolha o caminho real mais confiavel e nao bloqueie uma resposta tecnica util so por nao conter tag.\n"
                     "- Se afirmar que alterou, executou ou validou, garanta que houve acao real da IDE ou mudanca direta detectavel no workspace.\n"
                     "- Leia o contexto necessario sem entrar em loop; prefira agir quando ja houver informacao suficiente.\n"
                     "- Preserve a estrutura existente e faca alteracoes pequenas quando o projeto ja funciona.\n"
                     "- Depois de editar, valide com uma tag EXECUTE/EXECUTE_ADMIN ja preenchida, [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST] quando isso for util.\n\n"
                     "Continue essa missao de forma autonoma. "
                     "Atue como especialista senior em desenvolvimento de sistemas, apps e jogos: diagnostique, implemente, valide e corrija ate resolver. "
-                    "Se precisar de arquivo, use [READ]; o conteudo retornado pela IDE passa a ser sua memoria de trabalho. "
-                    "Se precisar verificar se um recurso/termo existe, use [SEARCH_TEXT: padrao | arquivo]. "
-                    "Use [SCAN_TEXT] e [FIX_MOJIBAKE] somente quando a missao pedir correcao de texto, acentos, codificacao ou caracteres corrompidos. "
-                    "Nao desvie uma tarefa de interface, logica, camera, build ou execucao para mojibake. "
-                    "Se souber a mudanca completa, use [WRITE]. "
-                    "Se souber apenas um trecho a trocar, use [REPLACE]. "
+                    "Se precisar de arquivo, use [READ] ou ferramenta direta equivalente; o conteudo retornado passa a ser sua memoria de trabalho. "
+                    "Se precisar verificar se um recurso/termo existe no projeto, use [SEARCH_TEXT: padrao | arquivo] ou busca direta equivalente. "
+                    "Se a solucao depender de informacao atual, documentacao externa ou erro desconhecido, use [WEB_SEARCH: consulta objetiva] para a IDE buscar na internet. "
+                    "Use [SCAN_TEXT]/[FIX_MOJIBAKE] ou ferramenta direta equivalente quando fizer sentido para a missao. "
+                    "Se souber a mudanca completa, use [WRITE] ou edicao direta no workspace. "
+                    "Se souber apenas um trecho a trocar, use [REPLACE] ou patch direto equivalente. "
                     "Se precisar rodar, use uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: python -m unittest]. "
                     "Se o comando realmente exigir administrador no Windows, use uma tag EXECUTE_ADMIN ja preenchida, por exemplo [EXECUTE_ADMIN: whoami /groups]; nao escreva 'como administrador' dentro do comando. "
                     "Nunca use reticencias, 'comando', 'comando real', texto entre sinais de menor/maior ou qualquer texto demonstrativo como se fosse comando real. "
@@ -3131,6 +3786,9 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     f"Alteracoes recentes feitas pela IDE neste projeto:\n{self.format_recent_changes_for_agent(limit=8)}\n\n"
                     f"Arquivos do workspace:\n{self.get_workspace_tree(limit=220)}"
                 )
+                local_training_context = self.build_local_training_context(objective or command)
+                if local_training_context:
+                    context += f"\n\n{local_training_context}"
                 if extra_context:
                     context += f"\n\nContexto adicional:\n{extra_context}"
                 context += f"\n\n{self.build_project_intelligence_context()}"
@@ -3148,6 +3806,13 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 if self.is_task_cancelled(current_task_id):
                     return
                 self.last_response = response or streamed_joined
+                local_fallback = self.local_llm_fallback_reply(
+                    command,
+                    self.last_response,
+                    image_path=image_path,
+                )
+                if local_fallback:
+                    self.last_response = local_fallback
                 if not (self.last_response or "").strip():
                     self.last_response = (
                         "O Codex terminou sem devolver texto para a IDE. "
@@ -3182,30 +3847,30 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     )
                 ):
                     self.log_agent("Aviso: resposta afirma acao sem evidencia direta; exibindo sem bloquear.")
-                display_response = self.strip_agent_action_markup(self.last_response)
                 has_agent_action = self.response_has_agent_action(self.last_response)
-                if has_agent_action:
-                    display_response = self.action_execution_message(self.last_response)
-                elif direct_action_happened:
-                    display_response = self.format_direct_workspace_changes(
-                        direct_changes,
-                        direct_change_total,
-                    )
-                elif invalid_claim:
-                    display_response = (
-                        "A IDE bloqueou uma resposta que dizia ter executado/corrigido, "
-                        "mas nao trouxe uma acao real. A proxima resposta precisa vir com uma acao executavel."
-                    )
+                display_response = self.build_ai_display_response(
+                    self.last_response,
+                    direct_changes=direct_changes,
+                    direct_change_total=direct_change_total,
+                    has_agent_action=has_agent_action,
+                    invalid_claim=invalid_claim,
+                )
                 stream_visible = self.streaming_textbox is not None
                 if stream_visible:
                     if has_agent_action:
                         self.replace_stream_message(display_response or "A IDE recebeu uma acao interna e vai executar agora.")
+                    elif (
+                        display_response
+                        and display_response.strip()
+                        and display_response.strip() != streamed_joined.strip()
+                    ):
+                        self.replace_stream_message(display_response)
                     elif response and response.strip() and response.strip() not in streamed_joined.strip():
                         self.append_stream_message("\n\n" + response)
                     self.finish_stream_message()
                 else:
                     if display_response or not has_agent_action:
-                        self.add_chat_message("Merotec AI", display_response or self.last_response)
+                        self.add_chat_message("Merotec IA", display_response or self.last_response)
                 if retry_available:
                     pass
                 elif self.is_codex_capacity_response(self.last_response):
@@ -3258,12 +3923,15 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         ]
         for pattern in block_patterns:
             cleaned = re.sub(pattern, "", cleaned, flags=re.DOTALL | re.IGNORECASE)
-        cleaned = re.sub(
-            r"^[ \t]*\[(READ|SEARCH_TEXT|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|EXECUTE_ADMIN|OPEN_URL|SCREENSHOT|HUMAN_TEST)[ \t]*:[^\]\r\n]+\][ \t]*$",
-            "",
-            cleaned,
-            flags=re.IGNORECASE | re.MULTILINE,
+        action_tag = (
+            r"\[(READ|SEARCH_TEXT|WEB_SEARCH|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|EXECUTE_ADMIN|OPEN_URL|SCREENSHOT|HUMAN_TEST)"
+            r"[ \t]*:[^\]\r\n]+\]"
         )
+        cleaned_lines = []
+        for line in cleaned.splitlines():
+            if re.sub(action_tag, "", line, flags=re.IGNORECASE).strip():
+                cleaned_lines.append(line)
+        cleaned = "\n".join(cleaned_lines)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
         return cleaned
 
@@ -3275,9 +3943,40 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             return "A IDE recebeu uma alteracao real e iniciou a aplicacao no projeto."
         if tags & {"EXECUTE", "EXECUTE_ADMIN", "OPEN_URL", "SCREENSHOT", "HUMAN_TEST"}:
             return "A IDE recebeu uma execucao real e iniciou a validacao."
-        if tags & {"READ", "SEARCH_TEXT", "SCAN_TEXT"}:
+        if tags & {"READ", "SEARCH_TEXT", "WEB_SEARCH", "SCAN_TEXT"}:
             return "A IDE esta coletando contexto objetivo para executar o proximo passo."
         return ""
+
+    def build_ai_display_response(
+        self,
+        response_text,
+        direct_changes=None,
+        direct_change_total=0,
+        has_agent_action=None,
+        invalid_claim=False,
+    ):
+        if has_agent_action is None:
+            has_agent_action = self.response_has_agent_action(response_text)
+        if has_agent_action:
+            return self.action_execution_message(response_text)
+
+        if invalid_claim:
+            return (
+                "A IDE bloqueou uma resposta que dizia ter executado/corrigido, "
+                "mas nao trouxe uma acao real. A proxima resposta precisa vir com uma acao executavel."
+            )
+
+        display_response = self.strip_agent_action_markup(response_text)
+        if direct_change_total > 0:
+            direct_summary = self.format_direct_workspace_changes(
+                direct_changes or [],
+                direct_change_total,
+            )
+            if display_response:
+                return f"{display_response}\n\n{direct_summary}"
+            return direct_summary
+
+        return display_response
 
 
     def build_command_failure_diagnostic(self, command, output, returncode):
@@ -3511,7 +4210,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         image_path = filedialog.askopenfilename(
             initialdir=self.current_workspace,
             filetypes=[
-                ("Imagens", "*.png *.jpg *.jpeg *.webp *.bmp", "*.gif", "*.webm"),
+                ("Imagens", "*.png *.jpg *.jpeg *.webp *.bmp *.gif *.webm"),
                 ("Todos", "*.*"),
             ],
         )

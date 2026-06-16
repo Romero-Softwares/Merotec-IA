@@ -1,4 +1,5 @@
 import json
+import html
 import os
 import queue
 import re
@@ -9,16 +10,67 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 import difflib
+import ctypes
+import ctypes.wintypes
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 from tkinter import messagebox
 
 from PIL import ImageGrab
 
-from modules.app_constants import IGNORED_DIRS, PROJECT_ROOT
+from modules.app_constants import APP_NAME, IGNORED_DIRS, PROJECT_ROOT
+
+
+class DuckDuckGoHtmlResultParser(HTMLParser):
+    def __init__(self, max_results=5):
+        super().__init__(convert_charrefs=True)
+        self.max_results = max_results
+        self.results = []
+        self._capture_link = False
+        self._capture_snippet = False
+        self._current_href = ""
+        self._current_text = []
+        self._current_snippet = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs or [])
+        css_class = attrs_dict.get("class", "")
+        if tag == "a" and "result__a" in css_class and len(self.results) < self.max_results:
+            self._capture_link = True
+            self._current_href = attrs_dict.get("href", "")
+            self._current_text = []
+            return
+        if "result__snippet" in css_class and self.results:
+            self._capture_snippet = True
+            self._current_snippet = []
+
+    def handle_data(self, data):
+        if self._capture_link:
+            self._current_text.append(data)
+        elif self._capture_snippet:
+            self._current_snippet.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._capture_link:
+            title = " ".join("".join(self._current_text).split())
+            url = AgentActionsMixin.normalize_duckduckgo_result_url(self._current_href)
+            if title and url:
+                self.results.append({"title": title, "url": url, "snippet": ""})
+            self._capture_link = False
+            self._current_href = ""
+            self._current_text = []
+            return
+        if self._capture_snippet and tag in {"a", "td", "div"}:
+            snippet = " ".join("".join(self._current_snippet).split())
+            if snippet and self.results and not self.results[-1].get("snippet"):
+                self.results[-1]["snippet"] = snippet
+            self._capture_snippet = False
+            self._current_snippet = []
 
 
 class AgentActionsMixin:
@@ -114,6 +166,42 @@ class AgentActionsMixin:
             lines.append(f"- ... mais {total - len(lines)} arquivo(s)")
         return "Codex executou a tarefa diretamente no workspace.\n\nArquivos afetados:\n" + "\n".join(lines)
 
+    def bool_setting_enabled(self, key, env_name=None, default=False):
+        settings = getattr(self, "settings", None)
+        if isinstance(settings, dict) and key in settings:
+            value = settings.get(key)
+        elif env_name:
+            value = os.getenv(env_name, "")
+            if value == "":
+                return bool(default)
+        else:
+            return bool(default)
+
+        if isinstance(value, bool):
+            return value
+        normalized = self.normalize_plain_text(str(value))
+        if normalized in {"1", "true", "yes", "sim", "on", "enabled", "habilitado"}:
+            return True
+        if normalized in {"0", "false", "no", "nao", "off", "disabled", "desabilitado"}:
+            return False
+        return bool(default)
+
+    def autonomous_unrestricted_mode_enabled(self):
+        return self.bool_setting_enabled(
+            "autonomous_unrestricted_mode",
+            env_name="MEROTEC_AUTONOMOUS_UNRESTRICTED",
+            default=False,
+        )
+
+    def codex_auto_approve_app_server_enabled(self):
+        if self.bool_setting_enabled(
+            "codex_auto_approve_app_server_requests",
+            env_name="MEROTEC_CODEX_AUTO_APPROVE_APP_SERVER",
+            default=False,
+        ):
+            return True
+        return self.autonomous_unrestricted_mode_enabled()
+
     def show_retry_available(self):
         if not self.last_failed_ai_task:
             return
@@ -177,6 +265,7 @@ class AgentActionsMixin:
             action_names = (
                 "READ",
                 "SEARCH_TEXT",
+                "WEB_SEARCH",
                 "SCAN_TEXT",
                 "FIX_MOJIBAKE",
                 "UNDO",
@@ -188,8 +277,8 @@ class AgentActionsMixin:
             )
         action_names = tuple(str(name).upper() for name in action_names)
         action_pattern = "|".join(re.escape(name) for name in action_names)
-        line_pattern = re.compile(
-            rf"^[ \t]*\[({action_pattern})[ \t]*:[ \t]*([^\]\r\n]+?)[ \t]*\][ \t]*$",
+        tag_pattern = re.compile(
+            rf"\[({action_pattern})[ \t]*:[ \t]*([^\]\r\n]+?)[ \t]*\]",
             re.IGNORECASE,
         )
         in_fenced_block = False
@@ -200,16 +289,28 @@ class AgentActionsMixin:
                 continue
             if in_fenced_block:
                 continue
-            match = line_pattern.match(line)
-            if match:
+            matches = list(tag_pattern.finditer(line))
+            if not matches:
+                continue
+
+            without_tags = tag_pattern.sub("", line).strip()
+            if without_tags:
+                continue
+
+            for match in matches:
                 yield match.group(1).upper(), match.group(2).strip()
 
     def extract_agent_action_values(self, response_text, action_name):
-        return [
-            value
-            for found_action, value in self.iter_agent_action_lines(response_text, (action_name,))
-            if found_action == action_name.upper()
-        ]
+        values = []
+        seen = set()
+        for found_action, value in self.iter_agent_action_lines(response_text, (action_name,)):
+            if found_action != action_name.upper():
+                continue
+            if value in seen:
+                continue
+            values.append(value)
+            seen.add(value)
+        return values
 
     def extract_agent_action_names(self, response_text):
         names = {action for action, _value in self.iter_agent_action_lines(response_text)}
@@ -262,8 +363,14 @@ class AgentActionsMixin:
                 task_objective=task_objective,
             )
 
+        unrestricted_mode = self.autonomous_unrestricted_mode_enabled()
+
         fix_paths = self.extract_agent_action_values(response_text, "FIX_MOJIBAKE")
-        if fix_paths and not self.objective_allows_text_repair(task_objective or self.active_ai_objective or ""):
+        if (
+            fix_paths
+            and not unrestricted_mode
+            and not self.objective_allows_text_repair(task_objective or self.active_ai_objective or "")
+        ):
             self.redirect_unrelated_text_repair(
                 "FIX_MOJIBAKE",
                 response_text,
@@ -306,12 +413,12 @@ class AgentActionsMixin:
                 or self.extract_agent_action_values(response_text, "EXECUTE_ADMIN")
             ):
                 self.add_chat_message(
-                    "Merotec AI",
+                    "Merotec IA",
                     "Leitura priorizada antes da execucao, para agir com base no arquivo correto.",
                 )
             if self.extract_agent_action_values(response_text, "SEARCH_TEXT"):
                 self.add_chat_message(
-                    "Merotec AI",
+                    "Merotec IA",
                     "Leitura priorizada antes da busca, para editar com base concreta.",
                 )
             return
@@ -329,8 +436,26 @@ class AgentActionsMixin:
             )
             return
 
+        web_search_requests = self.extract_agent_action_values(response_text, "WEB_SEARCH")
+        has_action = has_action or bool(web_search_requests)
+        if web_search_requests:
+            if self.should_block_passive_ai_action("WEB_SEARCH", web_search_requests, task_objective, action_depth, task_id):
+                return
+            self.mark_ai_active_action("web_search", task_id=task_id)
+            self._agent_web_search_many(
+                web_search_requests,
+                task_objective=task_objective,
+                action_depth=action_depth,
+                task_id=task_id,
+            )
+            return
+
         scan_paths = self.extract_agent_action_values(response_text, "SCAN_TEXT")
-        if scan_paths and not self.objective_allows_text_repair(task_objective or self.active_ai_objective or ""):
+        if (
+            scan_paths
+            and not unrestricted_mode
+            and not self.objective_allows_text_repair(task_objective or self.active_ai_objective or "")
+        ):
             self.redirect_unrelated_text_repair(
                 "SCAN_TEXT",
                 response_text,
@@ -408,7 +533,7 @@ class AgentActionsMixin:
                     requested_command=command,
                 )
                 continue
-            if self.is_file_mutation_command(command):
+            if not unrestricted_mode and self.is_file_mutation_command(command):
                 self.mark_ai_active_action("redirect", task_id=task_id)
                 self.redirect_mutation_command_to_write(
                     command,
@@ -417,7 +542,7 @@ class AgentActionsMixin:
                     task_id=task_id,
                 )
                 continue
-            if self.is_file_inspection_command(command):
+            if not unrestricted_mode and self.is_file_inspection_command(command):
                 if self.should_block_passive_ai_action("EXECUTE_INSPECTION", [command], task_objective, action_depth, task_id):
                     continue
                 self.redirect_inspection_command_to_scan(
@@ -461,7 +586,7 @@ class AgentActionsMixin:
             self.add_chat_message("Sistema", "A IA respondeu com intencao, mas nao executou uma acao. Reforcando a tarefa.")
             self._run_ai_task(
                 "A resposta anterior nao executou nenhuma acao. Continue a missao agora usando uma tag real da IDE "
-                "([READ], [SEARCH_TEXT], [SCAN_TEXT], [FIX_MOJIBAKE], [REPLACE], [WRITE], EXECUTE/EXECUTE_ADMIN ja preenchido, [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST]) "
+                "([READ], [SEARCH_TEXT], [WEB_SEARCH], [SCAN_TEXT], [FIX_MOJIBAKE], [REPLACE], [WRITE], EXECUTE/EXECUTE_ADMIN ja preenchido, [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST]) "
                 "usando comando real quando houver execucao, ou entregue uma conclusao final direta se a tarefa ja estiver respondida.",
                 extra_context=(
                     f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or ''}\n\n"
@@ -606,6 +731,8 @@ class AgentActionsMixin:
         objective = task_objective or self.active_ai_objective or ""
         if not self.objective_requests_visual_human_test(objective):
             return False
+        if self.command_launches_python_main(command):
+            return True
         normalized_command = self.normalize_plain_text(command or "")
         visual_commands = (
             "flutter run",
@@ -616,6 +743,16 @@ class AgentActionsMixin:
             "cmd /c start",
         )
         return any(item in normalized_command for item in visual_commands)
+
+    def command_launches_python_main(self, command):
+        command_text = str(command or "")
+        normalized = self.normalize_plain_text(command_text)
+        has_python_runner = re.search(r"\b(?:python|pythonw|py)(?:\.exe)?\b", normalized)
+        has_main_py = re.search(r"(?:^|[\\/\\s\"'])main\.py\b", command_text, re.IGNORECASE) or re.search(
+            r"\bmain\.py\b",
+            normalized,
+        )
+        return bool(has_python_runner and has_main_py)
 
     def _agent_human_test(self, request, task_objective=None, action_depth=0, task_id=None, requested_command=None):
         if self.is_task_cancelled(task_id):
@@ -651,6 +788,11 @@ class AgentActionsMixin:
                     "encoding": "utf-8",
                     "errors": "replace",
                 }
+                if plan.get("env"):
+                    popen_kwargs["env"] = {
+                        **os.environ,
+                        **{str(key): str(value) for key, value in plan["env"].items()},
+                    }
                 if plan["shell"]:
                     process = subprocess.Popen(plan["command"], shell=True, **popen_kwargs)
                 else:
@@ -660,6 +802,7 @@ class AgentActionsMixin:
                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                         **popen_kwargs,
                     )
+                plan["capture_process_pid"] = process.pid
                 self.register_terminal_process(process, f"Teste visual IA: {command_display}")
 
                 def read_output():
@@ -691,6 +834,9 @@ class AgentActionsMixin:
                         if found_url:
                             url = found_url
                     if url and self.is_url_ready(url):
+                        ready = True
+                        break
+                    if self.human_test_window_is_ready(plan):
                         ready = True
                         break
                     if self.human_test_output_is_ready("".join(output_lines[-20:])):
@@ -728,7 +874,7 @@ class AgentActionsMixin:
                 if self.is_task_cancelled(task_id):
                     return
 
-                image = ImageGrab.grab()
+                image = self.grab_human_test_image(plan)
                 screenshot_path = self.save_agent_screenshot(image)
                 self.log_agent(f"Print do teste visual capturado: {screenshot_path.name}")
                 self.add_chat_image_message("Merotec AI", screenshot_path, "")
@@ -809,6 +955,11 @@ class AgentActionsMixin:
         workspace = Path(self.current_workspace).resolve()
         objective = self.normalize_plain_text((request or "") + "\n" + (task_objective or self.active_ai_objective or ""))
         if requested_command:
+            self_target = self.resolve_requested_self_test_target(requested_command, workspace)
+            if self_target:
+                return self.build_merotec_self_human_test_plan(workspace, self_target)
+            if self.workspace_looks_like_merotec_self(workspace) and self.command_launches_python_main(requested_command):
+                return self.build_merotec_self_human_test_plan(workspace, workspace / "main.py")
             url = self.extract_first_local_url(requested_command)
             if not url and "web-port" in requested_command:
                 match = re.search(r"--web-port[=\s]+(\d+)", requested_command)
@@ -891,6 +1042,13 @@ class AgentActionsMixin:
 
         if kind == "python":
             target = workspace / "app.py" if (workspace / "app.py").exists() else workspace / "main.py"
+            is_merotec_self_target = (
+                target.name == "main.py"
+                and (workspace / "modules" / "agent_actions.py").exists()
+                and (workspace / "modules" / "app_constants.py").exists()
+            )
+            if target.resolve() == (PROJECT_ROOT / "main.py").resolve() or is_merotec_self_target:
+                return self.build_merotec_self_human_test_plan(workspace, target)
             command = f'"{sys.executable}" "{target.name}"'
             return {
                 "command": command,
@@ -903,6 +1061,272 @@ class AgentActionsMixin:
             }
 
         return None
+
+    def build_merotec_self_human_test_plan(self, workspace, target):
+        workspace = Path(workspace).resolve()
+        target = Path(target)
+        title_suffix = f" - teste visual {os.getpid()}-{time.time_ns()}"
+        return {
+            "command": [sys.executable, target.name],
+            "display": f"{Path(sys.executable).name} {target.name} (nova instancia de teste)",
+            "cwd": workspace,
+            "shell": False,
+            "url": "",
+            "ready_timeout": 35,
+            "screenshot_delay": 4.0,
+            "window_capture_timeout": 12.0,
+            "require_target_window": True,
+            "env": {
+                "MEROTEC_FORCE_NEW_INSTANCE": "1",
+                "MEROTEC_HUMAN_TEST_INSTANCE": "1",
+                "MEROTEC_VISUAL_TEST_INSTANCE": "1",
+                "MEROTEC_INSTANCE_TITLE_SUFFIX": title_suffix,
+            },
+        }
+
+    def resolve_requested_self_test_target(self, command, workspace):
+        workspace = Path(workspace).resolve()
+        if not self.workspace_looks_like_merotec_self(workspace):
+            return None
+
+        command_text = str(command or "")
+        py_tokens = re.findall(r'"([^"]+\.py)"|\'([^\']+\.py)\'|([^\s"\']+\.py)', command_text, re.IGNORECASE)
+        for token_group in py_tokens:
+            token = next((item for item in token_group if item), "")
+            if not token:
+                continue
+            candidate = Path(token)
+            if not candidate.is_absolute():
+                candidate = workspace / candidate
+            try:
+                if candidate.resolve() == (workspace / "main.py").resolve():
+                    return workspace / "main.py"
+            except OSError:
+                continue
+        normalized_command = self.normalize_plain_text(command_text)
+        if (
+            (workspace / "main.py").exists()
+            and self.command_launches_python_main(command_text)
+        ):
+            return workspace / "main.py"
+        return None
+
+    def workspace_looks_like_merotec_self(self, workspace):
+        workspace = Path(workspace)
+        return (
+            (workspace / "main.py").exists()
+            and (workspace / "modules" / "agent_actions.py").exists()
+            and (workspace / "modules" / "app_constants.py").exists()
+        )
+
+    def grab_human_test_image(self, plan):
+        plan = plan or {}
+        capture_pid = plan.get("capture_process_pid")
+        if capture_pid:
+            image = self.grab_window_image_by_pid(
+                capture_pid,
+                timeout=plan.get("window_capture_timeout", 8.0),
+            )
+            if image is not None:
+                return image
+            self.log_agent(f"Janela alvo do teste visual nao encontrada pelo PID: {capture_pid}")
+        capture_title = plan.get("capture_window_title", "")
+        if capture_title:
+            image = self.grab_window_image_by_title(
+                capture_title,
+                timeout=plan.get("window_capture_timeout", 8.0),
+            )
+            if image is not None:
+                return image
+            self.log_agent(f"Janela alvo do teste visual nao encontrada para captura: {capture_title}")
+        if plan.get("require_target_window"):
+            raise RuntimeError("Janela alvo do teste visual nao foi encontrada; captura do desktop foi bloqueada.")
+        return ImageGrab.grab()
+
+    def grab_window_image_by_title(self, title, timeout=8.0):
+        if os.name != "nt" or not title:
+            return None
+
+        deadline = time.time() + max(0.0, float(timeout or 0.0))
+        while time.time() <= deadline:
+            hwnd = self.find_window_handle_by_title(title)
+            if hwnd:
+                bbox = self.window_bbox_from_handle(hwnd)
+                if bbox:
+                    return ImageGrab.grab(bbox=bbox)
+            time.sleep(0.25)
+        return None
+
+    def human_test_window_is_ready(self, plan):
+        if os.name != "nt" or not plan:
+            return False
+        capture_pid = plan.get("capture_process_pid")
+        if capture_pid and self.find_window_handle_by_pid(capture_pid):
+            return True
+        capture_title = plan.get("capture_window_title", "")
+        if capture_title and self.find_window_handle_by_title(capture_title):
+            return True
+        return False
+
+    def find_window_handle_by_title(self, title):
+        try:
+            user32 = ctypes.windll.user32
+            exact = user32.FindWindowW(None, str(title))
+            if exact and user32.IsWindowVisible(exact):
+                return exact
+
+            matches = []
+
+            def enum_callback(hwnd, _lparam):
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length <= 0:
+                    return True
+                buffer = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buffer, length + 1)
+                window_title = buffer.value
+                if window_title == title or title in window_title:
+                    matches.append(hwnd)
+                    return False
+                return True
+
+            callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+            user32.EnumWindows(callback_type(enum_callback), 0)
+            return matches[0] if matches else None
+        except Exception:
+            return None
+
+    def grab_window_image_by_pid(self, pid, timeout=8.0):
+        if os.name != "nt" or not pid:
+            return None
+
+        deadline = time.time() + max(0.0, float(timeout or 0.0))
+        while time.time() <= deadline:
+            hwnd = self.find_window_handle_by_pid(pid)
+            if hwnd:
+                bbox = self.window_bbox_from_handle(hwnd)
+                if bbox:
+                    return ImageGrab.grab(bbox=bbox)
+            time.sleep(0.25)
+        return None
+
+    def find_window_handle_by_pid(self, pid):
+        try:
+            pid = int(pid)
+            user32 = ctypes.windll.user32
+            target_pids = self.collect_process_tree_pids(pid)
+            matches = []
+
+            def enum_callback(hwnd, _lparam):
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                process_id = ctypes.wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+                if process_id.value not in target_pids:
+                    return True
+                rect = ctypes.wintypes.RECT()
+                if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    return True
+                width = rect.right - rect.left
+                height = rect.bottom - rect.top
+                if width < 80 or height < 80:
+                    return True
+                matches.append((width * height, hwnd))
+                return True
+
+            callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+            user32.EnumWindows(callback_type(enum_callback), 0)
+            if not matches:
+                return None
+            matches.sort(reverse=True)
+            return matches[0][1]
+        except Exception:
+            return None
+
+    def collect_process_tree_pids(self, root_pid, parent_map=None):
+        try:
+            root_pid = int(root_pid)
+        except (TypeError, ValueError):
+            return set()
+
+        if parent_map is None:
+            parent_map = self.snapshot_process_parent_map()
+
+        tree = {root_pid}
+        changed = True
+        while changed:
+            changed = False
+            for child_pid, parent_pid in dict(parent_map).items():
+                try:
+                    child_pid = int(child_pid)
+                    parent_pid = int(parent_pid)
+                except (TypeError, ValueError):
+                    continue
+                if parent_pid in tree and child_pid not in tree:
+                    tree.add(child_pid)
+                    changed = True
+        return tree
+
+    def snapshot_process_parent_map(self):
+        if os.name != "nt":
+            return {}
+        try:
+            kernel32 = ctypes.windll.kernel32
+            th32cs_snapprocess = 0x00000002
+            invalid_handle = ctypes.c_void_p(-1).value
+
+            class PROCESSENTRY32W(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", ctypes.wintypes.DWORD),
+                    ("cntUsage", ctypes.wintypes.DWORD),
+                    ("th32ProcessID", ctypes.wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", ctypes.wintypes.DWORD),
+                    ("cntThreads", ctypes.wintypes.DWORD),
+                    ("th32ParentProcessID", ctypes.wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", ctypes.wintypes.DWORD),
+                    ("szExeFile", ctypes.c_wchar * 260),
+                ]
+
+            snapshot = kernel32.CreateToolhelp32Snapshot(th32cs_snapprocess, 0)
+            if snapshot in (0, invalid_handle):
+                return {}
+            try:
+                parent_map = {}
+                entry = PROCESSENTRY32W()
+                entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+                if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+                    return {}
+                while True:
+                    parent_map[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+                    if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                        break
+                return parent_map
+            finally:
+                kernel32.CloseHandle(snapshot)
+        except Exception:
+            return {}
+
+    def window_bbox_from_handle(self, hwnd):
+        try:
+            user32 = ctypes.windll.user32
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            time.sleep(0.35)
+
+            rect = ctypes.wintypes.RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return None
+            bbox = (rect.left, rect.top, rect.right, rect.bottom)
+            if bbox[2] - bbox[0] < 80 or bbox[3] - bbox[1] < 80:
+                return None
+            return bbox
+        except Exception:
+            return None
 
     def extract_first_local_url(self, text):
         match = re.search(r"https?://(?:localhost|127\.0\.0\.1|\[?::1\]?)(?::\d+)?/[^\s\"')\]]*", text or "", re.IGNORECASE)
@@ -1127,7 +1551,7 @@ class AgentActionsMixin:
                 clean, _line_range = self.parse_agent_read_request(raw)
                 key = clean.strip().replace("\\", "/").lower()
                 metrics["read_paths"][key] = metrics["read_paths"].get(key, 0) + 1
-        elif normalized_action in {"SEARCH_TEXT", "SCAN_TEXT", "EXECUTE_INSPECTION"}:
+        elif normalized_action in {"SEARCH_TEXT", "WEB_SEARCH", "SCAN_TEXT", "EXECUTE_INSPECTION"}:
             metrics["search_rounds"] += 1
             metrics["searches"] += request_count
 
@@ -1138,7 +1562,7 @@ class AgentActionsMixin:
         too_many_reads = metrics["read_rounds"] > limits["rounds"] or metrics["read_files"] > limits["files"]
         too_many_searches = metrics["search_rounds"] > limits["search_rounds"]
         too_many_passive = metrics["passive_actions"] > limits["passive"]
-        too_deep = action_depth >= 18 and normalized_action in {"READ", "SEARCH_TEXT", "SCAN_TEXT", "EXECUTE_INSPECTION"}
+        too_deep = action_depth >= 18 and normalized_action in {"READ", "SEARCH_TEXT", "WEB_SEARCH", "SCAN_TEXT", "EXECUTE_INSPECTION"}
         if repeated_reads or too_many_reads or too_many_searches or too_many_passive or too_deep:
             self.log_agent(
                 f"Aviso: alto volume de contexto permitido ({normalized_action}); "
@@ -1178,7 +1602,7 @@ class AgentActionsMixin:
                 "PROXIMA RESPOSTA OBRIGATORIA:\n"
                 "- Entregue a analise completa em texto agora.\n"
                 "- Inclua arquitetura, fluxo principal, arquivos importantes, riscos, pontos fortes e proximas implementacoes recomendadas.\n"
-                "- Nao use [READ], [SEARCH_TEXT], [SCAN_TEXT], EXECUTE, [REPLACE] ou [WRITE] nesta resposta.\n"
+                "- Nao use [READ], [SEARCH_TEXT], [WEB_SEARCH], [SCAN_TEXT], EXECUTE, [REPLACE] ou [WRITE] nesta resposta.\n"
                 "- Nao diga que vai analisar: apresente o resultado."
             )
             self._run_ai_task(
@@ -1207,7 +1631,7 @@ class AgentActionsMixin:
             "- Se a missao pede executar/testar, responda com uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: python -m unittest].\n"
             "- Se precisa validar visualmente, responda com [HUMAN_TEST: auto].\n"
             "- Se ja sabe que nao da para fazer com seguranca, entregue conclusao curta dizendo exatamente o bloqueio.\n"
-            "- Nao use [READ], [SEARCH_TEXT], [SCAN_TEXT] ou comando de inspecao na proxima resposta."
+            "- Nao use [READ], [SEARCH_TEXT], [WEB_SEARCH], [SCAN_TEXT] ou comando de inspecao na proxima resposta."
         )
         self._run_ai_task(
             "Pare de ler e execute a proxima acao concreta da missao.",
@@ -1230,6 +1654,8 @@ class AgentActionsMixin:
         return False
 
     def should_use_project_map_instead_of_mass_read(self, read_paths, task_objective=None):
+        if self.autonomous_unrestricted_mode_enabled():
+            return False
         objective = self.normalize_plain_text(task_objective or self.active_ai_objective or "")
         if not any(scope in objective for scope in ("projeto", "aplicativo", "app", "sistema", "arquitetura")):
             return False
@@ -1592,6 +2018,104 @@ class AgentActionsMixin:
             return pattern.strip().strip("\"'"), path.strip().strip("\"'")
         return "", text
 
+    def _agent_web_search_many(self, requests, task_objective=None, action_depth=0, task_id=None):
+        if self.is_task_cancelled(task_id):
+            return
+
+        blocks = []
+        for request in requests:
+            query = self.sanitize_web_search_query(request)
+            if not query:
+                blocks.append("WEB_SEARCH ignorado: consulta vazia.")
+                continue
+            try:
+                html_text = self.fetch_web_search_html(query)
+                results = self.parse_web_search_results(html_text)
+                blocks.append(self.build_web_search_context(query, results))
+                self.log_agent(f"Busca web feita pela IDE: {query}")
+                self.add_chat_message("Merotec AI", f"Busquei na internet: `{query}`.")
+            except Exception as exc:
+                blocks.append(self.build_web_search_context(query, [], error=str(exc)))
+                self.add_chat_message("Erro", f"Falha na busca web `{query}`: {exc}")
+
+        context = (
+            f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or 'Continuar tarefa atual'}\n\n"
+            + "\n\n".join(blocks)
+            + "\n\n"
+            "Continue a missao usando esses resultados da internet como contexto externo. "
+            "Se encontrou informacao suficiente, conclua ou aplique a correcao. "
+            "Se precisar mudar arquivo, use [REPLACE] ou [WRITE]; se precisar validar, use uma tag EXECUTE real. "
+            "Nao repita a mesma busca web sem necessidade."
+        )
+        self._run_ai_task(
+            "Continue a missao original com base na busca web feita pela IDE.",
+            extra_context=context,
+            task_objective=task_objective or self.active_ai_objective,
+            action_depth=action_depth + 1,
+            task_id=task_id,
+        )
+
+    def sanitize_web_search_query(self, request):
+        query = re.sub(r"\s+", " ", str(request or "").strip().strip("\"'"))
+        return query[:220]
+
+    def fetch_web_search_html(self, query, timeout=12):
+        url = "https://duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0 Safari/537.36 MerotecAI/1.0"
+                )
+            },
+        )
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            return response.read().decode(charset, errors="replace")
+
+    @staticmethod
+    def normalize_duckduckgo_result_url(raw_url):
+        url = html.unescape(str(raw_url or "").strip())
+        if not url:
+            return ""
+        parsed = urllib.parse.urlparse(url)
+        if parsed.path == "/l/" or parsed.path.endswith("/l/"):
+            query = urllib.parse.parse_qs(parsed.query)
+            target = query.get("uddg", [""])[0]
+            if target:
+                return urllib.parse.unquote(target)
+        if url.startswith("//"):
+            return "https:" + url
+        if url.startswith("http://") or url.startswith("https://"):
+            return url
+        return ""
+
+    def parse_web_search_results(self, html_text, max_results=5):
+        parser = DuckDuckGoHtmlResultParser(max_results=max_results)
+        parser.feed(html_text or "")
+        return parser.results[:max_results]
+
+    def build_web_search_context(self, query, results, error=""):
+        header = f"WEB_SEARCH: {query}"
+        if error:
+            return f"{header}\nResultado: falha ao buscar na internet.\nErro: {error}"
+        if not results:
+            return f"{header}\nResultado: nenhuma resposta encontrada pelo buscador."
+
+        lines = [header, f"Resultados encontrados: {len(results)}"]
+        for index, result in enumerate(results, start=1):
+            title = result.get("title", "").strip()
+            url = result.get("url", "").strip()
+            snippet = result.get("snippet", "").strip()
+            if len(snippet) > 320:
+                snippet = snippet[:320].rstrip() + "..."
+            lines.append(f"{index}. {title}\nURL: {url}")
+            if snippet:
+                lines.append(f"Resumo: {snippet}")
+        return "\n".join(lines)
+
     def normalize_search_pattern(self, pattern):
         terms = re.findall(r"[a-zA-Z0-9_]+", pattern or "")
         if not terms:
@@ -1673,6 +2197,8 @@ class AgentActionsMixin:
         return "|".join(re.findall(r"[a-zA-Z0-9_]{3,}", objective or "")[:12])
 
     def should_stop_repeated_search(self, rel, pattern, task_id):
+        if self.autonomous_unrestricted_mode_enabled():
+            return False
         task_key = task_id if task_id is not None else self.current_task_id
         task_history = self.ai_search_history.setdefault(task_key, {"keys": {}, "files": {}})
         normalized = self.normalize_search_pattern(pattern)
@@ -1799,21 +2325,6 @@ class AgentActionsMixin:
     def has_suspicious_text_chars(self, text):
         return any(char in text for char in ("\ufffd", "\ufeff"))
 
-    def mojibake_score(self, text):
-        markers = [
-            "\ufffd",
-            "Ã",
-            "Â",
-            "â€",
-            "â€™",
-            "â€œ",
-            "â€\x9d",
-            "â€“",
-            "â€”",
-            "ï»¿",
-        ]
-        return sum(text.count(marker) for marker in markers)
-
     def _agent_fix_mojibake(self, raw_path, task_id=None):
         try:
             path = self.resolve_workspace_path(raw_path)
@@ -1857,24 +2368,6 @@ class AgentActionsMixin:
             except UnicodeError:
                 continue
         return min(candidates, key=lambda item: (self.mojibake_score(item), len(item))) if candidates else line
-
-    def apply_mojibake_map(self, text):
-        replacements = {
-            "Ã¡": "á", "Ã ": "à", "Ã¢": "â", "Ã£": "ã", "Ã¤": "ä",
-            "Ã©": "é", "Ãª": "ê", "Ã¨": "è", "Ã«": "ë",
-            "Ã­": "í", "Ã®": "î", "Ã¬": "ì", "Ã¯": "ï",
-            "Ã³": "ó", "Ã´": "ô", "Ãµ": "õ", "Ã²": "ò", "Ã¶": "ö",
-            "Ãº": "ú", "Ã»": "û", "Ã¹": "ù", "Ã¼": "ü",
-            "Ã§": "ç", "Ã±": "ñ",
-            "Ã�": "Á", "Ã‰": "É", "Ã“": "Ó", "Ãš": "Ú", "Ã‡": "Ç",
-            "Âº": "º", "Âª": "ª", "Â°": "°", "Â·": "·", "Â ": " ",
-            "â€™": "'", "â€˜": "'", "â€œ": '"', "â€\x9d": '"',
-            "â€“": "-", "â€”": "-", "â€¦": "...", "ï»¿": "",
-        }
-        repaired = text
-        for bad, good in replacements.items():
-            repaired = repaired.replace(bad, good)
-        return repaired
 
     def mojibake_score(self, text):
         markers = [
@@ -2493,7 +2986,10 @@ class AgentActionsMixin:
             coverage_before = self.read_coverage_ratio(history["ranges"], total_lines)
             repeated = range_key in history["range_keys"]
             repeated_too_much = repeated and history["requests"] > 20
-            if repeated_too_much or coverage_before >= 0.99 or history["requests"] > 40:
+            if (
+                not self.autonomous_unrestricted_mode_enabled()
+                and (repeated_too_much or coverage_before >= 0.99 or history["requests"] > 40)
+            ):
                 reason = "intervalo repetido em excesso" if repeated_too_much else "arquivo ja foi mapeado quase inteiro"
                 return self.build_read_stop_context(rel, total_lines, history, reason)
             history["ranges"].append((start, end))
@@ -2502,7 +2998,11 @@ class AgentActionsMixin:
         else:
             history["overview_count"] += 1
             coverage_before = self.read_coverage_ratio(history["ranges"], total_lines)
-            if history["overview_count"] > 6 and coverage_before >= 0.90:
+            if (
+                not self.autonomous_unrestricted_mode_enabled()
+                and history["overview_count"] > 6
+                and coverage_before >= 0.90
+            ):
                 return self.build_read_stop_context(rel, total_lines, history, "visao geral repetida")
             block = self.build_file_context_for_agent(path, rel)
 

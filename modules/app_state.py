@@ -121,6 +121,15 @@ class AppStateMixin:
         os.environ["AI_PROVIDER"] = self.settings.get("ai_provider", "codex")
         os.environ["CODEX_MODEL_NAME"] = self.settings.get("codex_model_name", "")
         os.environ["CODEX_REASONING_EFFORT"] = self.settings.get("codex_reasoning_effort", "xhigh") or "xhigh"
+        os.environ["MEROTEC_AUTONOMOUS_UNRESTRICTED"] = (
+            "1" if self.settings.get("autonomous_unrestricted_mode", False) else "0"
+        )
+        os.environ["MEROTEC_CODEX_AUTO_APPROVE_APP_SERVER"] = (
+            "1" if self.settings.get("codex_auto_approve_app_server_requests", False) else "0"
+        )
+        os.environ["MEROTEC_CODEX_APP_SERVER_APPROVAL_POLICY"] = (
+            self.settings.get("codex_app_server_approval_policy", "on-request") or "on-request"
+        )
         if self.settings.get("openai_model_name"):
             os.environ["OPENAI_MODEL_NAME"] = self.settings["openai_model_name"]
         if self.settings.get("google_model_name"):

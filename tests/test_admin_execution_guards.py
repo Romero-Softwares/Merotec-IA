@@ -12,13 +12,17 @@ from modules.agent_actions import AgentActionsMixin
 from modules.app_constants import IGNORED_DIRS, IGNORED_SUFFIXES
 from modules.engine import UniversalEngine
 from modules.workspace_intelligence import WorkspaceIntelligenceMixin
-from main import UniversalApp
+from main import UniversalApp, _single_instance_bypass_requested
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class DummyApp(AgentActionsMixin, WorkspaceIntelligenceMixin):
     build_command_failure_diagnostic = UniversalApp.build_command_failure_diagnostic
+    build_ai_display_response = UniversalApp.build_ai_display_response
+    response_has_agent_action = UniversalApp.response_has_agent_action
+    strip_agent_action_markup = UniversalApp.strip_agent_action_markup
+    action_execution_message = UniversalApp.action_execution_message
     command_failure_signature = UniversalApp.command_failure_signature
     extract_workspace_paths_from_output = UniversalApp.extract_workspace_paths_from_output
     unique_existing_relative_paths = UniversalApp.unique_existing_relative_paths
@@ -33,6 +37,10 @@ class DummyApp(AgentActionsMixin, WorkspaceIntelligenceMixin):
         self.messages = []
         self.logs = []
         self.executed_commands = []
+        self.human_tests = []
+        self.queued_ai_tasks = []
+        self.ai_passive_action_count = 0
+        self.max_ai_passive_actions = 20
 
     def is_task_cancelled(self, task_id=None):
         return False
@@ -51,6 +59,12 @@ class DummyApp(AgentActionsMixin, WorkspaceIntelligenceMixin):
 
     def _agent_execute_admin(self, command, **kwargs):
         self.executed_commands.append(("EXECUTE_ADMIN", command))
+
+    def _agent_human_test(self, request, **kwargs):
+        self.human_tests.append((request, kwargs))
+
+    def _run_ai_task(self, command, **kwargs):
+        self.queued_ai_tasks.append((command, kwargs))
 
     def iter_workspace_files(self, limit=500):
         workspace = Path(self.current_workspace)
@@ -181,6 +195,7 @@ class AdminExecutionGuardsTest(unittest.TestCase):
 
         self.assertIn("[EXECUTE: python -m unittest]", instruction)
         self.assertIn("[EXECUTE_ADMIN: whoami /groups]", instruction)
+        self.assertIn("[WEB_SEARCH: consulta objetiva]", instruction)
         self.assertNotIn("[EXECUTE: comando concreto]", instruction)
         self.assertNotIn("[EXECUTE_ADMIN: comando concreto]", instruction)
 
@@ -231,6 +246,18 @@ class AdminExecutionGuardsTest(unittest.TestCase):
                         any("placeholder" in message.lower() for message in self.app.logs)
                     )
 
+    def test_unrestricted_mode_allows_real_mutation_execute_action(self):
+        self.app.settings = {"autonomous_unrestricted_mode": True}
+        command = 'powershell -NoProfile -Command "Set-Content -Path sample.txt -Value ok"'
+
+        self.app.parse_and_execute_agent_actions(
+            f"[EXECUTE: {command}]",
+            task_objective="atualizar arquivo pelo caminho direto",
+            task_id="unrestricted-execute",
+        )
+
+        self.assertEqual([("EXECUTE", command)], self.app.executed_commands)
+
     def test_repeated_concrete_placeholder_failure_is_detected(self):
         self.assertTrue(
             self.app.command_output_is_placeholder_error(
@@ -248,6 +275,71 @@ class AdminExecutionGuardsTest(unittest.TestCase):
         )
 
         self.assertEqual([("EXECUTE_ADMIN", "net stop spooler")], self.app.executed_commands)
+
+    def test_adjacent_human_test_tags_execute_visual_validation_once(self):
+        self.app.parse_and_execute_agent_actions(
+            "[HUMAN_TEST: auto][HUMAN_TEST: auto]",
+            task_objective="faca um teste visual desse sistema",
+            task_id="visual-tag",
+        )
+
+        self.assertEqual(1, len(self.app.human_tests))
+        self.assertEqual("auto", self.app.human_tests[0][0])
+
+    def test_adjacent_action_tags_are_not_shown_as_chat_text(self):
+        response = "[HUMAN_TEST: auto][HUMAN_TEST: auto]"
+
+        self.assertTrue(self.app.response_has_agent_action(response))
+        self.assertEqual(
+            "A IDE recebeu uma execucao real e iniciou a validacao.",
+            self.app.build_ai_display_response(response),
+        )
+        self.assertEqual("", self.app.strip_agent_action_markup(response))
+
+    def test_web_search_tag_is_hidden_as_context_action(self):
+        response = "[WEB_SEARCH: Python urllib timeout]"
+
+        self.assertTrue(self.app.response_has_agent_action(response))
+        self.assertEqual(
+            "A IDE esta coletando contexto objetivo para executar o proximo passo.",
+            self.app.build_ai_display_response(response),
+        )
+        self.assertEqual("", self.app.strip_agent_action_markup(response))
+
+    def test_web_search_action_parses_results_and_requeues_agent(self):
+        html = """
+        <html><body>
+          <a class="result__a" href="/l/?uddg=https%3A%2F%2Fdocs.python.org%2F3%2Flibrary%2Furllib.request.html">urllib.request docs</a>
+          <a class="result__snippet">Official Python documentation for urllib.request.</a>
+        </body></html>
+        """
+        self.app.fetch_web_search_html = lambda query: html
+
+        self.app.parse_and_execute_agent_actions(
+            "[WEB_SEARCH: Python urllib request timeout]",
+            task_objective="resolver erro de rede usando documentacao atual",
+            task_id="web-search",
+        )
+
+        self.assertTrue(
+            any("Busquei na internet" in message for _sender, message in self.app.messages)
+        )
+        self.assertEqual(1, len(self.app.queued_ai_tasks))
+        _command, kwargs = self.app.queued_ai_tasks[0]
+        context = kwargs["extra_context"]
+        self.assertIn("WEB_SEARCH: Python urllib request timeout", context)
+        self.assertIn("urllib.request docs", context)
+        self.assertIn("https://docs.python.org/3/library/urllib.request.html", context)
+        self.assertIn("Official Python documentation", context)
+
+    def test_inline_action_examples_are_not_executed(self):
+        self.app.parse_and_execute_agent_actions(
+            "Para validar, use [HUMAN_TEST: auto].",
+            task_objective="explique como validar",
+            task_id="visual-example",
+        )
+
+        self.assertEqual([], self.app.human_tests)
 
     def test_execute_with_admin_marker_is_redirected_to_admin_executor(self):
         AgentActionsMixin._agent_execute(
@@ -281,6 +373,172 @@ class AdminExecutionGuardsTest(unittest.TestCase):
             self.assertIn("-m http.server", plan["display"])
             self.assertRegex(plan["url"], r"http://127\.0\.0\.1:\d+/index\.html$")
 
+    def test_human_test_plan_relaunches_self_in_separate_test_instance(self):
+        self.app.current_workspace = str(PROJECT_ROOT)
+        self.app.active_ai_objective = "Analise o print do teste visual real da IDE"
+
+        plan = self.app.build_human_test_plan("auto", task_objective=self.app.active_ai_objective)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(PROJECT_ROOT.resolve(), Path(plan["cwd"]).resolve())
+        self.assertFalse(plan["shell"])
+        self.assertIn("nova instancia de teste", plan["display"])
+        self.assertIsInstance(plan["command"], list)
+        self.assertIn("main.py", " ".join(str(part) for part in plan["command"]))
+        self.assertIn("MEROTEC_INSTANCE_TITLE_SUFFIX", plan.get("env", {}))
+        self.assertEqual("1", plan["env"].get("MEROTEC_FORCE_NEW_INSTANCE"))
+        self.assertEqual("1", plan["env"].get("MEROTEC_HUMAN_TEST_INSTANCE"))
+        self.assertEqual("1", plan["env"].get("MEROTEC_VISUAL_TEST_INSTANCE"))
+        self.assertIn("teste visual", plan["env"]["MEROTEC_INSTANCE_TITLE_SUFFIX"])
+        self.assertNotIn("capture_window_title", plan)
+        self.assertTrue(plan.get("require_target_window"))
+        self.assertGreater(plan["ready_timeout"], 2)
+
+    def test_human_test_self_plans_use_unique_instance_markers(self):
+        self.app.current_workspace = str(PROJECT_ROOT)
+        self.app.active_ai_objective = "Analise o print do teste visual real da IDE"
+
+        first_plan = self.app.build_human_test_plan("auto", task_objective=self.app.active_ai_objective)
+        second_plan = self.app.build_human_test_plan("auto", task_objective=self.app.active_ai_objective)
+
+        self.assertNotEqual(
+            first_plan["env"]["MEROTEC_INSTANCE_TITLE_SUFFIX"],
+            second_plan["env"]["MEROTEC_INSTANCE_TITLE_SUFFIX"],
+        )
+
+    def test_human_test_capture_prefers_process_over_title(self):
+        image = object()
+
+        class CaptureApp(DummyApp):
+            def __init__(self):
+                super().__init__()
+                self.capture_calls = []
+
+            def grab_window_image_by_pid(self, pid, timeout=8.0):
+                self.capture_calls.append(("pid", pid, timeout))
+                return image
+
+            def grab_window_image_by_title(self, title, timeout=8.0):
+                self.capture_calls.append(("title", title, timeout))
+                return None
+
+        app = CaptureApp()
+
+        result = app.grab_human_test_image(
+            {
+                "capture_process_pid": 1234,
+                "capture_window_title": "titulo antigo",
+                "window_capture_timeout": 9.0,
+                "require_target_window": True,
+            }
+        )
+
+        self.assertIs(image, result)
+        self.assertEqual([("pid", 1234, 9.0)], app.capture_calls)
+
+    def test_collect_process_tree_pids_includes_descendants(self):
+        parent_map = {
+            101: 100,
+            102: 101,
+            103: 102,
+            200: 999,
+        }
+
+        self.assertEqual(
+            {100, 101, 102, 103},
+            self.app.collect_process_tree_pids(100, parent_map=parent_map),
+        )
+
+    def test_single_instance_bypass_accepts_visual_test_markers(self):
+        keys = (
+            "MEROTEC_FORCE_NEW_INSTANCE",
+            "MEROTEC_HUMAN_TEST_INSTANCE",
+            "MEROTEC_VISUAL_TEST_INSTANCE",
+            "MEROTEC_INSTANCE_TITLE_SUFFIX",
+        )
+        previous = {key: os.environ.get(key) for key in keys}
+        try:
+            for key in keys:
+                os.environ.pop(key, None)
+
+            self.assertFalse(_single_instance_bypass_requested())
+
+            os.environ["MEROTEC_HUMAN_TEST_INSTANCE"] = "1"
+            self.assertTrue(_single_instance_bypass_requested())
+            os.environ.pop("MEROTEC_HUMAN_TEST_INSTANCE", None)
+
+            os.environ["MEROTEC_VISUAL_TEST_INSTANCE"] = "1"
+            self.assertTrue(_single_instance_bypass_requested())
+            os.environ.pop("MEROTEC_VISUAL_TEST_INSTANCE", None)
+
+            os.environ["MEROTEC_INSTANCE_TITLE_SUFFIX"] = " - teste visual unitario"
+            self.assertTrue(_single_instance_bypass_requested())
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_human_test_plan_wraps_explicit_self_command_in_test_instance(self):
+        self.app.current_workspace = str(PROJECT_ROOT)
+        self.app.active_ai_objective = "Faca um teste visual real"
+        requested = f'"{sys.executable}" "main.py"'
+
+        plan = self.app.build_human_test_plan(
+            requested,
+            task_objective=self.app.active_ai_objective,
+            requested_command=requested,
+        )
+
+        self.assertIsNotNone(plan)
+        self.assertFalse(plan["shell"])
+        self.assertIn("nova instancia de teste", plan["display"])
+        self.assertEqual("1", plan["env"].get("MEROTEC_FORCE_NEW_INSTANCE"))
+        self.assertNotIn("capture_window_title", plan)
+        self.assertTrue(plan.get("require_target_window"))
+
+    def test_human_test_plan_wraps_absolute_python_self_command(self):
+        self.app.current_workspace = str(PROJECT_ROOT)
+        self.app.active_ai_objective = "Execute o teste visual"
+        requested = f'"{sys.executable}" "{PROJECT_ROOT / "main.py"}"'
+
+        plan = self.app.build_human_test_plan(
+            requested,
+            task_objective=self.app.active_ai_objective,
+            requested_command=requested,
+        )
+
+        self.assertFalse(plan["shell"])
+        self.assertIn("nova instancia de teste", plan["display"])
+        self.assertEqual("1", plan["env"].get("MEROTEC_FORCE_NEW_INSTANCE"))
+        self.assertTrue(plan.get("require_target_window"))
+        self.assertNotIn("capture_window_title", plan)
+
+    def test_execute_python_main_visual_request_routes_to_human_test(self):
+        self.app.active_ai_objective = "Faca um teste visual real"
+
+        self.assertTrue(
+            self.app.should_route_execute_to_human_test(
+                f'"{sys.executable}" "main.py"',
+                self.app.active_ai_objective,
+            )
+        )
+
+        self.assertTrue(
+            self.app.should_route_execute_to_human_test(
+                "py main.py",
+                self.app.active_ai_objective,
+            )
+        )
+
+        self.assertTrue(
+            self.app.should_route_execute_to_human_test(
+                "pythonw.exe .\\main.py",
+                self.app.active_ai_objective,
+            )
+        )
+
     def test_codex_app_server_placeholder_approval_is_rejected(self):
         app = DummyCodexApprovalApp()
 
@@ -308,6 +566,19 @@ class AdminExecutionGuardsTest(unittest.TestCase):
         self.assertFalse(approved)
         self.assertTrue(any("placeholder" in message.lower() for message in app.logs))
 
+    def test_codex_app_server_real_request_is_autoapproved_when_enabled(self):
+        app = DummyCodexApprovalApp()
+        app.settings = {"codex_auto_approve_app_server_requests": True}
+
+        approved = app.ask_codex_app_server_approval(
+            "execCommandApproval",
+            {"command": "python -m unittest tests.test_admin_execution_guards"},
+            str(Path.cwd()),
+        )
+
+        self.assertTrue(approved)
+        self.assertTrue(any("autoaprovada" in message.lower() for message in app.logs))
+
     def test_codex_app_server_extracts_common_command_shapes(self):
         app = DummyCodexApprovalApp()
         cases = [
@@ -320,6 +591,27 @@ class AdminExecutionGuardsTest(unittest.TestCase):
         for params, expected in cases:
             with self.subTest(params=params):
                 self.assertEqual(expected, app.extract_codex_app_server_command(params))
+
+    def test_direct_workspace_changes_keep_codex_final_message_visible(self):
+        response = (
+            "Corrigi a inicializacao da janela e preservei a configuracao atual.\n\n"
+            "Verificado com python -m unittest."
+        )
+
+        display = self.app.build_ai_display_response(
+            response,
+            direct_changes=[("alterado", "ide_settings.json")],
+            direct_change_total=1,
+        )
+
+        self.assertIn("Corrigi a inicializacao da janela", display)
+        self.assertIn("Verificado com python -m unittest", display)
+        self.assertIn("Arquivos afetados", display)
+        self.assertIn("ide_settings.json (alterado)", display)
+        self.assertNotEqual(
+            self.app.format_direct_workspace_changes([("alterado", "ide_settings.json")], 1),
+            display,
+        )
 
 
 if __name__ == "__main__":

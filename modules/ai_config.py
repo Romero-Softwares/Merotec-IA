@@ -12,9 +12,16 @@ from modules.ui_theme import THEME
 
 
 class AiConfigMixin:
+    def ai_status_text(self):
+        status = self.engine.status_text()
+        quota = self.engine.quota_status_text()
+        if not quota or quota == status:
+            return status
+        return f"{status}\nCota atual: {quota}"
+
     def refresh_ai_status(self):
         if hasattr(self, "ai_status_label"):
-            self.ai_status_label.configure(text=self.engine.status_text())
+            self.ai_status_label.configure(text=self.ai_status_text())
 
     def find_codex_executable(self):
         candidates = []

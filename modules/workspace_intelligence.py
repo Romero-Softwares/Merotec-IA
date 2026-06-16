@@ -1,3 +1,5 @@
+import json
+import hashlib
 import os
 import re
 import subprocess
@@ -5,10 +7,11 @@ import sys
 import threading
 import unicodedata
 from collections import Counter
+from datetime import datetime
 from decimal import Decimal, DivisionByZero, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
-from modules.app_constants import IGNORED_DIRS, IGNORED_SUFFIXES
+from modules.app_constants import IGNORED_DIRS, IGNORED_SUFFIXES, MEROTEC_SYSTEM_AI_DIR
 from modules.memory import MemorySubnet
 
 
@@ -25,6 +28,9 @@ class WorkspaceIntelligenceMixin:
         calculation_reply = self.local_calculation_reply(command, normalized)
         if calculation_reply:
             return calculation_reply
+
+        if self.is_local_llm_request(normalized):
+            return self.local_llm_reply(command)
 
         greetings = {
             "ola",
@@ -220,6 +226,10 @@ class WorkspaceIntelligenceMixin:
         selected = categories[selected_key]
         validation_command = self.autonomous_discovery_validation_command()
         project_signal = self.autonomous_discovery_project_signal()
+        local_training_artifact = ""
+        if self.is_local_training_subnet_request(normalized):
+            local_training_artifact = self.export_local_training_subnet_artifacts()
+        local_training_section = f"{local_training_artifact}\n\n" if local_training_artifact else ""
 
         category_lines = []
         for category in categories.values():
@@ -240,6 +250,7 @@ class WorkspaceIntelligenceMixin:
             f"Validacao padrao sugerida: `{validation_command or 'sem comando automatico seguro'}`.\n\n"
             "Sinal atual do projeto:\n"
             f"{project_signal}\n\n"
+            f"{local_training_section}"
             "Regra operacional: se o pedido vier incompleto, a IDE nao devolve pergunta aberta; "
             "ela transforma a ambiguidade em uma leitura minima, uma validacao real ou um diagnostico fechado."
         )
@@ -271,6 +282,11 @@ class WorkspaceIntelligenceMixin:
             "mercado",
             "ciclo",
             "clube",
+            "varredura",
+            "varrer",
+            "subrede",
+            "sub",
+            "rede",
         }
         human_terms = {"humano", "humanos", "usuario", "pessoa", "interacao", "interacoes"}
         has_autonomy = bool(words & autonomy_terms) or "sem humano" in normalized or "sem o humano" in normalized
@@ -280,7 +296,664 @@ class WorkspaceIntelligenceMixin:
             and ("gatilho" in normalized or "gatilhos" in normalized)
         )
         removes_human = bool(words & {"retirar", "remover"}) and bool(words & human_terms)
-        return (has_autonomy and has_discovery) or asks_three_triggers or (removes_human and has_discovery)
+        return (
+            (has_autonomy and has_discovery)
+            or asks_three_triggers
+            or (removes_human and has_discovery)
+            or self.is_local_training_subnet_request(normalized)
+        )
+
+    def is_local_training_subnet_request(self, normalized):
+        normalized = self.normalize_plain_text(normalized or "")
+        words = set(re.findall(r"[a-z0-9_]+", normalized))
+        training_terms = {
+            "alimentado",
+            "alimentar",
+            "corpus",
+            "dataset",
+            "modelo",
+            "rag",
+            "treinada",
+            "treinado",
+            "treinamento",
+            "treinar",
+            "treinavel",
+        }
+        local_terms = {"cota", "local", "offline", "conectada", "conectado", "quota"}
+        subnet_terms = {"subrede", "sub", "rede", "varredura", "varrer"}
+        has_training_goal = bool(words & training_terms)
+        has_local_reason = bool(words & local_terms) or "sem cota" in normalized or "nao dependa" in normalized
+        has_subnet_scan = bool(words & subnet_terms) or "sub rede" in normalized or "sub-rede" in normalized
+        return has_training_goal and (has_local_reason or has_subnet_scan)
+
+    def local_training_system_dir(self):
+        return Path(getattr(self, "system_ai_dir", MEROTEC_SYSTEM_AI_DIR)).resolve()
+
+    def local_training_workspace_key(self, workspace=None):
+        workspace = Path(workspace or self.current_workspace).resolve()
+        slug = re.sub(r"[^a-zA-Z0-9_.-]+", "_", workspace.name).strip("._") or "workspace"
+        digest = hashlib.sha256(str(workspace).encode("utf-8", errors="ignore")).hexdigest()[:12]
+        return f"{slug}-{digest}"
+
+    def local_training_output_dir(self, workspace=None):
+        return self.local_training_system_dir() / "workspaces" / self.local_training_workspace_key(workspace)
+
+    def local_training_corpus_path(self, workspace=None):
+        return self.local_training_output_dir(workspace) / "training_corpus.jsonl"
+
+    def local_training_artifact_label(self, path):
+        try:
+            return path.relative_to(self.local_training_system_dir()).as_posix()
+        except ValueError:
+            return path.as_posix()
+
+    def export_local_training_subnet_artifacts(self, max_files=180, max_chars_per_file=8000, chunk_chars=1800):
+        workspace = Path(self.current_workspace).resolve()
+        files = list(self.iter_workspace_files(limit=1400))
+        summary = self.local_project_summary()
+        recent_changes = self.recent_change_records(limit=20) if hasattr(self, "recent_change_records") else []
+
+        subnet = MemorySubnet(workspace, max_nodes=240)
+        subnet.ingest_project_signals(files, summary=summary, recent_changes=recent_changes)
+
+        output_dir = self.local_training_output_dir(workspace)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        subnet_path = output_dir / "memory_subnet.json"
+        corpus_path = output_dir / "training_corpus.jsonl"
+        manifest_path = output_dir / "README.md"
+
+        subnet_path.write_text(subnet.export_json(), encoding="utf-8")
+        records = self.build_local_training_records(
+            files,
+            summary,
+            subnet,
+            recent_changes=recent_changes,
+            max_files=max_files,
+            max_chars_per_file=max_chars_per_file,
+            chunk_chars=chunk_chars,
+        )
+        with corpus_path.open("w", encoding="utf-8", newline="\n") as file:
+            for record in records:
+                file.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+        manifest = (
+            "# Merotec Local AI Corpus\n\n"
+            "Artefatos gerados pela varredura local do workspace para uso offline/RAG.\n\n"
+            f"- Workspace analisado: `{workspace}`\n"
+            f"- Chave do projeto: `{self.local_training_workspace_key(workspace)}`\n"
+            "- `memory_subnet.json`: grafo leve de sinais do projeto.\n"
+            "- `training_corpus.jsonl`: registros JSONL com resumo, nos da sub-rede e trechos textuais redigidos.\n\n"
+            "Linhas com possiveis segredos sao redigidas antes de entrar no corpus.\n"
+        )
+        manifest_path.write_text(manifest, encoding="utf-8")
+
+        return (
+            "Artefatos locais atualizados na rede do sistema para modelo/RAG offline:\n"
+            f"- {self.local_training_artifact_label(subnet_path)}\n"
+            f"- {self.local_training_artifact_label(corpus_path)} ({len(records)} registros)\n"
+            f"- {self.local_training_artifact_label(manifest_path)}\n"
+            f"\n{self.local_training_subnet_status()}"
+        )
+
+    def local_training_subnet_status(self):
+        workspace = Path(self.current_workspace).resolve()
+        output_dir = self.local_training_output_dir(workspace)
+        subnet_path = output_dir / "memory_subnet.json"
+        corpus_path = output_dir / "training_corpus.jsonl"
+        manifest_path = output_dir / "README.md"
+
+        missing = [
+            self.local_training_artifact_label(path)
+            for path in (subnet_path, corpus_path, manifest_path)
+            if not path.exists()
+        ]
+        if missing:
+            return (
+                "Sub-rede local: ainda nao preparada na pasta do sistema.\n"
+                f"Faltando: {', '.join(missing)}.\n"
+                "Peca uma varredura/treinamento local para gerar o corpus offline sem gravar no diretorio do projeto."
+            )
+
+        node_count = 0
+        edge_count = 0
+        try:
+            subnet = json.loads(subnet_path.read_text(encoding="utf-8"))
+            node_count = len(subnet.get("nodes") or {})
+            edge_count = len(subnet.get("edges") or [])
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+
+        record_count = 0
+        try:
+            with corpus_path.open("r", encoding="utf-8") as file:
+                record_count = sum(1 for line in file if line.strip())
+        except OSError:
+            pass
+
+        try:
+            updated_at = corpus_path.stat().st_mtime
+            updated_text = datetime.fromtimestamp(updated_at).strftime("%d/%m/%Y %H:%M")
+        except OSError:
+            updated_text = "data indisponivel"
+
+        ready = node_count > 0 and record_count > 0
+        status = "pronta" if ready else "incompleta"
+        return (
+            f"Sub-rede local: {status} para memoria/RAG offline.\n"
+            f"- Pasta da rede do sistema: {self.local_training_artifact_label(output_dir)}\n"
+            f"- Projeto alimentador: {workspace.name}\n"
+            f"- Nos de memoria: {node_count}\n"
+            f"- Ligacoes: {edge_count}\n"
+            f"- Registros no corpus: {record_count}\n"
+            f"- Ultima atualizacao: {updated_text}\n"
+            "Uso real: ela fornece contexto local e corpus redigido quando o Codex/modelo externo falhar.\n"
+            "Limite atual: ela nao e, sozinha, um LLM treinado capaz de gerar respostas novas sem um motor local conectado."
+        )
+
+    def ensure_local_training_subnet_ready(self):
+        status = self.local_training_subnet_status()
+        if "Sub-rede local: pronta" in status:
+            return status
+
+        try:
+            return self.export_local_training_subnet_artifacts()
+        except Exception as exc:
+            return (
+                f"{status}\n\n"
+                "Tentei preparar a sub-rede local automaticamente, mas a geracao falhou.\n"
+                f"Erro: {exc}"
+            )
+
+    def build_local_training_records(
+        self,
+        files,
+        summary,
+        subnet,
+        recent_changes=None,
+        max_files=180,
+        max_chars_per_file=8000,
+        chunk_chars=1800,
+    ):
+        records = [
+            {
+                "kind": "project_summary",
+                "instruction": "Resuma o workspace local para um agente offline.",
+                "input": subnet.root_path.name,
+                "output": summary,
+                "source": "workspace_summary",
+            }
+        ]
+
+        for node in sorted(subnet.nodes.values(), key=lambda item: item.get("weight", 0), reverse=True):
+            records.append(
+                {
+                    "kind": "memory_node",
+                    "instruction": "Use este sinal da sub-rede para orientar a proxima acao local.",
+                    "input": node.get("key", ""),
+                    "output": node,
+                    "source": "memory_subnet",
+                }
+            )
+
+        for change in recent_changes or []:
+            records.append(
+                {
+                    "kind": "recent_change",
+                    "instruction": "Considere esta mudanca recente ao continuar a tarefa.",
+                    "input": change.get("rel") or change.get("path") or "",
+                    "output": {
+                        "action": change.get("action", ""),
+                        "summary": change.get("summary", ""),
+                        "objective": change.get("objective", ""),
+                        "timestamp": change.get("timestamp", ""),
+                    },
+                    "source": "change_history",
+                }
+            )
+
+        chunked_files = 0
+        for path, rel in files:
+            if chunked_files >= max_files:
+                break
+            if not self.should_include_file_in_local_training(path):
+                continue
+            text = self.read_local_training_text(path, max_chars=max_chars_per_file)
+            if not text:
+                continue
+            chunked_files += 1
+            rel_text = rel.as_posix()
+            for index, chunk in enumerate(self.chunk_local_training_text(text, chunk_chars=chunk_chars), start=1):
+                records.append(
+                    {
+                        "kind": "file_chunk",
+                        "instruction": "Use este trecho do workspace como contexto local redigido.",
+                        "input": {"path": rel_text, "chunk": index},
+                        "output": chunk,
+                        "source": rel_text,
+                    }
+                )
+        return records
+
+    def should_include_file_in_local_training(self, path):
+        suffix = path.suffix.lower()
+        if suffix in {".bak", ".tmp"} or suffix in IGNORED_SUFFIXES:
+            return False
+        allowed_suffixes = {
+            ".cmd",
+            ".cs",
+            ".css",
+            ".dart",
+            ".html",
+            ".java",
+            ".js",
+            ".json",
+            ".jsx",
+            ".kt",
+            ".md",
+            ".py",
+            ".rs",
+            ".toml",
+            ".ts",
+            ".tsx",
+            ".txt",
+            ".xml",
+            ".yaml",
+            ".yml",
+        }
+        if suffix not in allowed_suffixes:
+            return False
+        try:
+            return path.stat().st_size <= 350_000
+        except OSError:
+            return False
+
+    def read_local_training_text(self, path, max_chars=8000):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        text = self.redact_local_training_text(text)
+        return text[:max_chars].strip()
+
+    def redact_local_training_text(self, text):
+        secret_pattern = re.compile(
+            r"(api[_-]?key|token|secret|password|passwd|private[_-]?key|client[_-]?secret|authorization)",
+            re.IGNORECASE,
+        )
+        redacted = []
+        for line in text.splitlines():
+            redacted.append("[REDACTED_SECRET_LINE]" if secret_pattern.search(line) else line)
+        return "\n".join(redacted)
+
+    def chunk_local_training_text(self, text, chunk_chars=1800):
+        if not text:
+            return []
+        chunks = []
+        start = 0
+        while start < len(text):
+            end = min(len(text), start + chunk_chars)
+            if end < len(text):
+                newline = text.rfind("\n", start, end)
+                if newline > start + 300:
+                    end = newline
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            start = end
+        return chunks
+
+    def load_local_training_records(self, max_records=700):
+        corpus_path = self.local_training_corpus_path(self.current_workspace)
+        if not corpus_path.exists():
+            return []
+
+        records = []
+        try:
+            with corpus_path.open("r", encoding="utf-8") as file:
+                for line in file:
+                    if len(records) >= max_records:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, dict):
+                        records.append(record)
+        except OSError:
+            return []
+        return records
+
+    def local_training_query_terms(self, query):
+        normalized = self.normalize_plain_text(query or "")
+        stopwords = {
+            "ainda",
+            "como",
+            "com",
+            "continue",
+            "da",
+            "das",
+            "de",
+            "do",
+            "dos",
+            "essa",
+            "esse",
+            "esta",
+            "este",
+            "para",
+            "por",
+            "que",
+            "rede",
+            "sem",
+            "uma",
+            "vou",
+        }
+        return {
+            word
+            for word in re.findall(r"[a-z0-9_]+", normalized)
+            if len(word) >= 3 and word not in stopwords
+        }
+
+    def local_training_record_search_text(self, record):
+        pieces = [
+            str(record.get("kind", "")),
+            str(record.get("source", "")),
+            json.dumps(record.get("input", ""), ensure_ascii=False, sort_keys=True),
+            json.dumps(record.get("output", ""), ensure_ascii=False, sort_keys=True),
+        ]
+        return self.normalize_plain_text(" ".join(pieces))
+
+    def score_local_training_record(self, record, terms):
+        kind = record.get("kind", "")
+        base_scores = {
+            "project_summary": 9,
+            "recent_change": 8,
+            "memory_node": 5,
+            "file_chunk": 2,
+        }
+        score = base_scores.get(kind, 1)
+        text = self.local_training_record_search_text(record)
+        for term in terms:
+            if term in text:
+                score += 6
+            if text.count(term) > 1:
+                score += min(6, text.count(term))
+        source = str(record.get("source", ""))
+        if source in {"main.py", "modules/workspace_intelligence.py", "modules/app_constants.py"}:
+            score += 3
+        return score
+
+    def format_local_training_context_record(self, record, max_output_chars=900):
+        kind = str(record.get("kind", "registro"))
+        source = str(record.get("source", "desconhecido"))
+        input_value = record.get("input", "")
+        output_value = record.get("output", "")
+        if not isinstance(output_value, str):
+            output_text = json.dumps(output_value, ensure_ascii=False, sort_keys=True)
+        else:
+            output_text = output_value
+        output_text = output_text.strip()
+        if len(output_text) > max_output_chars:
+            output_text = output_text[:max_output_chars].rstrip() + "\n[trecho reduzido]"
+        input_text = ""
+        if input_value:
+            input_text = json.dumps(input_value, ensure_ascii=False, sort_keys=True)
+            if len(input_text) > 180:
+                input_text = input_text[:180].rstrip() + "..."
+        header = f"- {kind} | fonte: {source}"
+        if input_text:
+            header += f" | entrada: {input_text}"
+        return f"{header}\n{output_text}"
+
+    def build_local_training_context(self, command, max_records=9, max_chars=6000):
+        status = self.local_training_subnet_status()
+        if "Sub-rede local: pronta" not in status:
+            status = self.ensure_local_training_subnet_ready()
+        if "Sub-rede local: pronta" not in status and "Artefatos locais atualizados" not in status:
+            return ""
+
+        records = self.load_local_training_records()
+        if not records:
+            return ""
+
+        terms = self.local_training_query_terms(command)
+        ranked = sorted(
+            records,
+            key=lambda record: self.score_local_training_record(record, terms),
+            reverse=True,
+        )
+        selected = ranked[:max_records]
+        sections = []
+        total_chars = 0
+        for record in selected:
+            text = self.format_local_training_context_record(record)
+            if total_chars + len(text) > max_chars:
+                remaining = max_chars - total_chars
+                if remaining < 400:
+                    break
+                text = text[:remaining].rstrip() + "\n[contexto reduzido]"
+            sections.append(text)
+            total_chars += len(text)
+
+        if not sections:
+            return ""
+        return (
+            "CONTEXTO DA SUB-REDE LOCAL DO SISTEMA:\n"
+            "A rede abaixo vem do corpus offline pronto em `.merotec_system_ai` e deve orientar a proxima acao.\n\n"
+            f"{status}\n\n"
+            "Registros mais relevantes:\n"
+            + "\n\n".join(sections)
+        )
+
+    def is_local_llm_request(self, normalized):
+        text = normalized or ""
+        local_terms = {
+            "llm",
+            "modelo local",
+            "ia local",
+            "offline",
+            "sem cota",
+            "sem codex",
+            "sub rede",
+            "sub-rede",
+            "rag",
+        }
+        action_terms = {
+            "responda",
+            "responder",
+            "use",
+            "usar",
+            "fallback",
+            "falhar",
+            "falha",
+            "cota",
+            "treinavel",
+            "transformar",
+            "transformara",
+            "modelo",
+            "llm",
+        }
+        return any(term in text for term in local_terms) and any(term in text for term in action_terms)
+
+    def is_external_model_failure_response(self, text):
+        normalized = self.normalize_plain_text(text or "")
+        failure_markers = {
+            "alta demanda",
+            "capacity",
+            "insufficient_quota",
+            "sem cota",
+            "creditos esgotados",
+            "limite atingido",
+            "rate limit",
+            "nao foi encontrado",
+            "nao esta logado",
+            "nao conseguiu iniciar",
+            "terminou sem devolver texto",
+            "app-server retornou erro",
+            "retornou erro",
+        }
+        return any(marker in normalized for marker in failure_markers)
+
+    def local_llm_fallback_reply(self, command, external_response="", image_path=None):
+        if image_path or not self.is_external_model_failure_response(external_response):
+            return None
+        return self.local_llm_reply(command, failure_reason=external_response)
+
+    def local_llm_reply(self, command, failure_reason="", max_records=8, max_chars=5200):
+        status = self.local_training_subnet_status()
+        if "Sub-rede local: pronta" not in status:
+            status = self.ensure_local_training_subnet_ready()
+        if "Sub-rede local: pronta" not in status and "Artefatos locais atualizados" not in status:
+            return (
+                "**LLM Local (RAG offline)**\n\n"
+                "A rede local ainda nao tem corpus suficiente para responder como fallback.\n\n"
+                f"{status}"
+            )
+
+        records = self.load_local_training_records()
+        if not records:
+            return (
+                "**LLM Local (RAG offline)**\n\n"
+                "A sub-rede existe, mas o corpus local esta vazio. Rode a varredura local novamente."
+            )
+
+        terms = self.local_training_query_terms(command)
+        ranked = sorted(
+            records,
+            key=lambda record: self.score_local_training_record(record, terms),
+            reverse=True,
+        )
+        selected = ranked[:max_records]
+        if selected and not any(record.get("kind") == "file_chunk" for record in selected):
+            first_chunk = next((record for record in ranked if record.get("kind") == "file_chunk"), None)
+            if first_chunk:
+                insert_at = min(2, len(selected))
+                selected = selected[:insert_at] + [first_chunk] + selected[insert_at : max_records - 1]
+        signals = []
+        for record in selected:
+            summary = self.summarize_local_llm_record(record)
+            if summary:
+                signals.append(summary)
+            if len(signals) >= 6:
+                break
+
+        answer_lines = [
+            "**LLM Local (RAG offline)**",
+            "",
+        ]
+        if failure_reason:
+            answer_lines.extend(
+                [
+                    "O modelo externo falhou; a resposta abaixo foi montada pelo motor local extrativo usando a sub-rede do sistema.",
+                    "",
+                ]
+            )
+        else:
+            answer_lines.extend(
+                [
+                    "Resposta gerada pelo motor local extrativo usando a sub-rede e o corpus offline do sistema.",
+                    "",
+                ]
+            )
+
+        answer_lines.extend(
+            [
+                "Estado da rede:",
+                self.compact_local_llm_status(status),
+                "",
+                "Resposta:",
+                self.compose_local_llm_answer(command, selected),
+                "",
+                "Evidencias locais usadas:",
+            ]
+        )
+        answer_lines.extend(f"- {signal}" for signal in signals)
+
+        result = "\n".join(answer_lines).strip()
+        if len(result) > max_chars:
+            return result[:max_chars].rstrip() + "\n[resposta local reduzida]"
+        return result
+
+    def compact_local_llm_status(self, status):
+        lines = []
+        for line in (status or "").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Sub-rede local:") or stripped.startswith("- Pasta") or stripped.startswith("- Registros"):
+                lines.append(stripped)
+        return "\n".join(lines) or "Sub-rede local preparada."
+
+    def summarize_local_llm_record(self, record):
+        kind = str(record.get("kind", "registro"))
+        source = str(record.get("source", "desconhecido"))
+        input_value = record.get("input", "")
+        output_value = record.get("output", "")
+        if isinstance(output_value, dict):
+            output_text = " ".join(
+                str(output_value.get(key, ""))
+                for key in ("summary", "objective", "action", "timestamp")
+                if output_value.get(key)
+            )
+        else:
+            output_text = str(output_value or "")
+        output_text = self.first_local_llm_sentence(output_text)
+        if not output_text:
+            output_text = json.dumps(input_value, ensure_ascii=False, sort_keys=True)[:160]
+        if len(output_text) > 180:
+            output_text = output_text[:180].rstrip() + "..."
+        return f"{kind} em {source}: {output_text}"
+
+    def first_local_llm_sentence(self, text):
+        clean_lines = []
+        for line in str(text or "").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if "[REDACTED_SECRET_LINE]" in stripped:
+                clean_lines.append("[REDACTED_SECRET_LINE]")
+                continue
+            clean_lines.append(stripped)
+            if len(" ".join(clean_lines)) >= 180:
+                break
+        clean = " ".join(clean_lines)
+        match = re.search(r"^(.{40,220}?[.!?])(?:\s|$)", clean)
+        if match:
+            return match.group(1).strip()
+        return clean[:220].strip()
+
+    def compose_local_llm_answer(self, command, records):
+        normalized = self.normalize_plain_text(command or "")
+        sources = []
+        for record in records:
+            source = str(record.get("source", "")).strip()
+            if source and source not in sources:
+                sources.append(source)
+            if len(sources) >= 5:
+                break
+
+        if "transform" in normalized and "llm" in normalized:
+            return (
+                "A rede ja foi promovida de simples memoria para um fallback local estilo LLM/RAG: "
+                "ela prepara corpus redigido, ranqueia registros por similaridade textual e monta uma resposta "
+                "extrativa quando o modelo externo falha ou quando o usuario pede IA local. "
+                "Ela ainda nao treina pesos neurais; o ganho real agora e autonomia offline baseada no proprio corpus."
+            )
+
+        if "cota" in normalized or "falha" in normalized or "falhar" in normalized:
+            return (
+                "Quando Codex/OpenAI/Gemini estiver sem cota, nao logado ou indisponivel, a IDE pode responder "
+                "com a sub-rede local. A resposta fica limitada ao que existe no corpus, mas preserva continuidade "
+                "da tarefa e evita expor segredos porque o corpus e redigido antes de ser salvo."
+            )
+
+        if sources:
+            return (
+                "Encontrei contexto local relevante em "
+                + ", ".join(sources)
+                + ". A resposta abaixo usa esses registros como base e evita inventar detalhes fora do corpus."
+            )
+        return "Encontrei registros na sub-rede local e montei uma resposta limitada ao corpus offline disponivel."
 
     def autonomous_discovery_trigger_categories(self):
         return {
