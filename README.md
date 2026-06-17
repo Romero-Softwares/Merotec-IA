@@ -1,6 +1,7 @@
 # Merotec IA IDE
 
 Projeto Python desktop com interface em CustomTkinter para automação assistida por IA, gerenciamento de projetos, execução de comandos e captura de voz.
+<img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/3d1391d1-e5d6-4e6d-af41-9fe28b041629" />
 
 ## Requisitos
 
