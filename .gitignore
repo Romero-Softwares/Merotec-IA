@@ -17,15 +17,20 @@ history.json
 change_history.json
 *.bak
 .codex-manual-cache/
+.chrome-shot-profile/
+.edge-dump-profile/
+.edge-shot-profile/
 .merotec_attachments/
 .merotec_backups/
 .merotec_local_ai/
+.merotec_system_ai/
 codex_schema_probe/
 
 # Logs e temporarios
 *.log
 *.tmp
 *.temp
+tmp*/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

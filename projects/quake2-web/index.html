@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quake2 Web Arena</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="game-shell">
+    <section class="topbar" aria-label="Painel do jogo">
+      <div>
+        <p class="eyebrow">Arena FPS jogavel</p>
+        <h1>Quake2 Web Arena</h1>
+      </div>
+      <div class="actions">
+        <button id="startButton" type="button">Iniciar</button>
+        <button id="restartButton" type="button">Reiniciar</button>
+      </div>
+    </section>
+
+    <section class="stage">
+      <canvas id="game" width="960" height="600" aria-label="Quake2 Web Arena"></canvas>
+      <div class="crosshair" aria-hidden="true"></div>
+
+      <aside class="hud" aria-label="Estado do jogador">
+        <div><strong>Vida</strong><span id="health">100</span></div>
+        <div><strong>Armadura</strong><span id="armor">50</span></div>
+        <div><strong>Municao</strong><span id="ammo">80</span></div>
+        <div><strong>Arma</strong><span id="weaponName">Blaster</span></div>
+        <div><strong>Baixas</strong><span id="kills">0/12</span></div>
+        <div><strong>Andar</strong><span id="floor">0</span></div>
+      </aside>
+
+      <div class="weapon" aria-hidden="true">
+        <div class="barrel"></div>
+        <div class="muzzle"></div>
+      </div>
+
+      <div id="message" class="message">Clique em Iniciar para entrar na arena.</div>
+
+      <div id="overlay" class="overlay">
+        <div class="overlay-panel">
+          <p class="eyebrow">Missao</p>
+          <h2>Invada o complexo</h2>
+          <p>Elimine os guardas, derrube o nucleo do reator e alcance o portao de extracao.</p>
+          <ul>
+            <li>WASD move, mouse ou setas miram.</li>
+            <li>Click ou Espaco dispara.</li>
+            <li>1, 2, 3 ou Q troca de arma.</li>
+            <li>Shift corre, R reinicia.</li>
+            <li>Rampas, escadas, portais e elevadores ligam os andares.</li>
+          </ul>
+          <button id="playButton" type="button">Jogar agora</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="game.js"></script>
+</body>
+</html>

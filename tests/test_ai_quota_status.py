@@ -1,6 +1,7 @@
 import sys
 import time
 import unittest
+import os
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -9,6 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from main import UniversalApp
 from modules.ai_config import AiConfigMixin
+from modules.app_state import AppStateMixin
 from modules.engine import UniversalEngine
 
 
@@ -56,9 +58,9 @@ class AiQuotaStatusTest(unittest.TestCase):
 
         text = engine.quota_status_text()
 
-        self.assertIn("IA", text)
+        self.assertIn("CODEX", text)
         self.assertIn("plus", text)
-        self.assertIn("janela 45%", text)
+        self.assertIn("janela 42%", text)
         self.assertIn("ctx 14.5k/128.0k", text)
 
     def test_quota_status_reports_limit_problem(self):
@@ -110,6 +112,65 @@ class AiQuotaStatusTest(unittest.TestCase):
 
         self.assertIn("Cota atual:", app.ai_status_label.text)
         self.assertIn("janela 17%", app.ai_status_label.text)
+
+    def test_codex_progress_timeout_is_recoverable(self):
+        engine = bare_engine()
+
+        self.assertTrue(
+            engine._is_codex_progress_timeout(
+                "Codex ficou sem enviar progresso por mais de 900 segundos."
+            )
+        )
+        self.assertFalse(engine._is_codex_progress_timeout("Codex retornou erro 1."))
+
+    def test_codex_app_server_progress_timeout_falls_back_to_exec(self):
+        engine = bare_engine()
+        engine.codex_model_name = "gpt-5.5"
+        engine.codex_reasoning_effort = "high"
+        engine._find_codex_executable = lambda: "codex"
+        engine._codex_is_logged_in = lambda executable: True
+        engine._generate_codex_app_server_solution = lambda *args, **kwargs: (
+            "Codex ficou sem enviar progresso por mais de 900 segundos."
+        )
+        engine._generate_codex_exec_solution = lambda *args, **kwargs: "fallback exec ok"
+
+        response = engine._generate_codex_solution("corrigir tarefa longa")
+
+        self.assertEqual("fallback exec ok", response)
+
+    def test_codex_timeout_settings_are_exported_to_environment(self):
+        class DummyState(AppStateMixin):
+            def __init__(self):
+                self.settings = {
+                    "ai_provider": "codex",
+                    "codex_model_name": "gpt-5.5",
+                    "codex_reasoning_effort": "high",
+                    "autonomous_unrestricted_mode": True,
+                    "codex_auto_approve_app_server_requests": True,
+                    "codex_app_server_approval_policy": "on-request",
+                    "codex_app_server_idle_timeout_seconds": 1200,
+                    "codex_task_timeout_seconds": 5400,
+                }
+
+        previous = {
+            key: os.environ.get(key)
+            for key in (
+                "MEROTEC_CODEX_APP_SERVER_IDLE_TIMEOUT_SECONDS",
+                "MEROTEC_CODEX_TASK_TIMEOUT_SECONDS",
+            )
+        }
+        try:
+            app = DummyState()
+            app._apply_settings_to_environment()
+
+            self.assertEqual("1200", os.environ["MEROTEC_CODEX_APP_SERVER_IDLE_TIMEOUT_SECONDS"])
+            self.assertEqual("5400", os.environ["MEROTEC_CODEX_TASK_TIMEOUT_SECONDS"])
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 if __name__ == "__main__":

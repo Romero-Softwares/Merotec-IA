@@ -530,6 +530,12 @@ Regras:
                     )
                     if fallback_response:
                         return fallback_response
+                if self._is_codex_progress_timeout(app_server_response):
+                    if stream_callback:
+                        stream_callback(
+                            "\nCodex app-server ficou silencioso; continuando pelo executor direto...\n"
+                        )
+                    break
                 return app_server_response
 
         last_exec_response = ""
@@ -589,6 +595,20 @@ Regras:
     def _is_capacity_message(self, text):
         lower = (text or "").lower()
         return "alta demanda" in lower or self._is_codex_capacity_error(lower)
+
+    def _is_codex_progress_timeout(self, text):
+        lower = (text or "").lower()
+        return "sem enviar progresso" in lower or "ficou sem enviar progresso" in lower
+
+    def _positive_int_env(self, name, default, minimum=1, maximum=None):
+        try:
+            value = int(os.getenv(name, "").strip())
+        except (TypeError, ValueError):
+            value = int(default)
+        value = max(int(minimum), value)
+        if maximum is not None:
+            value = min(int(maximum), value)
+        return value
 
     def _is_codex_error_message(self, text):
         lower = (text or "").lower()
@@ -859,9 +879,20 @@ Regras:
             final_from_items = ""
             last_error = ""
             completed = False
-            deadline = time.time() + 1800
+            task_timeout = self._positive_int_env(
+                "MEROTEC_CODEX_TASK_TIMEOUT_SECONDS",
+                3600,
+                minimum=300,
+                maximum=14400,
+            )
+            idle_timeout = self._positive_int_env(
+                "MEROTEC_CODEX_APP_SERVER_IDLE_TIMEOUT_SECONDS",
+                900,
+                minimum=120,
+                maximum=7200,
+            )
+            deadline = time.time() + task_timeout
             last_activity = time.time()
-            idle_timeout = 45
 
             while time.time() < deadline:
                 if self.cancel_requested:
@@ -874,8 +905,8 @@ Regras:
                         break
                     if time.time() - last_activity > idle_timeout:
                         last_error = (
-                            "Codex ficou sem enviar progresso por mais de 45 segundos. "
-                            "A tarefa foi interrompida para a IDE nao ficar presa."
+                            f"Codex ficou sem enviar progresso por mais de {idle_timeout} segundos. "
+                            "A IDE vai tentar continuar pelo executor direto do Codex."
                         )
                         break
                     continue
@@ -937,6 +968,8 @@ Regras:
                     break
 
             final_message = "".join(chunks).strip() or final_from_items.strip()
+            if last_error and self._is_codex_progress_timeout(last_error) and not completed:
+                return self._format_codex_app_server_error(last_error)
             if final_message:
                 return final_message
             if last_error:

@@ -22,6 +22,8 @@ DEFAULT_APP_SETTINGS = {
     "autonomous_unrestricted_mode": True,
     "codex_auto_approve_app_server_requests": True,
     "codex_app_server_approval_policy": "on-request",
+    "codex_app_server_idle_timeout_seconds": 900,
+    "codex_task_timeout_seconds": 3600,
 }
 
 SCRATCHPAD_DEFAULT_TEXT = """# Como configurar um modelo de IA nesta IDE

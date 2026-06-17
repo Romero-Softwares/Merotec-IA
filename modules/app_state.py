@@ -130,6 +130,12 @@ class AppStateMixin:
         os.environ["MEROTEC_CODEX_APP_SERVER_APPROVAL_POLICY"] = (
             self.settings.get("codex_app_server_approval_policy", "on-request") or "on-request"
         )
+        os.environ["MEROTEC_CODEX_APP_SERVER_IDLE_TIMEOUT_SECONDS"] = str(
+            self.settings.get("codex_app_server_idle_timeout_seconds", 900) or 900
+        )
+        os.environ["MEROTEC_CODEX_TASK_TIMEOUT_SECONDS"] = str(
+            self.settings.get("codex_task_timeout_seconds", 3600) or 3600
+        )
         if self.settings.get("openai_model_name"):
             os.environ["OPENAI_MODEL_NAME"] = self.settings["openai_model_name"]
         if self.settings.get("google_model_name"):

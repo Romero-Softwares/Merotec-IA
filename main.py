@@ -190,6 +190,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.last_response = ""
         self.last_failed_ai_task = None
         self.active_ai_objective = None
+        self.ai_context_memory = []
         self.command_failure_signatures = {}
         self.ai_read_history = {}
         self.ai_search_history = {}
@@ -206,6 +207,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.last_tk_callback_error = ""
         self.reporting_callback_error = False
         self.streaming_textbox = None
+        self.streaming_sender = ""
         self.streaming_text = ""
         self.ai_live_trace = ""
         self.ai_live_trace_task_id = None
@@ -706,6 +708,101 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         _tab_name, info = self._current_editor_info()
         return info.get("widget") if info else None
 
+    def _is_editor_text_change_event(self, event):
+        keysym = getattr(event, "keysym", "") or ""
+        char = getattr(event, "char", "") or ""
+        state = int(getattr(event, "state", 0) or 0)
+        navigation_keys = {
+            "Left",
+            "Right",
+            "Up",
+            "Down",
+            "Home",
+            "End",
+            "Prior",
+            "Next",
+            "Control_L",
+            "Control_R",
+            "Shift_L",
+            "Shift_R",
+            "Alt_L",
+            "Alt_R",
+            "Escape",
+            "Caps_Lock",
+            "Num_Lock",
+            "Scroll_Lock",
+        }
+        if keysym in navigation_keys:
+            return False
+        if state & 0x4:
+            return keysym.lower() in {"v", "x", "z", "y"}
+        return bool(char) or keysym in {"BackSpace", "Delete", "Return", "KP_Enter", "Tab", "ISO_Left_Tab"}
+
+    def _sync_editor_horizontal_scrollbar(self, editor):
+        scrollbar = getattr(editor, "_horizontal_scrollbar", None)
+        if scrollbar is None:
+            return
+        try:
+            scrollbar.set(*editor.xview())
+        except (tk.TclError, ValueError):
+            pass
+
+    def _keep_editor_insert_visible(self, editor):
+        try:
+            editor.see("insert")
+            self._sync_editor_horizontal_scrollbar(editor)
+        except tk.TclError:
+            pass
+
+    def _update_editor_view_after_navigation(self, tab_name):
+        info = self.open_editors.get(tab_name)
+        if not info:
+            return
+        editor = info["widget"]
+        self._keep_editor_insert_visible(editor)
+        self.update_editor_markers(tab_name, lightweight=True)
+
+    def _schedule_editor_content_changed(self, tab_name, delay=120):
+        info = self.open_editors.get(tab_name)
+        if not info:
+            return
+        job_id = info.get("content_changed_job")
+        if job_id is not None:
+            try:
+                self.after_cancel(job_id)
+            except tk.TclError:
+                pass
+        self.update_editor_markers(tab_name, lightweight=True)
+        info["content_changed_job"] = self.after(delay, lambda name=tab_name: self._flush_editor_content_changed(name))
+
+    def _flush_editor_content_changed(self, tab_name):
+        info = self.open_editors.get(tab_name)
+        if info is not None:
+            info["content_changed_job"] = None
+        self._on_editor_content_changed(tab_name)
+
+    def _handle_editor_key_release(self, event, tab_name):
+        if self._is_editor_text_change_event(event):
+            self._on_editor_key(event, tab_name)
+            self._schedule_editor_content_changed(tab_name)
+        else:
+            self.after(1, lambda name=tab_name: self._update_editor_view_after_navigation(name))
+        return None
+
+    def _scroll_editor_horizontal(self, event, tab_name):
+        info = self.open_editors.get(tab_name)
+        if not info:
+            return None
+        editor = info["widget"]
+        try:
+            delta = int(getattr(event, "delta", 0) or 0)
+            units = -4 if delta > 0 else 4
+            editor.xview_scroll(units, "units")
+            self._sync_editor_horizontal_scrollbar(editor)
+        except tk.TclError:
+            pass
+        return "break"
+
     def _selected_editor_lines(self, editor):
         try:
             first = editor.index("sel.first linestart")
@@ -776,7 +873,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             else:
                 editor.insert("insert", "\n" + indent + extra)
             self._on_editor_key(event, tab_name)
-            self._on_editor_content_changed(tab_name)
+            self._schedule_editor_content_changed(tab_name)
             return "break"
         except tk.TclError:
             return None
@@ -798,7 +895,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 if pairs.get(before) == after:
                     editor.delete("insert-1c", "insert+1c")
                     self._on_editor_key(event, tab_name)
-                    self._on_editor_content_changed(tab_name)
+                    self._schedule_editor_content_changed(tab_name)
                     return "break"
                 return None
 
@@ -819,7 +916,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 editor.insert("insert", char + closing)
                 editor.mark_set("insert", "insert-1c")
             self._on_editor_key(event, tab_name)
-            self._on_editor_content_changed(tab_name)
+            self._schedule_editor_content_changed(tab_name)
             return "break"
         except tk.TclError:
             return None
@@ -1331,7 +1428,6 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.code_editor_frame.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
         self.code_editor.insert("1.0", SCRATCHPAD_DEFAULT_TEXT)
         self.open_editors["Scratchpad"] = {"widget": self.code_editor, "path": None, "dirty": False}
-        self.code_editor.bind("<KeyRelease>", lambda event: self._on_editor_key(event, "Scratchpad"), add="+")
         self.update_editor_markers("Scratchpad")
 
         self.local_term_out = ctk.CTkTextbox(
@@ -1624,8 +1720,26 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             line_numbers.yview_moveto(first)
             scroll_bar.set(first, last)
 
+        horizontal_scroll = ctk.CTkScrollbar(
+            editor_frame,
+            orientation="horizontal",
+            command=editor.xview,
+            height=14,
+            fg_color="#111318",
+            button_color=THEME["border"],
+            button_hover_color=THEME["accent_dark"],
+        )
+        horizontal_scroll.grid(row=1, column=1, sticky="ew")
+        editor._horizontal_scrollbar = horizontal_scroll
+
+        def sync_horizontal_scroll(first, last):
+            try:
+                horizontal_scroll.set(first, last)
+            except (tk.TclError, ValueError):
+                pass
+
         status_strip = ctk.CTkFrame(editor_frame, fg_color="#111827", height=28, corner_radius=0)
-        status_strip.grid(row=1, column=0, columnspan=3, sticky="ew")
+        status_strip.grid(row=2, column=0, columnspan=3, sticky="ew")
         status_strip.grid_columnconfigure(0, weight=1)
         status_strip.grid_propagate(False)
 
@@ -1666,7 +1780,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         editor._search_matches = []
         editor._search_match_index = -1
 
-        editor.configure(yscrollcommand=sync_scroll)
+        editor.configure(yscrollcommand=sync_scroll, xscrollcommand=sync_horizontal_scroll)
         editor.bind("<KeyPress-Tab>", lambda event, name=tab_name: self.indent_editor_selection(name, event), add="+")
         editor.bind("<ISO_Left_Tab>", lambda event, name=tab_name: self.outdent_editor_selection(name, event), add="+")
         editor.bind("<Shift-Tab>", lambda event, name=tab_name: self.outdent_editor_selection(name, event), add="+")
@@ -1674,15 +1788,16 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         editor.bind("<KeyPress>", lambda event, name=tab_name: self.editor_auto_pair(name, event), add="+")
         editor.bind("<Control-slash>", lambda event, name=tab_name: self.toggle_editor_comment(name, event), add="+")
         editor.bind("<Control-question>", lambda event, name=tab_name: self.toggle_editor_comment(name, event), add="+")
-        editor.bind("<Control-space>", lambda event, name=tab_name: self.show_editor_completion(event, name), add="+")
+        editor.bind("<Control-space>", self.show_editor_completion, add="+")
         editor.bind("<Control-Shift-O>", lambda event: self.show_symbol_palette(event), add="+")
         editor.bind("<Control-Shift-o>", lambda event: self.show_symbol_palette(event), add="+")
         editor.bind("<Escape>", lambda event: self._hide_editor_completion(), add="+")
         editor.bind("<FocusOut>", lambda event: self.after(120, self._hide_editor_completion), add="+")
-        editor.bind("<KeyRelease>", lambda _event, name=tab_name: self._on_editor_content_changed(name), add="+")
-        editor.bind("<ButtonRelease-1>", lambda _event, name=tab_name: self.update_editor_markers(name), add="+")
+        editor.bind("<KeyRelease>", lambda event, name=tab_name: self._handle_editor_key_release(event, name), add="+")
+        editor.bind("<Shift-MouseWheel>", lambda event, name=tab_name: self._scroll_editor_horizontal(event, name), add="+")
+        editor.bind("<ButtonRelease-1>", lambda _event, name=tab_name: self._update_editor_view_after_navigation(name), add="+")
         editor.bind("<MouseWheel>", lambda _event, name=tab_name: self.after(1, lambda: self.update_editor_markers(name)), add="+")
-        editor.bind("<Configure>", lambda _event, name=tab_name: self.after(1, lambda: self.update_editor_markers(name)), add="+")
+        editor.bind("<Configure>", lambda _event, name=tab_name: self.after(1, lambda: self._update_editor_view_after_navigation(name)), add="+")
 
         self.after(1, lambda name=tab_name: self.update_editor_markers(name))
         return editor_frame, editor
@@ -2159,7 +2274,6 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         editor_frame, editor = self._create_editor(tab, tab_name)
         editor_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
         editor.insert("1.0", content)
-        editor.bind("<KeyRelease>", lambda event, name=tab_name: self._on_editor_key(event, name), add="+")
 
         self.open_editors[tab_name] = {"widget": editor, "path": str(path), "dirty": False}
         self.path_to_tab[str(path.resolve())] = tab_name
@@ -2177,7 +2291,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.update_editor_markers(tab_name)
         self._schedule_editor_completion(tab_name)
 
-    def update_editor_markers(self, tab_name):
+    def update_editor_markers(self, tab_name, lightweight=False):
         info = self.open_editors.get(tab_name)
         if not info:
             return
@@ -2208,7 +2322,8 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         editor.tag_add("current_line", "insert linestart", "insert lineend+1c")
         self._update_editor_status_context(tab_name, editor, current_line, current_col)
         self._highlight_matching_brace(editor)
-        self._highlight_current_identifier(editor)
+        if not lightweight:
+            self._highlight_current_identifier(editor)
 
     def _update_editor_status_context(self, tab_name, editor, current_line, current_col):
         info = self.open_editors.get(tab_name, {})
@@ -2905,10 +3020,49 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             self.report_callback_exception(RecursionError, "scroll do terminal excedeu limite", None)
 
     def add_chat_message(self, sender, text):
+        self.remember_ai_context_message(sender, text)
         self.after(0, lambda: self._add_chat_message_sync(sender, text))
 
     def add_chat_image_message(self, sender, image_path, text=""):
+        image_note = f"{text}\n[imagem anexada: {Path(image_path).name}]" if text else f"[imagem anexada: {Path(image_path).name}]"
+        self.remember_ai_context_message(sender, image_note)
         self.after(0, lambda: self._add_chat_image_message_sync(sender, image_path, text))
+
+    def remember_ai_context_message(self, sender, text, max_chars=2400):
+        text = str(text or "").strip()
+        if not text:
+            return
+        sender = str(sender or "").strip() or "Mensagem"
+        compact = re.sub(r"\s+", " ", text)
+        if len(compact) > max_chars:
+            compact = compact[: max_chars - 3].rstrip() + "..."
+        self.ai_context_memory.append(
+            {
+                "sender": sender,
+                "text": compact,
+                "task_id": self.current_task_id,
+                "objective": self.active_ai_objective or "",
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+            }
+        )
+        self.ai_context_memory = self.ai_context_memory[-80:]
+
+    def build_recent_ai_context_memory(self, limit=16, max_chars=6000):
+        messages = getattr(self, "ai_context_memory", [])[-limit:]
+        lines = []
+        total = 0
+        for item in messages:
+            sender = item.get("sender") or "Mensagem"
+            text = item.get("text") or ""
+            if not text:
+                continue
+            line = f"- {sender}: {text}"
+            total += len(line)
+            if total > max_chars:
+                lines.append("- ... historico recente truncado para caber no contexto.")
+                break
+            lines.append(line)
+        return "\n".join(lines)
 
     def _add_chat_message_sync(self, sender, text):
         user = sender.lower() in {"voce", "você"}
@@ -3149,6 +3303,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
     def _begin_stream_message_sync(self, sender):
         self.streaming_text = ""
+        self.streaming_sender = sender
         user = sender.lower() in {"voce", "vocÃª"}
         system = sender.lower() in {"sistema", "erro"}
         border_color = THEME["accent_dark"] if user else THEME["border"]
@@ -3213,6 +3368,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         textbox = self.streaming_textbox
         if textbox is not None and self.streaming_text:
             display_text = self.format_chat_text_for_display(self.streaming_text)
+            self.remember_ai_context_message(self.streaming_sender or "Merotec IA", display_text)
             textbox.configure(state="normal")
             textbox.delete("1.0", "end")
             textbox.insert("1.0", display_text)
@@ -3221,6 +3377,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             self.scroll_textbox_end(textbox)
             self.safe_chat_scroll_bottom()
         self.streaming_textbox = None
+        self.streaming_sender = ""
         self.streaming_text = ""
 
     def replace_stream_message(self, text):
@@ -3304,12 +3461,20 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             self.add_chat_message("Merotec AI", local_task_reply)
             return
 
-        extra_context = None
+        continuation_context = None
+        task_objective = None
+        if self.should_continue_active_ai_task(command, normalized):
+            task_objective = self.active_ai_objective
+            continuation_context = self.build_active_task_continuation_context(command)
+            self.add_chat_message("Sistema", "Continuando a missao anterior com memoria recente da IDE.")
+
+        extra_context = continuation_context
         if self.is_project_analysis_request(normalized):
-            extra_context = self.build_project_analysis_context()
+            project_context = self.build_project_analysis_context()
+            extra_context = f"{extra_context}\n\n{project_context}" if extra_context else project_context
             self.add_chat_message("Sistema", "Preparando contexto inicial do projeto para a IA...")
 
-        self._run_ai_task(command, image_path=image_path, extra_context=extra_context)
+        self._run_ai_task(command, image_path=image_path, extra_context=extra_context, task_objective=task_objective)
 
     def cancel_ai_task(self):
         self.cancelled_task_ids.add(self.current_task_id)
@@ -3380,6 +3545,74 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             action_depth=task.get("action_depth", 0),
             task_id=task.get("task_id"),
         )
+
+    def should_continue_active_ai_task(self, command, normalized=None):
+        if not self.active_ai_objective:
+            return False
+        normalized = normalized or self.normalize_plain_text(command or "")
+        if not normalized:
+            return False
+        continuation_commands = {
+            "continue",
+            "continua",
+            "continuar",
+            "prossiga",
+            "segue",
+            "siga",
+            "pode continuar",
+            "continue dai",
+            "continue daqui",
+            "continue de onde parou",
+            "continue a tarefa",
+            "continua a tarefa",
+            "termina",
+            "termine",
+            "conclua",
+            "finalize",
+            "faca isso",
+            "faz isso",
+            "corrija isso",
+            "aplique isso",
+            "agora faca",
+        }
+        if normalized in continuation_commands:
+            return True
+        return any(
+            marker in normalized
+            for marker in (
+                "continue de onde",
+                "continua de onde",
+                "continue o que",
+                "continua o que",
+                "termine a tarefa",
+                "conclua a tarefa",
+                "finalize a tarefa",
+                "faca a correcao",
+                "faz a correcao",
+            )
+        )
+
+    def build_active_task_continuation_context(self, command):
+        objective = self.active_ai_objective or ""
+        last_response = self.strip_agent_action_markup(self.last_response or "").strip()
+        pieces = [
+            "CONTINUIDADE DA MISSAO NA IDE:",
+            f"Pedido atual do usuario: {command}",
+            f"Missao ativa anterior: {objective}",
+        ]
+        if last_response:
+            pieces.append(f"Ultima resposta visivel da IA:\n{last_response[-2400:]}")
+        recent_changes = self.format_recent_changes_for_agent(limit=10)
+        if recent_changes:
+            pieces.append(f"Alteracoes/acoes recentes registradas:\n{recent_changes}")
+        recent_chat = self.build_recent_ai_context_memory(limit=18)
+        if recent_chat:
+            pieces.append(f"Conversa recente relevante:\n{recent_chat}")
+        pieces.append(
+            "Ordem de continuidade: nao trate o pedido atual como tarefa isolada; "
+            "continue a missao ativa usando as evidencias, leituras, acoes e respostas recentes."
+        )
+        return "\n\n".join(pieces)
 
 
     def voice_command(self):
@@ -3784,6 +4017,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     "Evite narrar intencoes vazias; avance com leitura, alteracao, validacao ou uma conclusao clara. "
                     "Nao peca o objetivo novamente enquanto houver uma missao ativa.\n\n"
                     f"Alteracoes recentes feitas pela IDE neste projeto:\n{self.format_recent_changes_for_agent(limit=8)}\n\n"
+                    f"Conversa recente que deve ser preservada:\n{self.build_recent_ai_context_memory(limit=18)}\n\n"
                     f"Arquivos do workspace:\n{self.get_workspace_tree(limit=220)}"
                 )
                 local_training_context = self.build_local_training_context(objective or command)
