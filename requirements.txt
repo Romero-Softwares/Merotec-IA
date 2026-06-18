@@ -12,5 +12,6 @@ SpeechRecognition==3.16.1
 audioop-lts==0.2.2; python_version >= "3.13"
 comtypes==1.4.16; platform_system == "Windows"
 pywin32==311; platform_system == "Windows"
+pywebview>=5.4; platform_system == "Windows"
 standard-aifc==3.13.0; python_version >= "3.13"
 standard-chunk==3.13.0; python_version >= "3.13"

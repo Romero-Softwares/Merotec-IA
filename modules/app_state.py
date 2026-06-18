@@ -136,8 +136,18 @@ class AppStateMixin:
         os.environ["MEROTEC_CODEX_TASK_TIMEOUT_SECONDS"] = str(
             self.settings.get("codex_task_timeout_seconds", 3600) or 3600
         )
+        
+        # CORREÇÃO 1: Garante que a chave da OpenAI/OpenRouter é injetada no ambiente!
+        if self.settings.get("openai_api_key"):
+            os.environ["OPENAI_API_KEY"] = str(self.settings["openai_api_key"]).strip()
+
+        # CORREÇÃO 2: Limpa o nome do modelo (remove o ':free' se o usuário digitar por engano)
         if self.settings.get("openai_model_name"):
-            os.environ["OPENAI_MODEL_NAME"] = self.settings["openai_model_name"]
+            model_clean = str(self.settings["openai_model_name"]).strip()
+            if model_clean.endswith(":free") and "deepseek" in model_clean.lower():
+                model_clean = model_clean.replace(":free", "")
+            os.environ["OPENAI_MODEL_NAME"] = model_clean
+
         if self.settings.get("google_model_name"):
             os.environ["GOOGLE_MODEL_NAME"] = self.settings["google_model_name"]
 

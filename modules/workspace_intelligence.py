@@ -29,6 +29,10 @@ class WorkspaceIntelligenceMixin:
         if calculation_reply:
             return calculation_reply
 
+        capability_reply = self.local_capability_question_reply(command, normalized)
+        if capability_reply:
+            return capability_reply
+
         if self.is_local_llm_request(normalized):
             return self.local_llm_reply(command)
 
@@ -45,6 +49,115 @@ class WorkspaceIntelligenceMixin:
             return "Ola! Estou pronto. Me diga o que voce quer construir, corrigir ou analisar."
 
         return None
+
+    def local_capability_question_reply(self, command, normalized=None):
+        normalized = normalized or self.normalize_plain_text(command)
+        if not self.is_capability_question(command, normalized):
+            return None
+
+        words = set(re.findall(r"[a-z0-9_]+", normalized or ""))
+        deploy_terms = {"deploy", "publicar", "subir", "hospedar", "github", "repositorio", "repository"}
+        run_terms = {"rodar", "rode", "executar", "execute", "testar", "teste", "validar", "valide"}
+        edit_terms = {"corrigir", "corrija", "consertar", "conserte", "alterar", "altere", "editar", "edite", "implementar", "implemente"}
+
+        if words & deploy_terms:
+            return (
+                "Sim, consigo ajudar com o deploy, mas primeiro preciso responder e alinhar o alvo. "
+                "Para um deploy real eu preciso saber o destino, por exemplo GitHub Pages, Vercel, Netlify, servidor proprio ou outro ambiente, "
+                "e tambem preciso das credenciais/permissoes quando forem necessarias. "
+                "Quando voce quiser que eu execute de fato, envie um pedido direto como: `faca o deploy para GitHub Pages` e informe o repositorio/destino."
+            )
+
+        if words & run_terms:
+            return (
+                "Sim, consigo executar validacoes ou comandos do projeto quando voce pedir de forma direta. "
+                "Como isso esta em formato de pergunta, vou responder antes de agir: diga qual comando, teste ou app devo rodar, "
+                "ou envie `rode os testes` para eu iniciar a execucao."
+            )
+
+        if words & edit_terms:
+            return (
+                "Sim, consigo alterar o projeto, corrigir erros e implementar melhorias. "
+                "Como voce perguntou sobre capacidade, nao vou mexer nos arquivos agora. "
+                "Para executar, mande o pedido direto com o que deve mudar."
+            )
+
+        return (
+            "Sim, consigo ajudar com isso. Como a mensagem veio como pergunta, respondi sem iniciar execucao automatica. "
+            "Quando quiser acao real na IDE, envie o pedido em forma de tarefa direta."
+        )
+
+    def is_capability_question(self, command, normalized=None):
+        raw = str(command or "").strip()
+        normalized = normalized or self.normalize_plain_text(raw)
+        if not normalized:
+            return False
+
+        starters = (
+            "vc consegue",
+            "voce consegue",
+            "consegue",
+            "conseguiria",
+            "vc pode",
+            "voce pode",
+            "poderia",
+            "e possivel",
+            "eh possivel",
+            "tem como",
+            "da para",
+            "da pra",
+        )
+        has_capability_marker = normalized.startswith(starters) or any(f" {marker} " in f" {normalized} " for marker in starters)
+        if not has_capability_marker:
+            return False
+        return "?" in raw or normalized.startswith(("vc consegue", "voce consegue", "consegue", "conseguiria"))
+
+    def is_answer_only_question(self, command, normalized=None):
+        raw = str(command or "").strip()
+        normalized = normalized or self.normalize_plain_text(raw)
+        if not normalized:
+            return False
+        if self.is_capability_question(raw, normalized):
+            return True
+
+        question_starters = (
+            "como ",
+            "o que ",
+            "oque ",
+            "qual ",
+            "quais ",
+            "quando ",
+            "onde ",
+            "por que ",
+            "porque ",
+            "explique ",
+            "me explique ",
+        )
+        if not ("?" in raw or normalized.startswith(question_starters)):
+            return False
+
+        words = set(re.findall(r"[a-z0-9_]+", normalized))
+        direct_action_terms = {
+            "adicione",
+            "altere",
+            "apague",
+            "aplique",
+            "conserte",
+            "corrija",
+            "crie",
+            "edite",
+            "execute",
+            "faca",
+            "fazer",
+            "implemente",
+            "remova",
+            "rode",
+            "suba",
+            "teste",
+        }
+        if words & direct_action_terms and not normalized.startswith(question_starters):
+            return False
+        return True
 
     def local_undo_reply(self, normalized):
         undo_terms = {"desfazer", "desfaca", "reverter", "reverta", "voltar", "restaurar", "restaure", "recuperar", "recupere"}
@@ -1148,7 +1261,7 @@ class WorkspaceIntelligenceMixin:
                 targets.append(path)
                 seen.add(path)
 
-        for info in self.open_editors.values():
+        for info in getattr(self, "open_editors", {}).values():
             raw_path = info.get("path")
             if not raw_path:
                 continue
@@ -1166,6 +1279,164 @@ class WorkspaceIntelligenceMixin:
                 break
 
         return [path for path in targets if str(path.resolve()).startswith(str(workspace))]
+
+    def classify_smart_task_intent(self, command):
+        normalized = self.normalize_plain_text(command or "")
+        words = set(re.findall(r"[a-z0-9_]+", normalized))
+        intent_terms = {
+            "corrigir": {
+                "corrigir",
+                "corrija",
+                "erro",
+                "bug",
+                "falha",
+                "quebrou",
+                "problema",
+                "conserte",
+                "arrume",
+                "ajuste",
+            },
+            "implementar": {
+                "implementar",
+                "implemente",
+                "criar",
+                "crie",
+                "adicionar",
+                "adicione",
+                "fazer",
+                "faca",
+                "melhorar",
+                "melhore",
+                "tornar",
+                "torne",
+            },
+            "validar": {
+                "testar",
+                "teste",
+                "validar",
+                "valide",
+                "verificar",
+                "verifique",
+                "rodar",
+                "rode",
+                "executar",
+                "execute",
+                "visual",
+            },
+            "analisar": {
+                "analisar",
+                "analise",
+                "avaliar",
+                "avalie",
+                "revisar",
+                "revise",
+                "diagnostico",
+                "mapear",
+                "explique",
+            },
+            "configurar": {
+                "configurar",
+                "configure",
+                "chave",
+                "api",
+                "modelo",
+                "provider",
+                "provedor",
+                "openai",
+                "codex",
+                "google",
+                "openrouter",
+            },
+        }
+        scores = {
+            intent: sum(1 for term in terms if term in words or term in normalized)
+            for intent, terms in intent_terms.items()
+        }
+        if not any(scores.values()):
+            return "responder"
+        return max(scores, key=lambda intent: scores[intent])
+
+    def validation_command_for_smart_intent(self, intent):
+        workspace = Path(self.current_workspace)
+        if intent in {"responder", "analisar"}:
+            return ""
+        try:
+            return self.autonomous_discovery_validation_command()
+        except Exception:
+            pass
+        if (workspace / "requirements.txt").exists() or any(workspace.glob("*.py")):
+            return f'"{sys.executable}" -m unittest discover'
+        if (workspace / "package.json").exists():
+            return "npm test"
+        if (workspace / "index.html").exists() or any(workspace.glob("*.html")):
+            return "python -m http.server 8000"
+        return ""
+
+    def build_smart_task_brief(self, command, objective=None, max_files=8):
+        objective = objective or command or ""
+        normalized = self.normalize_plain_text(objective)
+        intent = self.classify_smart_task_intent(objective)
+        workspace = Path(self.current_workspace).resolve()
+        kind = self.detect_run_kind(workspace) or "generico"
+
+        suffixes_by_intent = {
+            "corrigir": {".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".dart", ".json", ".cmd"},
+            "implementar": {".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".dart", ".json", ".md"},
+            "validar": {".py", ".js", ".ts", ".html", ".json", ".yaml", ".yml", ".cmd", ".md"},
+            "analisar": {".py", ".js", ".ts", ".html", ".json", ".yaml", ".yml", ".md"},
+            "configurar": {".py", ".json", ".env", ".cmd", ".md", ".yaml", ".yml"},
+        }
+        candidate_files = self.find_likely_search_targets(
+            objective,
+            suffixes=suffixes_by_intent.get(intent, {".py", ".js", ".html", ".md", ".json"}),
+            limit=max_files,
+        )
+        file_lines = []
+        for path in candidate_files[:max_files]:
+            try:
+                rel = path.relative_to(workspace).as_posix()
+            except ValueError:
+                continue
+            file_lines.append(f"- {rel}")
+        if not file_lines:
+            key_files = self.local_key_files(list(self.iter_workspace_files(limit=300)), limit=max_files)
+            file_lines = key_files.splitlines() if key_files else ["- Nenhum arquivo candidato detectado."]
+
+        validation = self.validation_command_for_smart_intent(intent)
+        risk_notes = []
+        if intent in {"corrigir", "implementar"}:
+            risk_notes.append("Leia o trecho exato antes de alterar e prefira patch pequeno.")
+        if "config" in normalized or intent == "configurar":
+            risk_notes.append("Preserve chaves e configuracoes existentes; nao exponha segredos no chat.")
+        if kind == "python":
+            risk_notes.append("Validacao barata: compile ou unittest antes de teste visual.")
+        elif kind in {"html", "node"}:
+            risk_notes.append("Quando houver interface, use validacao visual ou servidor local.")
+        elif kind == "flutter":
+            risk_notes.append("Erros Windows/CMake devem ser corrigidos na camada nativa, nao no Dart sem evidencia.")
+        if not risk_notes:
+            risk_notes.append("Mantenha foco na menor acao verificavel.")
+
+        next_step = {
+            "corrigir": "Localizar causa, aplicar correcao pequena e validar.",
+            "implementar": "Escolher arquivos alvo, implementar o minimo completo e validar.",
+            "validar": "Executar validacao apropriada e interpretar a saida antes de concluir.",
+            "analisar": "Entregar diagnostico objetivo; leia arquivos especificos apenas se faltar evidencia.",
+            "configurar": "Conferir fluxo de configuracao, preservar valores atuais e validar inicializacao.",
+            "responder": "Responder diretamente se nao houver necessidade de editar ou executar.",
+        }.get(intent, "Avancar com a menor acao verificavel.")
+
+        return (
+            "BRIEFING INTELIGENTE DA IDE:\n"
+            f"- Intencao detectada: {intent}\n"
+            f"- Tipo de projeto detectado: {kind}\n"
+            f"- Proximo passo recomendado: {next_step}\n"
+            f"- Validacao sugerida: {validation or 'sem comando automatico; conclua em texto ou escolha validacao pontual'}\n"
+            "Arquivos candidatos:\n"
+            + "\n".join(file_lines[:max_files])
+            + "\nRiscos e cuidados:\n"
+            + "\n".join(f"- {note}" for note in risk_notes)
+        )
 
     def extract_mentioned_file_paths(self, text):
         extensions = r"(?:html|css|js|ts|tsx|jsx|py|dart|json|md|yaml|yml|txt|cpp|h|cs)"

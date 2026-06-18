@@ -38,6 +38,7 @@ class DummyApp(AgentActionsMixin, WorkspaceIntelligenceMixin):
         self.logs = []
         self.executed_commands = []
         self.human_tests = []
+        self.internal_browser_urls = []
         self.queued_ai_tasks = []
         self.ai_passive_action_count = 0
         self.max_ai_passive_actions = 20
@@ -62,6 +63,10 @@ class DummyApp(AgentActionsMixin, WorkspaceIntelligenceMixin):
 
     def _agent_human_test(self, request, **kwargs):
         self.human_tests.append((request, kwargs))
+
+    def open_internal_browser(self, url, source="IA"):
+        self.internal_browser_urls.append((url, source))
+        return url
 
     def _run_ai_task(self, command, **kwargs):
         self.queued_ai_tasks.append((command, kwargs))
@@ -332,6 +337,18 @@ class AdminExecutionGuardsTest(unittest.TestCase):
         self.assertIn("https://docs.python.org/3/library/urllib.request.html", context)
         self.assertIn("Official Python documentation", context)
 
+    def test_open_url_uses_internal_browser_when_available(self):
+        self.app.parse_and_execute_agent_actions(
+            "[OPEN_URL: 127.0.0.1:8000]",
+            task_objective="validar pagina no navegador interno",
+            task_id="open-url",
+        )
+
+        self.assertEqual([("http://127.0.0.1:8000", "IA")], self.app.internal_browser_urls)
+        self.assertTrue(
+            any("navegador interno da IDE" in message for _sender, message in self.app.messages)
+        )
+
     def test_inline_action_examples_are_not_executed(self):
         self.app.parse_and_execute_agent_actions(
             "Para validar, use [HUMAN_TEST: auto].",
@@ -355,8 +372,7 @@ class AdminExecutionGuardsTest(unittest.TestCase):
         )
 
     def test_human_test_plan_finds_nested_html_target(self):
-        temp_root = Path(os.environ.get("MEROTEC_TEST_TMP", "C:/tmp" if os.name == "nt" else tempfile.gettempdir()))
-        temp_root.mkdir(parents=True, exist_ok=True)
+        temp_root = os.environ.get("MEROTEC_TEST_TMP")
         with tempfile.TemporaryDirectory(dir=temp_root) as temp_dir:
             root = Path(temp_dir)
             playable = root / "unity-mini-csharp-game" / "PlayableWeb"

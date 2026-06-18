@@ -26,23 +26,49 @@ from modules import config as app_config
 
 class UniversalEngine:
     def __init__(self):
-        self.provider = os.getenv("AI_PROVIDER", app_config.AI_PROVIDER).strip().lower()
-        self.codex_model_name = os.getenv("CODEX_MODEL_NAME", app_config.CODEX_MODEL_NAME).strip()
-        self.codex_reasoning_effort = os.getenv(
-            "CODEX_REASONING_EFFORT",
-            app_config.CODEX_REASONING_EFFORT,
-        ).strip().lower() or "xhigh"
-        self.openai_api_key = os.getenv("OPENAI_API_KEY", app_config.OPENAI_API_KEY).strip()
-        self.openai_model_name = os.getenv("OPENAI_MODEL_NAME", app_config.OPENAI_MODEL_NAME).strip()
-        self.google_api_key = os.getenv("GOOGLE_API_KEY", app_config.GOOGLE_API_KEY).strip()
-        self.google_model_name = os.getenv("GOOGLE_MODEL_NAME", app_config.MODEL_NAME).strip()
+        # 1. Busca dinamicamente o arquivo de configurações salvo pela interface gráfica
+        settings_path = Path("ide_settings.json")
+        settings = {}
+        if settings_path.exists():
+            try:
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    settings = json.load(f)
+            except Exception:
+                pass
+
+        # 2. Define o Provedor carregando do JSON, se não houver usa a Variável de Ambiente ou o Padrão
+        self.provider = str(settings.get("ai_provider", os.getenv("AI_PROVIDER", app_config.AI_PROVIDER))).strip().lower()
+        
+        self.codex_model_name = str(settings.get("codex_model_name", os.getenv("CODEX_MODEL_NAME", app_config.CODEX_MODEL_NAME))).strip()
+        self.codex_reasoning_effort = str(settings.get("codex_reasoning_effort", os.getenv("CODEX_REASONING_EFFORT", app_config.CODEX_REASONING_EFFORT))).strip().lower() or "xhigh"
+        
+        # 3. Carrega as chaves de API salvas na configuração do JSON ou do ambiente
+        self.openai_api_key = str(settings.get("openai_api_key", os.getenv("OPENAI_API_KEY", app_config.OPENAI_API_KEY))).strip()
+        self.openai_model_name = str(settings.get("openai_model_name", os.getenv("OPENAI_MODEL_NAME", app_config.OPENAI_MODEL_NAME))).strip()
+        
+        self.google_api_key = str(settings.get("google_api_key", os.getenv("GOOGLE_API_KEY", app_config.GOOGLE_API_KEY))).strip()
+        self.google_model_name = str(settings.get("google_model_name", os.getenv("GOOGLE_MODEL_NAME", app_config.MODEL_NAME))).strip()
         self.language = os.getenv("APP_LANGUAGE", app_config.LANGUAGE).strip()
+        external_fallback_raw = settings.get(
+            "external_ai_fallback_enabled",
+            os.getenv("EXTERNAL_AI_FALLBACK_ENABLED", "1"),
+        )
+        self.external_ai_fallback_enabled = str(external_fallback_raw).strip().lower() not in {
+            "0",
+            "false",
+            "nao",
+            "não",
+            "off",
+        }
 
         self.client = None
         self.chat_session = None
         self.active_process = None
         self.cancel_requested = False
+        
+        # 4. Resolve o ID do modelo baseado no que foi carregado dinamicamente
         self.model_id = self._resolve_model_id()
+
         self.latest_rate_limits = None
         self.latest_token_usage = None
         self.latest_quota_problem = ""
@@ -63,14 +89,47 @@ class UniversalEngine:
             self.client = GoogleClient(api_key=self.google_api_key)
             self.reset_session()
 
+    _model_cache = {}
+    
     def _resolve_model_id(self):
+        cache_key = f"{self.provider}:{self.codex_model_name}"
+        if cache_key in self._model_cache:
+            return self._model_cache[cache_key]
+            
+        model_id = "gpt-5.5"
         if self.provider == "codex":
-            return self.codex_model_name or "gpt-5.5"
+            model_id = self.codex_model_name or "gpt-5.5"
+        
+        self._model_cache[cache_key] = model_id
+        return model_id
         if self.provider == "openai":
-            return self.openai_model_name
+            # Retorna estritamente o modelo configurado por você na interface, sem travar nenhuma string fixa
+            return self.openai_model_name if self.openai_model_name else "gpt-5.5"
         if self.provider == "google":
             return self.google_model_name
         return self.codex_model_name or "gpt-5.5"
+
+    def _resolve_model_id(self):
+        configured_model = {
+            "codex": self.codex_model_name,
+            "openai": self.openai_model_name,
+            "google": self.google_model_name,
+        }.get(self.provider, self.codex_model_name)
+        cache_key = f"{self.provider}:{configured_model}"
+        if cache_key in self._model_cache:
+            return self._model_cache[cache_key]
+
+        if self.provider == "codex":
+            model_id = self.codex_model_name or "gpt-5.5"
+        elif self.provider == "openai":
+            model_id = self.openai_model_name or "gpt-5.5"
+        elif self.provider == "google":
+            model_id = self.google_model_name or "gemini-3.1-flash-lite"
+        else:
+            model_id = self.codex_model_name or "gpt-5.5"
+
+        self._model_cache[cache_key] = model_id
+        return model_id
 
     def status_text(self):
         if self.provider == "codex":
@@ -186,7 +245,7 @@ class UniversalEngine:
             self.latest_quota_problem = "sem cota/limite atingido"
             self.latest_quota_updated_at = time.time()
 
-    def _remember_app_server_quota_message(self, method, params):
+    def _remember_quota_message_handler(self, method, params):
         lower_method = (method or "").lower()
         if "ratelimits" in lower_method:
             self._remember_rate_limits(params)
@@ -194,6 +253,9 @@ class UniversalEngine:
             self._remember_token_usage(params)
         if lower_method in {"error", "warning"} or lower_method.endswith("/error"):
             self._remember_quota_error(params)
+
+    def _remember_app_server_quota_message(self, method, params):
+        self._remember_quota_message_handler(method, params)
 
     def _human_rate_limit_reached(self, value):
         labels = {
@@ -363,7 +425,7 @@ Voce pode solicitar acoes da IDE usando tags especiais:
 [FIX_MOJIBAKE: caminho/arquivo.py] para a IDE corrigir mojibake comum com backup automatico.
 Para rodar terminal, envie uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: python -m unittest].
 Para administrador no Windows, envie uma tag EXECUTE_ADMIN ja preenchida, por exemplo [EXECUTE_ADMIN: whoami /groups].
-[OPEN_URL: http://127.0.0.1:porta/] para abrir uma URL local validada.
+[OPEN_URL: http://127.0.0.1:porta/] para abrir uma URL no navegador interno da IDE.
 [SCREENSHOT: tela] para capturar a tela atual e devolver a imagem para analise.
 [HUMAN_TEST: auto] para a IDE executar/abrir o app ou jogo, esperar a tela, capturar print real e devolver para analise visual.
 [UNDO: caminho/arquivo.py] para restaurar o backup .bak.
@@ -375,10 +437,12 @@ Regras:
 - Se a pergunta for simples e nao exigir projeto, responda diretamente sem tags.
 - Se a missao for analise/planejamento, entregue diagnostico completo em texto; nao transforme analise em execucao ou edicao.
 - Se a missao for implementacao/correcao, nao pare em "vou fazer"; use [READ], [REPLACE], [WRITE] e uma tag EXECUTE com comando real ate haver resultado verificavel.
+- Se voce nao tiver resposta exata, se depender de fato atual, documentacao, versao de biblioteca/servico ou comportamento externo, use [WEB_SEARCH: consulta objetiva] antes de concluir.
+- Se a resposta vier de contexto externo, entregue uma conclusao resumida e aplicavel dentro da IDE, citando o essencial em vez de despejar pesquisa bruta.
 - Se for usar uma tag, responda com a tag diretamente. Nao escreva "vou", "irei" ou "preciso" antes da tag.
 - Texto de intencao sem acao sera ignorado pela IDE. Acao real ou conclusao final sao as unicas saidas validas.
 - Nunca diga que corrigiu, aplicou, alterou, rodou, testou ou validou sem enviar a tag real que faz isso.
-- Correcao so conta com [REPLACE], [WRITE], [FIX_MOJIBAKE] ou [UNDO]; validacao so conta com uma tag EXECUTE/EXECUTE_ADMIN ja preenchida, [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST].
+- Correcao so conta com [REPLACE], [WRITE], [FIX_MOJIBAKE] ou [UNDO]; validacao so conta com uma tag EXECUTE/EXECUTE_ADMIN ja preenchida, [OPEN_URL] no navegador interno, [SCREENSHOT] ou [HUMAN_TEST].
 - Para projeto grande, use o mapa do workspace, arquivos-chave e buscas pontuais. Nao tente ler tudo em sequencia.
 - Depois de 2 ou 3 leituras estrategicas, tome decisao: editar, testar, abrir, capturar print ou concluir.
 - Se a IDE avisar que substituiu leitura em massa por mapa do projeto, use o mapa e entregue resultado; nao peca nova lista de arquivos.
@@ -471,7 +535,41 @@ Regras:
         approval_callback=None,
     ):
         self.cancel_requested = False
-        if self.provider == "codex":
+        response = self._generate_solution_with_provider(
+            self.provider,
+            prompt,
+            image_path=image_path,
+            code_context=code_context,
+            stream_callback=stream_callback,
+            workspace_path=workspace_path,
+            approval_callback=approval_callback,
+        )
+        if not self.should_try_external_ai_fallback(response):
+            return response
+
+        fallback_response = self.try_external_ai_fallback(
+            prompt,
+            image_path=image_path,
+            code_context=code_context,
+            stream_callback=stream_callback,
+            workspace_path=workspace_path,
+            approval_callback=approval_callback,
+            failed_response=response,
+        )
+        return fallback_response or response
+
+    def _generate_solution_with_provider(
+        self,
+        provider,
+        prompt,
+        image_path=None,
+        code_context=None,
+        stream_callback=None,
+        workspace_path=None,
+        approval_callback=None,
+    ):
+        provider = (provider or self.provider or "codex").strip().lower()
+        if provider == "codex":
             return self._generate_codex_solution(
                 prompt,
                 image_path,
@@ -480,9 +578,141 @@ Regras:
                 workspace_path=workspace_path,
                 approval_callback=approval_callback,
             )
-        if self.provider == "openai":
+        if provider == "openai":
             return self._generate_openai_solution(prompt, image_path, code_context)
         return self._generate_google_solution(prompt, image_path, code_context)
+
+    def should_try_external_ai_fallback(self, response):
+        text = str(response or "").strip()
+        if not text:
+            return True
+        normalized = text.lower()
+        failure_markers = (
+            "alta demanda",
+            "capacity",
+            "codex nao conseguiu iniciar",
+            "codex nao foi encontrado",
+            "nao esta logado",
+            "sem login",
+            "insufficient_quota",
+            "sem cota",
+            "cota disponivel",
+            "creditos esgotados",
+            "limite atingido",
+            "rate limit",
+            "usage limit",
+            "configure openai_api_key",
+            "configure google_api_key",
+            "pacote google genai nao esta instalado",
+            "erro no motor openai",
+            "erro no motor genai",
+            "erro na requisi",
+            "chave inserida foi rejeitada",
+            "modelo `",
+            "nao foi localizado",
+            "terminou sem devolver texto",
+            "app-server retornou erro",
+            "service unavailable",
+            "temporar",
+            "overloaded",
+        )
+        return any(marker in normalized for marker in failure_markers)
+
+    def configured_external_ai_fallback_providers(self):
+        providers = []
+        current = (self.provider or "").strip().lower()
+
+        if current != "codex":
+            providers.append("codex")
+        if current != "openai" and self.openai_api_key:
+            providers.append("openai")
+        if current != "google" and self.google_api_key and GoogleClient:
+            providers.append("google")
+
+        return [provider for provider in providers if provider in {"codex", "openai", "google"}]
+
+    def try_external_ai_fallback(
+        self,
+        prompt,
+        image_path=None,
+        code_context=None,
+        stream_callback=None,
+        workspace_path=None,
+        approval_callback=None,
+        failed_response="",
+    ):
+        if not getattr(self, "external_ai_fallback_enabled", True):
+            return None
+
+        providers = self.configured_external_ai_fallback_providers()
+        if not providers:
+            return None
+
+        original_state = self._snapshot_provider_state()
+        try:
+            for provider in providers:
+                if self.cancel_requested:
+                    return None
+                label = self.external_provider_label(provider)
+                if stream_callback:
+                    stream_callback(f"\nFallback externo: tentando {label}...\n")
+                self._activate_provider(provider)
+                response = self._generate_solution_with_provider(
+                    provider,
+                    prompt,
+                    image_path=image_path,
+                    code_context=code_context,
+                    stream_callback=stream_callback,
+                    workspace_path=workspace_path,
+                    approval_callback=approval_callback,
+                )
+                if response and not self.should_try_external_ai_fallback(response):
+                    return f"[Fallback externo: {label}]\n\n{response}"
+            return None
+        finally:
+            self._restore_provider_state(original_state)
+
+    def external_provider_label(self, provider):
+        labels = {
+            "codex": "Codex/ChatGPT",
+            "openai": "OpenAI/OpenRouter",
+            "google": "Gemini",
+        }
+        return labels.get(provider, provider.upper())
+
+    def _snapshot_provider_state(self):
+        return {
+            "provider": self.provider,
+            "model_id": self.model_id,
+            "client": self.client,
+            "chat_session": self.chat_session,
+            "generation_config": self.generation_config,
+        }
+
+    def _restore_provider_state(self, state):
+        self.provider = state["provider"]
+        self.model_id = state["model_id"]
+        self.client = state["client"]
+        self.chat_session = state["chat_session"]
+        self.generation_config = state["generation_config"]
+
+    def _activate_provider(self, provider):
+        self.provider = (provider or "codex").strip().lower()
+        self.model_id = self._resolve_model_id()
+        self.chat_session = None
+        if self.provider == "codex":
+            self.codex_executable = self._find_codex_executable()
+            self.client = "codex-cli" if self.codex_executable and self._codex_is_logged_in(self.codex_executable) else None
+            return
+        if self.provider == "openai":
+            self.client = "openai-http" if self.openai_api_key else None
+            return
+        if self.provider == "google" and self.google_api_key and GoogleClient:
+            self.client = GoogleClient(api_key=self.google_api_key)
+            self.generation_config = self._build_google_generation_config()
+            self.reset_session()
+            return
+        self.client = None
 
     def _generate_codex_solution(
         self,
@@ -918,7 +1148,7 @@ Regras:
 
                 method = message.get("method", "")
                 params = message.get("params") or {}
-                self._remember_app_server_quota_message(method, params)
+                self._remember_quota_message_handler(method, params)
 
                 if handle_server_request(message):
                     continue
@@ -1217,7 +1447,7 @@ Regras:
         if "not logged in" in lower or "unauthorized" in lower:
             return (
                 "O Codex que a IDE chama ainda nao esta logado no Windows. "
-                "Clique em `Entrar Codex`, conclua o login do Codex CLI e tente novamente."
+                "Clique em `Entrar Codex`, conclua o login e tente novamente."
             )
         return f"Codex app-server retornou erro:\n\n{message}"
 
@@ -1236,7 +1466,7 @@ Regras:
         prompt_text = (
             f"{self.system_instruction}\n\n"
             "Voce esta sendo chamado diretamente pela Merotec IA IDE via Codex CLI.\n"
-            f"Use raciocinio altissimo nesta tarefa: effort={selected_effort}.\n"
+            f"Use raciocinio alto nesta tarefa: effort={selected_effort}.\n"
             "Pode editar arquivos no workspace quando a tarefa pedir implementacao.\n"
             "Nao responda com promessa. Execute a tarefa e devolva apenas resultado final ou a acao real necessaria.\n"
             "Ao terminar, responda em portugues com um resumo curto do que fez.\n\n"
@@ -1388,24 +1618,59 @@ Regras:
             )
 
         try:
-            payload = {
-                "model": self.model_id,
-                "instructions": self.system_instruction,
-                "input": self._openai_input(prompt, code_context, image_path),
-                "reasoning": {"effort": "high"},
-            }
-            request = urllib.request.Request(
-                "https://api.openai.com/v1/responses",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "Authorization": f"Bearer {self.openai_api_key}",
+            # Detecta se a chave pertence ao OpenRouter
+            is_openrouter = self.openai_api_key.startswith("sk-or-") or "openrouter.ai" in os.getenv("OPENAI_BASE_URL", "").lower()
+            
+            if is_openrouter:
+                endpoint = "https://openrouter.ai/api/v1/chat/completions"
+                
+                # Garante que o modelo limpe espaços e use o ID do OpenRouter de forma estrita
+                current_model = str(self.model_id).strip() if self.model_id else ""
+                if not current_model or "gpt-" in current_model.lower():
+                    current_model = "deepseek/deepseek-chat:free"
+                    
+                payload = {
+                    "model": current_model,
+                    "messages": [
+                        {"role": "system", "content": self.system_instruction},
+                        {"role": "user", "content": self._message_payload(prompt, code_context)}
+                    ],
+                    "temperature": 0.1
+                }
+                headers = {
+                    "Authorization": f"Bearer {self.openai_api_key.strip()}",
                     "Content-Type": "application/json",
-                },
+                    "HTTP-Referer": "https://github.com/merotec/ai-ide",
+                    "X-Title": "Merotec AI IDE",
+                }
+            else:
+                base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+                endpoint = f"{base_url}/chat/completions"
+                payload = {
+                    "model": self.model_id,
+                    "messages": [
+                        {"role": "system", "content": self.system_instruction},
+                        {"role": "user", "content": self._message_payload(prompt, code_context)}
+                    ],
+                    "temperature": 0.1
+                }
+                headers = {
+                    "Authorization": f"Bearer {self.openai_api_key.strip()}",
+                    "Content-Type": "application/json",
+                }
+
+            request = urllib.request.Request(
+                endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
                 method="POST",
             )
             with urllib.request.urlopen(request, timeout=120) as response:
                 data = json.loads(response.read().decode("utf-8"))
-            self._remember_openai_usage(data.get("usage"))
+                
+            if "usage" in data:
+                self._remember_openai_usage(data.get("usage"))
+                
             return self._extract_openai_text(data)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
@@ -1424,8 +1689,8 @@ Regras:
 
         if status_code == 401 or code == "invalid_api_key":
             return (
-                "A chave da OpenAI esta invalida ou expirada. Abra Configurar IA e cole uma nova "
-                "OPENAI_API_KEY criada no painel da OpenAI."
+                f"A chave inserida foi rejeitada pela API (HTTP {status_code}). Verifique se "
+                "copiou o token completo do OpenRouter corretamente."
             )
 
         if status_code == 429 and code == "insufficient_quota":
@@ -1433,20 +1698,27 @@ Regras:
             self.latest_quota_updated_at = time.time()
             return (
                 "Sua chave foi aceita, mas a conta/projeto esta sem cota disponivel. "
-                "Verifique Billing, Usage e Limits na plataforma da OpenAI."
+                "Verifique seu saldo na plataforma."
             )
 
         if status_code in {400, 404} and "model" in message.lower():
             return (
-                f"O modelo `{self.model_id}` nao foi aceito pela API da sua conta. "
-                "Abra Configurar IA e teste `gpt-5.2` ou outro modelo liberado para voce."
+                f"O modelo `{self.model_id}` nao foi localizado. Certifique-se de que digitou o ID "
+                "exato do OpenRouter (Exemplo: deepseek/deepseek-chat:free)."
             )
 
-        return f"Erro no motor OpenAI usando modelo `{self.model_id}`: HTTP {status_code} - {message}"
+        return f"Erro na requisição: HTTP {status_code} - {message}"
 
     def _extract_openai_text(self, data):
         if data.get("output_text"):
             return data["output_text"]
+
+        if "choices" in data and len(data["choices"]) > 0:
+            choice = data["choices"][0]
+            if isinstance(choice, dict) and "message" in choice:
+                content = choice["message"].get("content")
+                if content:
+                    return content
 
         chunks = []
         for item in data.get("output", []):

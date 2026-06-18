@@ -1,0 +1,189 @@
+{
+  "system": {
+    "name": "Merotec IA IDE",
+    "version": "0.1.0",
+    "language": "pt-BR",
+    "workspace": "C:\\Users\\Merotec\\Desktop\\AI_Software_Enginering",
+    "projects_directory": "projects",
+    "system_ai_directory": ".merotec_system_ai"
+  },
+  "ai": {
+    "provider": "openai",
+    "codex": {
+      "model_name": "gpt-5.5",
+      "reasoning_effort": "high",
+      "executable": null,
+      "logged_in": false
+    },
+    "openai": {
+      "model_name": "openrouter/owl-alpha",
+      "api_key_configured": true,
+      "base_url": "https://openrouter.ai/api/v1"
+    },
+    "google": {
+      "model_name": "gemini-2.5-flash:free",
+      "api_key_configured": false
+    },
+    "fallback": {
+      "enabled": true,
+      "providers": ["codex", "openai", "google"]
+    }
+  },
+  "codex_app_server": {
+    "auto_approve_requests": true,
+    "approval_policy": "on-request",
+    "idle_timeout_seconds": 900,
+    "task_timeout_seconds": 3600
+  },
+  "paths": {
+    "settings_file": "ide_settings.json",
+    "history_file": "history.json",
+    "change_history_file": "change_history.json",
+    "projects_dir": "projects",
+    "system_ai_dir": ".merotec_system_ai"
+  },
+  "workspace": {
+    "last_workspace": "C:\\Users\\Merotec\\Desktop\\AI_Software_Enginering",
+    "recent_projects": [
+      "C:\\Users\\Merotec\\Desktop\\AI_Software_Enginering",
+      "C:\\Users\\Merotec\\Desktop\\Pojeto_loja",
+      "C:\\Users\\Merotec\\Desktop\\AI_Software_Enginering\\projects",
+      "C:\\Users\\Merotec\\Documents\\MG Game",
+      "C:\\Users\\Merotec\\Desktop\\Screenrecorder",
+      "C:\\Users\\Merotec\\Desktop\\simulador",
+      "C:\\Users\\Merotec\\Desktop\\AppEduc",
+      "C:\\Users\\Merotec\\Desktop\\fps"
+    ]
+  },
+  "ui": {
+    "app_name": "Merotec IA IDE",
+    "chat_tab_name": "Chat IA",
+    "core_tabs": [
+      "Chat IA",
+      "Scratchpad",
+      "Terminal Local",
+      "Log do Agente",
+      "Navegador"
+    ],
+    "file_icon_colors": {
+      "py": ["#3776ab", "#ffd343"],
+      "js": ["#f0db4f", "#1f2328"],
+      "ts": ["#3178c6", "#ffffff"],
+      "tsx": ["#3178c6", "#61dafb"],
+      "jsx": ["#1f2937", "#61dafb"],
+      "html": ["#e44d26", "#f7f7f7"],
+      "css": ["#264de4", "#f7f7f7"],
+      "json": ["#d6b656", "#1f2328"],
+      "md": ["#6f7785", "#ffffff"],
+      "txt": ["#8ea0b8", "#ffffff"],
+      "cmd": ["#2fbf71", "#06120c"],
+      "ps1": ["#3a7bd5", "#ffffff"],
+      "bat": ["#2fbf71", "#06120c"]
+    }
+  },
+  "scanner": {
+    "ignored_directories": [
+      ".git",
+      ".gradle",
+      ".gemini",
+      ".idea",
+      ".dart_tool",
+      ".merotec_attachments",
+      ".merotec_backups",
+      ".merotec_local_ai",
+      ".merotec_system_ai",
+      ".tool_appdata",
+      ".mypy_cache",
+      ".pytest_cache",
+      ".venv",
+      "__pycache__",
+      "build",
+      "codex_schema_probe",
+      "coverage",
+      "dist",
+      "ephemeral",
+      "node_modules",
+      "out",
+      "tcl_runtime",
+      "venv"
+    ],
+    "ignored_extensions": [
+      ".bin",
+      ".dll",
+      ".exe",
+      ".ico",
+      ".jpg",
+      ".jpeg",
+      ".pyd",
+      ".pyc",
+      ".png",
+      ".webp",
+      ".zip"
+    ]
+  },
+  "voice": {
+    "enabled": true,
+    "wake_word": "Merotec",
+    "end_word": "ok"
+  },
+  "memory": {
+    "nodes": 19,
+    "links": 18,
+    "corpus_records": 111,
+    "last_update": "16/06/2026 18:12",
+    "offline_rag_enabled": true
+  },
+  "autonomous_mode": {
+    "unrestricted": true,
+    "auto_approve_app_server": true
+  },
+  "modules": {
+    "config": "modules/config.py",
+    "engine": "modules/engine.py",
+    "app_constants": "modules/app_constants.py",
+    "app_state": "modules/app_state.py",
+    "agent_actions": "modules/agent_actions.py",
+    "ai_config": "modules/ai_config.py",
+    "executor": "modules/executor.py",
+    "memory": "modules/memory.py",
+    "project_loader": "modules/project_loader.py",
+    "project_manager": "modules/project_manager.py",
+    "ui_theme": "modules/ui_theme.py",
+    "voice": "modules/voice.py",
+    "workspace_intelligence": "modules/workspace_intelligence.py"
+  },
+  "subprojects": {
+    "quake2_web": {
+      "path": "projects/quake2-web",
+      "type": "Web/HTML",
+      "files": ["index.html", "style.css", "game.js", "README.md"]
+    },
+    "unity_mini_csharp_game": {
+      "path": "projects/unity-mini-csharp-game",
+      "type": "Unity/C#",
+      "files": [
+        "Assets/Scripts/Coin.cs",
+        "Assets/Scripts/EnemyPatrol.cs",
+        "Assets/Scripts/GameManager.cs",
+        "Assets/Scripts/PlayerController.cs",
+        "PlayableWeb/index.html",
+        "PlayableWeb/style.css",
+        "PlayableWeb/game.js",
+        "README.md"
+      ]
+    }
+  },
+  "tests": {
+    "directory": "tests",
+    "files": [
+      "test_admin_execution_guards.py",
+      "test_ai_context_memory.py",
+      "test_ai_quota_status.py",
+      "test_autonomous_discovery_triggers.py",
+      "test_editor_interactions.py",
+      "test_engine_config.py",
+      "test_smart_task_brief.py",
+      "test_text_repair.py"
+    ]
+  }
+}

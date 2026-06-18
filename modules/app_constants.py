@@ -3,7 +3,7 @@ from pathlib import Path
 
 APP_NAME = "Merotec IA IDE"
 CHAT_TAB_NAME = "Chat IA"
-CORE_TABS = {CHAT_TAB_NAME, "Chat IA", "Scratchpad", "Terminal Local", "Log do Agente"}
+CORE_TABS = {CHAT_TAB_NAME, "Chat IA", "Scratchpad", "Terminal Local", "Log do Agente", "Navegador"}
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROJECTS_DIR = PROJECT_ROOT / "projects"
@@ -24,6 +24,7 @@ DEFAULT_APP_SETTINGS = {
     "codex_app_server_approval_policy": "on-request",
     "codex_app_server_idle_timeout_seconds": 900,
     "codex_task_timeout_seconds": 3600,
+    "external_ai_fallback_enabled": True,
 }
 
 SCRATCHPAD_DEFAULT_TEXT = """# Como configurar um modelo de IA nesta IDE

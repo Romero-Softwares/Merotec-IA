@@ -80,7 +80,7 @@ import pygments
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from PIL import Image, ImageDraw, ImageGrab, ImageTk
+from PIL import Image, ImageGrab
 from pygments.lexers import get_lexer_for_filename
 from pygments.styles import get_style_by_name
 from pygments.util import ClassNotFound
@@ -228,15 +228,6 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.codex_login_started = False
         self.pending_image_path = None
         self.pending_image_preview = None
-        self.chat_background_path = None
-        self.chat_background_source = None
-        self.chat_background_image = None
-        self.chat_background_photo = None
-        self.chat_background_canvas_item = None
-        self.chat_background_label = None
-        self.chat_background_window_item = None
-        self.chat_background_size = None
-        self.chat_background_refresh_pending = False
         self.voice_capture_active = False
         self.voice_capture_started_at = None
         self.voice_keyword_capture_active = False
@@ -263,6 +254,11 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.editor_completion_job = None
         self.editor_symbol_cache = []
         self.editor_symbol_cache_signature = None
+        self.internal_browser_url = "about:blank"
+        self.internal_browser_window = None
+        self.internal_browser_started = False
+        self.internal_browser_backend = ""
+        self.internal_browser_lock = threading.Lock()
 
         self.engine = UniversalEngine()
         self.voice = VoiceModule()
@@ -308,6 +304,21 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         y = top + max(0, (work_height - height) // 2)
         self.geometry(f"{width}x{height}+{x}+{y}")
         self.minsize(min(1050, max(900, work_width - 80)), min(620, max(560, work_height - 80)))
+        self.after(0, self._maximize_initial_window)
+
+    def _maximize_initial_window(self):
+        try:
+            self.state("zoomed")
+            return
+        except tk.TclError:
+            pass
+        try:
+            self.attributes("-zoomed", True)
+            return
+        except tk.TclError:
+            pass
+        left, top, work_width, work_height = self._available_screen_area()
+        self.geometry(f"{work_width}x{work_height}+{left}+{top}")
 
     def _build_menu(self):
         self._configure_native_menu_style()
@@ -1184,7 +1195,6 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         def scroll_chat(units):
             try:
                 canvas.yview_scroll(units, "units")
-                self._position_chat_background()
             except tk.TclError:
                 pass
 
@@ -1198,22 +1208,6 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         canvas.configure(yscrollcommand=lambda first, last: scroll_bar.set(first, last))
         self.after(1, lambda: scroll_bar.set(*canvas.yview()))
         return
-
-    def _position_chat_background(self, event=None):
-        canvas = getattr(self.chat_history, "_parent_canvas", None)
-        item = getattr(self, "chat_background_canvas_item", None)
-        if canvas is None or item is None:
-            return
-        try:
-            canvas.tag_lower(item)
-        except tk.TclError:
-            pass
-
-    def _schedule_chat_background_refresh(self, event=None):
-        if self.chat_background_refresh_pending:
-            return
-        self.chat_background_refresh_pending = True
-        self.after(120, self._refresh_chat_background)
 
     def _build_file_icons(self):
         self.file_icons = {
@@ -1269,118 +1263,15 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             foreground=[("selected", THEME["button_text"])],
         )
 
-    def _find_chat_background_image(self):
-        image_extensions = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
-        preferred_dirs = [PROJECT_ROOT / "access", PROJECT_ROOT / "assets"]
-        for folder in preferred_dirs:
-            if not folder.exists():
-                continue
-            images = [path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in image_extensions]
-            if images:
-                return max(images, key=lambda path: path.stat().st_mtime)
-        return None
-
-    def _make_chat_effect_background(self, width, height):
-        width = max(240, int(width))
-        height = max(180, int(height))
-        base = Image.new("RGB", (1, height), THEME["bg"])
-        draw_base = ImageDraw.Draw(base)
-
-        for y in range(height):
-            vertical = y / max(1, height - 1)
-            draw_base.point(
-                (0, y),
-                fill=(
-                    int(7 + 12 * vertical),
-                    int(12 + 18 * vertical),
-                    int(24 + 34 * vertical),
-                ),
-            )
-
-        background = base.resize((width, height))
-        layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(layer)
-        cyan = (47, 187, 255, 42)
-        blue = (66, 120, 255, 24)
-        soft = (120, 220, 255, 16)
-
-        draw.ellipse((int(width * 0.58), -height // 4, int(width * 1.18), int(height * 0.72)), fill=(24, 90, 150, 38))
-        draw.ellipse((-width // 4, int(height * 0.66), int(width * 0.62), int(height * 1.28)), fill=(20, 70, 115, 28))
-
-        for offset in range(-height, width, 96):
-            draw.line((offset, height, offset + height, 0), fill=blue, width=1)
-        for offset in range(28, width + height, 128):
-            draw.line((offset, 0, offset - height, height), fill=(31, 95, 134, 18), width=1)
-
-        nodes = [
-            (0.18, 0.28), (0.31, 0.18), (0.45, 0.35), (0.62, 0.22), (0.79, 0.31),
-            (0.24, 0.57), (0.40, 0.70), (0.58, 0.58), (0.74, 0.74), (0.88, 0.52),
-        ]
-        points = [(int(width * x), int(height * y)) for x, y in nodes]
-        for start, end in zip(points, points[1:]):
-            draw.line((*start, *end), fill=cyan, width=1)
-        for x, y in points:
-            draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=(47, 187, 255, 82), outline=(180, 238, 255, 110))
-            draw.ellipse((x - 11, y - 11, x + 11, y + 11), outline=soft, width=1)
-
-        for radius, alpha in ((180, 18), (260, 12), (360, 7)):
-            draw.ellipse((width - radius, 18, width + radius // 2, 18 + radius * 2), outline=(47, 187, 255, alpha), width=1)
-
-        return Image.alpha_composite(background.convert("RGBA"), layer).convert("RGB")
-
-    def _refresh_chat_background(self, event=None):
-        self.chat_background_refresh_pending = False
+    def _style_chat_panel_layers(self):
         try:
-            canvas = getattr(self.chat_history, "_parent_canvas", None)
-            target_widget = canvas if canvas is not None else self.tab_chat
-            width = max(240, target_widget.winfo_width())
-            height = max(180, target_widget.winfo_height())
-            width = (width // 16) * 16
-            height = (height // 16) * 16
-            if self.chat_background_size == (width, height):
-                self._position_chat_background()
-                return
-
-            self.chat_background_size = (width, height)
-            background = self._make_chat_effect_background(width, height)
-
-            if canvas is not None:
-                self.chat_background_photo = ImageTk.PhotoImage(background)
-                if self.chat_background_canvas_item is None:
-                    self.chat_background_canvas_item = canvas.create_image(
-                        0,
-                        0,
-                        image=self.chat_background_photo,
-                        anchor="nw",
-                    )
-                else:
-                    canvas.itemconfigure(self.chat_background_canvas_item, image=self.chat_background_photo)
-                canvas.coords(self.chat_background_canvas_item, 0, 0)
-                canvas.tag_lower(self.chat_background_canvas_item)
-                canvas.configure(bg=THEME["bg"], highlightthickness=0, bd=0)
-
-            self.chat_background_image = ctk.CTkImage(
-                light_image=background,
-                dark_image=background,
-                size=(width, height),
-            )
-            if self.chat_background_label is not None:
-                self.chat_background_label.configure(image=self.chat_background_image)
-                self.chat_background_label.place_configure(relx=0, rely=0, relwidth=1, relheight=1)
-                self.chat_background_label.lower()
-        except Exception as exc:
-            self.log_agent(f"Nao consegui aplicar fundo do chat: {exc}")
-
-    def _style_chat_background_layers(self):
-        try:
-            self.chat_history.configure(fg_color="transparent")
+            self.chat_history.configure(fg_color=THEME["bg"])
             canvas = getattr(self.chat_history, "_parent_canvas", None)
             if canvas is not None:
                 canvas.configure(bg=THEME["bg"], highlightthickness=0, bd=0)
-                canvas.bind("<Configure>", self._position_chat_background, add="+")
             parent_frame = getattr(self.chat_history, "_parent_frame", None)
             if parent_frame is not None:
-                parent_frame.configure(fg_color="transparent")
+                parent_frame.configure(fg_color=THEME["bg"])
             self._autohide_ctk_scrollable_frame_scrollbar(self.chat_history)
         except tk.TclError:
             pass
@@ -1392,37 +1283,30 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             text_color=THEME["text"],
             border_width=1,
             border_color=THEME["border"],
-            segmented_button_fg_color=THEME["panel_alt"],
+            segmented_button_fg_color=THEME["nav_button_border"],
             segmented_button_selected_color=THEME["accent_dark"],
             segmented_button_selected_hover_color=THEME["accent"],
             segmented_button_unselected_color=THEME["panel_alt"],
             segmented_button_unselected_hover_color=THEME["panel_soft"],
         )
         self.tabview.grid(row=1, column=2, sticky="nsew", padx=12, pady=(12, 8))
+        self.tabview._segmented_button.configure(border_width=2)
 
         self.tab_chat = self.tabview.add("Chat AI")
         self.tab_editor = self.tabview.add("Scratchpad")
         self.tab_terminal = self.tabview.add("Terminal Local")
+        self.tab_browser = self.tabview.add("Navegador")
         self.tab_agent_log = self.tabview.add("Log do Agente")
 
-        for tab in (self.tab_chat, self.tab_editor, self.tab_terminal, self.tab_agent_log):
+        for tab in (self.tab_chat, self.tab_editor, self.tab_terminal, self.tab_browser, self.tab_agent_log):
             tab.grid_columnconfigure(0, weight=1)
             tab.grid_rowconfigure(0, weight=1)
 
-        self.chat_background_label = ctk.CTkLabel(self.tab_chat, text="", fg_color=THEME["panel"])
-        self.chat_background_label.place(relx=0, rely=0, relwidth=1, relheight=1)
-        self.chat_background_label.lower()
-
-        self.chat_history = ctk.CTkScrollableFrame(self.tab_chat, fg_color="transparent")
+        self.chat_history = ctk.CTkScrollableFrame(self.tab_chat, fg_color=THEME["bg"])
         self.chat_history.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
-        self.chat_history.tkraise()
-        self._style_chat_background_layers()
+        self._style_chat_panel_layers()
         self._autohide_ctk_scrollable_frame_scrollbar(self.chat_history)
         self._install_chat_scroll_controls()
-        self.chat_history.bind("<Configure>", self._schedule_chat_background_refresh, add="+")
-        self.tab_chat.bind("<Configure>", self._schedule_chat_background_refresh, add="+")
-        self._refresh_chat_background()
-        self.after(120, self._schedule_chat_background_refresh)
 
         self.code_editor_frame, self.code_editor = self._create_editor(self.tab_editor, "Scratchpad")
         self.code_editor_frame.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
@@ -1480,6 +1364,8 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.local_term_in.bind("<Return>", self.run_local_command)
         self._bind_terminal_interrupt_shortcuts(self.local_term_in)
 
+        self._build_internal_browser_tab()
+
         self.agent_log = ctk.CTkTextbox(
             self.tab_agent_log,
             fg_color=THEME["terminal"],
@@ -1491,6 +1377,189 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self._style_text_surface(self.agent_log, THEME["terminal"], "#d7dee9")
         self._show_ctk_textbox_scrollbar(self.agent_log)
         self._replace_text(self.agent_log, "Log iniciado.\n")
+
+    def _build_internal_browser_tab(self):
+        self.tab_browser.grid_rowconfigure(1, weight=1)
+        self.tab_browser.grid_columnconfigure(0, weight=1)
+
+        toolbar = ctk.CTkFrame(self.tab_browser, fg_color=THEME["panel_alt"], corner_radius=6)
+        toolbar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        toolbar.grid_columnconfigure(0, weight=1)
+
+        self.browser_url_entry = ctk.CTkEntry(
+            toolbar,
+            placeholder_text="https:// ou http://127.0.0.1:porta",
+            font=("Segoe UI", 13),
+            fg_color=THEME["panel"],
+            border_color=THEME["border"],
+            text_color=THEME["text"],
+            height=34,
+        )
+        self.browser_url_entry.grid(row=0, column=0, sticky="ew", padx=(8, 6), pady=8)
+        self.browser_url_entry.bind("<Return>", self.browse_internal_url_from_entry)
+
+        go_button = self._elevated_button(toolbar, text="Ir", width=64, height=30, command=self.browse_internal_url_from_entry)
+        go_button.elevation_shadow.grid(row=0, column=1, padx=4, pady=8)
+
+        reload_button = self._elevated_button(toolbar, text="Recarregar", width=96, height=30, command=self.reload_internal_browser)
+        reload_button.elevation_shadow.grid(row=0, column=2, padx=4, pady=8)
+
+        external_button = self._elevated_button(toolbar, text="Externo", width=78, height=30, command=self.open_current_browser_url_external)
+        external_button.elevation_shadow.grid(row=0, column=3, padx=(4, 8), pady=8)
+
+        body = ctk.CTkFrame(self.tab_browser, fg_color=THEME["bg"], corner_radius=6, border_width=1, border_color=THEME["border"])
+        body.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 8))
+        body.grid_rowconfigure(1, weight=1)
+        body.grid_columnconfigure(0, weight=1)
+
+        self.browser_status_label = ctk.CTkLabel(
+            body,
+            text="Navegador interno pronto para URLs locais ou web.",
+            text_color=THEME["text"],
+            anchor="w",
+            justify="left",
+            font=("Segoe UI", 13, "bold"),
+        )
+        self.browser_status_label.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 4))
+
+        self.browser_info = ctk.CTkTextbox(
+            body,
+            fg_color=THEME["terminal"],
+            text_color="#d7dee9",
+            font=("Consolas", 12),
+            wrap="word",
+        )
+        self.browser_info.grid(row=1, column=0, sticky="nsew", padx=14, pady=(8, 14))
+        self._style_text_surface(self.browser_info, THEME["terminal"], "#d7dee9")
+        self._replace_text(
+            self.browser_info,
+            "Navegador interno da Merotec IA IDE\n\n"
+            "- URLs abertas pela IA via [OPEN_URL] aparecem aqui.\n"
+            "- Com pywebview/WebView2 instalado, a IDE abre uma janela web controlada por ela.\n"
+            "- Se o motor interno nao estiver disponivel, a IDE avisa e pode usar o navegador externo como fallback.\n",
+        )
+
+    def normalize_internal_browser_url(self, url):
+        raw = str(url or "").strip().strip("\"'")
+        if not raw:
+            return ""
+        if raw.lower() == "about:blank":
+            return "about:blank"
+        candidate = Path(raw)
+        try:
+            if candidate.exists():
+                return candidate.resolve().as_uri()
+        except OSError:
+            pass
+        if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", raw):
+            host = raw.split("/", 1)[0].lower()
+            scheme = "http" if host.startswith(("localhost", "127.0.0.1", "0.0.0.0", "[::1]")) else "https"
+            raw = f"{scheme}://{raw}"
+        return raw
+
+    def browse_internal_url_from_entry(self, event=None):
+        url = self.browser_url_entry.get().strip()
+        self.open_internal_browser(url, source="usuario")
+        return "break"
+
+    def reload_internal_browser(self):
+        self.open_internal_browser(self.internal_browser_url, source="reload")
+
+    def open_current_browser_url_external(self):
+        url = self.normalize_internal_browser_url(self.internal_browser_url)
+        if not url:
+            return
+        webbrowser.open(url, new=1)
+        self.set_internal_browser_status(f"Abrindo fallback externo: {url}", "warning")
+
+    def set_internal_browser_status(self, message, kind="ready"):
+        def update():
+            label = getattr(self, "browser_status_label", None)
+            textbox = getattr(self, "browser_info", None)
+            if label is not None:
+                color = THEME["warning"] if kind == "warning" else THEME["error"] if kind == "error" else THEME["text"]
+                label.configure(text=message, text_color=color)
+            if textbox is not None:
+                try:
+                    textbox.insert("end", f"\n{datetime.now().strftime('%H:%M:%S')} - {message}")
+                    textbox.see("end")
+                except tk.TclError:
+                    pass
+
+        self.after(0, update)
+
+    def open_internal_browser(self, url, source="IA"):
+        normalized = self.normalize_internal_browser_url(url)
+        if not normalized:
+            self.set_internal_browser_status("URL vazia recebida pelo navegador interno.", "error")
+            return ""
+
+        self.internal_browser_url = normalized
+        try:
+            self.tabview.set("Navegador")
+            self.browser_url_entry.delete(0, "end")
+            self.browser_url_entry.insert(0, normalized)
+        except tk.TclError:
+            pass
+
+        opened, detail = self._open_pywebview_browser(normalized)
+        if opened:
+            self.internal_browser_backend = "pywebview"
+            self.set_internal_browser_status(f"Navegador interno abriu: {normalized}", "ready")
+            return normalized
+
+        self.internal_browser_backend = "external-fallback"
+        self.set_internal_browser_status(
+            f"Motor interno indisponivel ({detail}). Abrindo no navegador externo como fallback: {normalized}",
+            "warning",
+        )
+        try:
+            webbrowser.open(normalized, new=1)
+        except Exception as exc:
+            self.set_internal_browser_status(f"Falha ao abrir fallback externo: {exc}", "error")
+            return ""
+        return normalized
+
+    def _open_pywebview_browser(self, url):
+        try:
+            import webview
+        except Exception as exc:
+            return False, f"pywebview/WebView2 nao instalado: {exc}"
+
+        with self.internal_browser_lock:
+            window = self.internal_browser_window
+            if self.internal_browser_started and window is not None:
+                try:
+                    window.load_url(url)
+                    return True, "url carregada"
+                except Exception as exc:
+                    return False, f"nao consegui recarregar a janela interna: {exc}"
+
+            self.internal_browser_started = True
+
+        def run_browser():
+            try:
+                window = webview.create_window(
+                    "Merotec IA - Navegador Interno",
+                    url,
+                    width=1280,
+                    height=820,
+                    resizable=True,
+                )
+                self.internal_browser_window = window
+                start_kwargs = {"debug": False}
+                if sys.platform == "win32":
+                    start_kwargs["gui"] = "edgechromium"
+                webview.start(**start_kwargs)
+            except Exception as exc:
+                self.set_internal_browser_status(f"Falha no motor interno WebView: {exc}", "error")
+            finally:
+                with self.internal_browser_lock:
+                    self.internal_browser_window = None
+                    self.internal_browser_started = False
+
+        threading.Thread(target=run_browser, daemon=True).start()
+        return True, "janela criada"
 
     def _build_input_bar(self):
         self.input_frame = ctk.CTkFrame(self, fg_color=THEME["panel"], corner_radius=0)
@@ -1926,7 +1995,6 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
     def safe_chat_scroll_bottom(self):
         try:
             self.chat_history._parent_canvas.yview_moveto(1.0)
-            self._position_chat_background()
         except (RecursionError, tk.TclError):
             self.report_callback_exception(RecursionError, "scroll do chat excedeu limite", None)
 
@@ -2830,7 +2898,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             live_text = self.describe_live_ai_trace(self.ai_live_trace, chunk)
 
         if live_text:
-            self.log_agent(f"IA ao vivo: {live_text}")
+            self.log_agent(f"IA: {live_text}")
         self.update_ai_activity_from_stream(chunk)
 
     def finish_ai_live_trace(self, task_id=None):
@@ -2845,7 +2913,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             self.ai_live_trace_last_log_at = 0
             self.ai_live_trace_last_length = 0
         if had_trace:
-            self.log_agent(f"IA ao vivo finalizada em {elapsed}s; resposta recebida pela IDE.")
+            self.log_agent(f"IA finalizada em {elapsed}s; resposta recebida pela IDE.")
 
     def clean_live_ai_text(self, text, limit=260):
         cleaned = self.strip_agent_action_markup(text or "")
@@ -3461,20 +3529,35 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             self.add_chat_message("Merotec AI", local_task_reply)
             return
 
+        answer_only = self.is_answer_only_question(command, normalized)
         continuation_context = None
         task_objective = None
-        if self.should_continue_active_ai_task(command, normalized):
+        if not answer_only and self.should_continue_active_ai_task(command, normalized):
             task_objective = self.active_ai_objective
             continuation_context = self.build_active_task_continuation_context(command)
             self.add_chat_message("Sistema", "Continuando a missao anterior com memoria recente da IDE.")
 
         extra_context = continuation_context
+        if answer_only:
+            answer_context = (
+                "MODO RESPOSTA SOMENTE:\n"
+                "- O usuario fez uma pergunta ou perguntou sobre capacidade.\n"
+                "- Responda primeiro em texto claro, sem iniciar execucao, sem editar arquivos e sem emitir tags da IDE.\n"
+                "- Se a pergunta envolver uma acao possivel, explique o que voce consegue fazer e quais dados faltam para executar depois."
+            )
+            extra_context = f"{extra_context}\n\n{answer_context}" if extra_context else answer_context
         if self.is_project_analysis_request(normalized):
             project_context = self.build_project_analysis_context()
             extra_context = f"{extra_context}\n\n{project_context}" if extra_context else project_context
             self.add_chat_message("Sistema", "Preparando contexto inicial do projeto para a IA...")
 
-        self._run_ai_task(command, image_path=image_path, extra_context=extra_context, task_objective=task_objective)
+        self._run_ai_task(
+            command,
+            image_path=image_path,
+            extra_context=extra_context,
+            task_objective=task_objective,
+            answer_only=answer_only,
+        )
 
     def cancel_ai_task(self):
         self.cancelled_task_ids.add(self.current_task_id)
@@ -3924,7 +4007,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         return str(value)
 
-    def _run_ai_task(self, command, image_path=None, extra_context=None, task_objective=None, action_depth=0, task_id=None):
+    def _run_ai_task(self, command, image_path=None, extra_context=None, task_objective=None, action_depth=0, task_id=None, answer_only=False):
         def process():
             retry_available = False
             stream_started = False
@@ -3934,9 +4017,10 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             if not task_objective:
                 self.current_task_id += 1
                 current_task_id = self.current_task_id
-                self.active_ai_objective = command
-                self.ai_read_history = {}
-                self.ai_search_history = {}
+                if not answer_only:
+                    self.active_ai_objective = command
+                    self.ai_read_history = {}
+                    self.ai_search_history = {}
                 self.ai_task_metrics[current_task_id] = {
                     "read_rounds": 0,
                     "read_files": 0,
@@ -3985,7 +4069,8 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     "MODO CODEX DA IDE:\n"
                     "- Comporte-se como um agente de engenharia, nao como um assistente passivo.\n"
                     "- Use raciocinio altissimo: antes de responder, escolha o proximo passo que realmente muda, executa, valida ou conclui.\n"
-                    "- Para perguntas simples, responda direto.\n"
+                    "- Para perguntas simples ou perguntas de capacidade, responda direto antes de qualquer execucao.\n"
+                    "- Se o usuario perguntar se voce consegue/pode fazer algo, explique a capacidade e o que falta; nao execute comandos nem edite arquivos nessa rodada.\n"
                     "- Para analise/planejamento, entregue diagnostico completo em texto e nao execute/edite sem pedido claro.\n"
                     "- Para implementacao/correcao, avance ate uma mudanca aplicada e uma verificacao plausivel.\n"
                     "- Trabalhe de forma produtiva: responda com conclusao util, diagnostico objetivo ou acao real quando precisar mexer no projeto.\n"
@@ -4007,7 +4092,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     "Nunca use reticencias, 'comando', 'comando real', texto entre sinais de menor/maior ou qualquer texto demonstrativo como se fosse comando real. "
                     "Nunca copie literalmente 'comando concreto' nas tags [EXECUTE] ou [EXECUTE_ADMIN]; se ainda nao houver comando real, entregue uma conclusao em texto. "
                     "Para testar projeto HTML/Web, use [EXECUTE: python -m http.server 8000]; a IDE troca pelo Python real, escolhe porta livre e valida a URL. "
-                    "Para abrir uma pagina validada, use [OPEN_URL: http://127.0.0.1:porta/]. "
+                    "Para abrir uma pagina validada no navegador interno da IDE, use [OPEN_URL: http://127.0.0.1:porta/]. "
                     "Para validar visualmente um app/jogo como usuario, use [HUMAN_TEST: auto]; a IDE executa, abre, espera a tela, captura print e devolve a imagem para voce analisar. "
                     "Use [SCREENSHOT: tela] apenas quando a tela ja estiver aberta. "
                     "Depois de analisar o print, corrija com [REPLACE] ou [WRITE] e teste novamente ate funcionar. "
@@ -4018,6 +4103,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     "Nao peca o objetivo novamente enquanto houver uma missao ativa.\n\n"
                     f"Alteracoes recentes feitas pela IDE neste projeto:\n{self.format_recent_changes_for_agent(limit=8)}\n\n"
                     f"Conversa recente que deve ser preservada:\n{self.build_recent_ai_context_memory(limit=18)}\n\n"
+                    f"{self.build_smart_task_brief(command, objective=objective)}\n\n"
                     f"Arquivos do workspace:\n{self.get_workspace_tree(limit=220)}"
                 )
                 local_training_context = self.build_local_training_context(objective or command)
@@ -4062,6 +4148,10 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                         "task_id": current_task_id,
                     }
                     retry_available = True
+                if answer_only:
+                    cleaned_answer = self.strip_agent_action_markup(self.last_response or "").strip()
+                    if cleaned_answer:
+                        self.last_response = cleaned_answer
                 direct_changes, direct_change_total = self.detect_direct_workspace_changes(direct_snapshot)
                 direct_action_happened = direct_change_total > 0
                 if direct_action_happened:
@@ -4119,13 +4209,14 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     retry_available = True
                 else:
                     self.last_failed_ai_task = None
-                self.parse_and_execute_agent_actions(
-                    self.last_response,
-                    task_objective=objective,
-                    action_depth=action_depth,
-                    task_id=current_task_id,
-                    direct_action_happened=direct_action_happened,
-                )
+                if not answer_only:
+                    self.parse_and_execute_agent_actions(
+                        self.last_response,
+                        task_objective=objective,
+                        action_depth=action_depth,
+                        task_id=current_task_id,
+                        direct_action_happened=direct_action_happened,
+                    )
                 if getattr(self.engine, "provider", "") == "codex":
                     self.load_workspace_files()
             except Exception as exc:

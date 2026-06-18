@@ -12,6 +12,7 @@ THEME = {
     "button_shadow": "#02040a",
     "border": "#243653",
     "border_lift": "#2fbbff",
+    "nav_button_border": "#39fffa",
     "text": "#b9c8d8",
     "muted": "#70839e",
     "button_text": "#c2cfdd",

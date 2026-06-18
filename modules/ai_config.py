@@ -254,16 +254,18 @@ class AiConfigMixin:
 
             api_key = self.prompt_value(
                 "Chave Google",
-                "Cole a GOOGLE_API_KEY. Ela fica apenas nesta sessao do app.",
+                "Cole a GOOGLE_API_KEY. Ela será salva para sessões futuras.",
                 secret=True,
             )
             if api_key:
                 os.environ["GOOGLE_API_KEY"] = api_key
+                self.settings["google_api_key"] = api_key  # Salva no arquivo de configurações
 
             self.settings.update(
                 {
                     "ai_provider": "google",
                     "google_model_name": os.getenv("GOOGLE_MODEL_NAME", self.engine.model_id),
+                    "google_api_key": api_key if api_key else self.settings.get("google_api_key", ""),
                 }
             )
             self._save_settings()
@@ -283,17 +285,19 @@ class AiConfigMixin:
 
         api_key = self.prompt_value(
             "Chave OpenAI",
-            "Cole a OPENAI_API_KEY. Ela fica apenas nesta sessao do app.",
+            "Cole a OPENAI_API_KEY. Ela será salva para sessões futuras.",
             secret=True,
         )
         if api_key:
             os.environ["OPENAI_API_KEY"] = api_key
+            self.settings["openai_api_key"] = api_key  # Salva no arquivo de configurações
 
         os.environ["AI_PROVIDER"] = "openai"
         self.settings.update(
             {
                 "ai_provider": "openai",
                 "openai_model_name": os.getenv("OPENAI_MODEL_NAME", self.engine.model_id),
+                "openai_api_key": api_key if api_key else self.settings.get("openai_api_key", ""),
             }
         )
         self._save_settings()

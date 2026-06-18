@@ -5,14 +5,14 @@ color 02
 cls
 
 echo =======================================================
-echo          MEROTEC IA
+echo                      MEROTEC IA
 echo =======================================================
 echo [SISTEMA] Iniciando processos locais...
 
-:: Navega ate o diretorio do projeto, troque pelo seu diretorio atual
+:: Navega ate o diretorio do projeto
 cd /d "C:\Users\Merotec\Desktop\AI_Software_Enginering"
 
-:: 2. Ativa o ambiente virtual e inicia a IDE
+:: Ativa o ambiente virtual e inicia a IDE
 if not exist venv (
     color 0C
     echo [ERRO] Ambiente venv nao encontrado em: %cd%
@@ -26,19 +26,14 @@ if not exist venv (
 echo [VENV] Ativando ambiente virtual...
 call venv\Scripts\activate
 echo [VENV] ambiente virtual ativado!
+
 set "TCL_LIBRARY=%LOCALAPPDATA%\Programs\Python\Python314\tcl\tcl8.6"
 set "TK_LIBRARY=%LOCALAPPDATA%\Programs\Python\Python314\tcl\tk8.6"
-if "%AI_PROVIDER%"=="" set "AI_PROVIDER=codex"
-echo [IA] motor principal: %AI_PROVIDER%
-echo [IA] O Codex usa a conta ja logada no Windows.
+
+echo [SISTEMA] Carregando configuracoes automáticas do painel...
 echo.
 echo ********************************************************
 echo.
-echo [SISTEMA] executando sistema...
-:: Inicia o script principal
-echo.
+echo [SISTEMA] Abrindo a interface grafica da IDE...
 python main.py
-echo [SISTEMA] sistema de gerenciamento interrompido!
-
-:: Encerra a interface atual apos o sistema finalizar
-exit
+pause

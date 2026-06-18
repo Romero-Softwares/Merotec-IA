@@ -1706,9 +1706,15 @@ class AgentActionsMixin:
         if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
             url = "http://" + url
         try:
-            webbrowser.open(url, new=1)
-            self.log_agent(f"URL aberta pela IA: {url}")
-            self.add_chat_message("Merotec AI", f"Abri a pagina para validacao visual: {url}")
+            opener = getattr(self, "open_internal_browser", None)
+            opened_url = opener(url, source="IA") if callable(opener) else ""
+            if not opened_url:
+                webbrowser.open(url, new=1)
+                opened_url = url
+                self.add_chat_message("Merotec AI", f"Abri a pagina no navegador externo: {opened_url}")
+            else:
+                self.add_chat_message("Merotec AI", f"Abri a pagina no navegador interno da IDE: {opened_url}")
+            self.log_agent(f"URL aberta pela IA: {opened_url}")
         except Exception as exc:
             self.add_chat_message("Erro", f"Nao consegui abrir a URL: {exc}")
 
