@@ -236,7 +236,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.voice_keyword_capture_active = False
         self.voice_keyword_start = "merotec"
         self.voice_keyword_end = "ok"
-        self.voice_keyword_listener_enabled = True
+        self.voice_keyword_listener_enabled = bool(self.settings.get("voice_keyword_listener_enabled", False))
         self.terminal_progress_active = False
         self.terminal_work_count = 0
         self.terminal_work_lock = threading.Lock()
@@ -418,7 +418,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         ai_menu.add_command(label="Enviar missão ao Chat Web", command=self.send_mission_to_web_chat)
         ai_menu.add_command(label="Importar resposta do Chat Web", command=self.import_web_chat_response)
         ai_menu.add_separator()
-        ai_menu.add_command(label="Configurar IA...", command=self.configure_ai)
+        ai_menu.add_command(label="Configurações...", command=self.configure_ai)
         self.menu.add_cascade(label="IA", menu=ai_menu)
 
         self.visual_menus = [file_menu, view_menu, editor_menu, ai_menu]
@@ -615,7 +615,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.ai_status_label.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 12))
 
         buttons = [
-            ("Configurar IA", self.configure_ai),
+            ("Configurações", self.configure_ai),
             ("Entrar Codex", self.launch_codex_login),
             ("Atualizar Explorer", self.load_workspace_files),
             ("Comando por Voz", self.voice_command),
@@ -4354,6 +4354,22 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         if self.agent_busy:
             return
         self.start_voice_capture()
+
+    def apply_voice_keyword_listener_setting(self):
+        enabled = bool(self.settings.get("voice_keyword_listener_enabled", False))
+        self.voice_keyword_listener_enabled = enabled
+        if not enabled:
+            try:
+                self.voice.stop_keyword_listener()
+            except Exception:
+                pass
+            self.voice_keyword_capture_active = False
+            if not self.voice_capture_active:
+                self.set_voice_button_text("Comando por Voz")
+            self.set_status("Escuta automatica do microfone desativada.", "ready")
+            return
+        if not self.voice_capture_active:
+            self.after(200, self.start_voice_keyword_listener)
 
     def set_voice_button_text(self, text, active=False):
         def update():

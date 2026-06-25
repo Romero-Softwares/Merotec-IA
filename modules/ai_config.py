@@ -7,7 +7,7 @@ from tkinter import StringVar, filedialog
 
 import customtkinter as ctk
 
-from modules.app_constants import IGNORED_DIRS, IGNORED_SUFFIXES, PROJECT_ROOT
+from modules.app_constants import DEFAULT_APP_SETTINGS, IGNORED_DIRS, IGNORED_SUFFIXES, PROJECT_ROOT
 from modules.ai_profiles import (
     PROVIDER_LABELS,
     PROVIDER_ORDER,
@@ -295,8 +295,8 @@ class AiConfigMixin:
         )
         drafts = {provider: profile_for(self.settings, provider) for provider in PROVIDER_ORDER}
         dialog = ctk.CTkToplevel(self)
-        dialog.title("Configurar IA e Chat Web")
-        dialog.geometry("720x690")
+        dialog.title("Configurações")
+        dialog.geometry("720x740")
         dialog.minsize(620, 560)
         dialog.transient(self)
         dialog.grab_set()
@@ -306,7 +306,7 @@ class AiConfigMixin:
 
         ctk.CTkLabel(
             dialog,
-            text="Perfil ativo de IA",
+            text="Configurações",
             text_color=CONFIG_UI["text"],
             font=("Segoe UI", 18, "bold"),
         ).grid(row=0, column=0, sticky="w", padx=20, pady=(20, 2))
@@ -350,6 +350,7 @@ class AiConfigMixin:
         body.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 10))
         body.grid_columnconfigure(1, weight=1)
         current = {"provider": selected, "widgets": {}, "types": {}}
+        system_options = {}
 
         def title_for(provider):
             lines = {
@@ -401,7 +402,59 @@ class AiConfigMixin:
                 justify="left",
             ).grid(row=0, column=0, columnspan=2, sticky="ew", padx=4, pady=(8, 14))
 
-            row = 1
+            system_frame = ctk.CTkFrame(
+                body,
+                fg_color=CONFIG_UI["bg"],
+                border_color=CONFIG_UI["border"],
+                border_width=1,
+                corner_radius=8,
+            )
+            system_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=4, pady=(0, 14))
+            system_frame.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(
+                system_frame,
+                text="Sistema",
+                text_color=CONFIG_UI["accent"],
+                font=("Segoe UI", 13, "bold"),
+            ).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(10, 2))
+            ctk.CTkLabel(
+                system_frame,
+                text="Escuta automatica do microfone",
+                text_color=CONFIG_UI["label"],
+                font=("Segoe UI", 12),
+                wraplength=240,
+                justify="left",
+            ).grid(row=1, column=0, sticky="w", padx=(12, 10), pady=(6, 10))
+            voice_switch = ctk.CTkSwitch(
+                system_frame,
+                text="Ativado",
+                onvalue=True,
+                offvalue=False,
+                fg_color=CONFIG_UI["field"],
+                progress_color=CONFIG_UI["accent"],
+                button_color=CONFIG_UI["text"],
+                button_hover_color="#FFFFFF",
+                text_color=CONFIG_UI["text"],
+            )
+            if bool(self.settings.get("voice_keyword_listener_enabled", DEFAULT_APP_SETTINGS["voice_keyword_listener_enabled"])):
+                voice_switch.select()
+            else:
+                voice_switch.deselect()
+            voice_switch.grid(row=1, column=1, sticky="w", padx=4, pady=(6, 10))
+            ctk.CTkLabel(
+                system_frame,
+                text=(
+                    "Desligue para economizar memoria e evitar manter o microfone ativo. "
+                    "Quando quiser usar comando por palavra-chave, habilite novamente aqui."
+                ),
+                text_color=CONFIG_UI["muted"],
+                font=("Segoe UI", 11),
+                wraplength=600,
+                justify="left",
+            ).grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
+            system_options["voice_keyword_listener_enabled"] = voice_switch
+
+            row = 2
             for key, label, kind in self._ai_profile_fields(provider):
                 ctk.CTkLabel(
                     body,
@@ -525,6 +578,9 @@ class AiConfigMixin:
             try:
                 collect_current()
                 active = current["provider"]
+                self.settings["voice_keyword_listener_enabled"] = bool(
+                    system_options["voice_keyword_listener_enabled"].get()
+                )
                 for provider in PROVIDER_ORDER:
                     update_profile(
                         self.settings,
@@ -555,6 +611,9 @@ class AiConfigMixin:
                 )
                 if active == "codex":
                     self.ensure_codex_ready()
+                apply_voice_setting = getattr(self, "apply_voice_keyword_listener_setting", None)
+                if callable(apply_voice_setting):
+                    apply_voice_setting()
                 if active == "web_chat":
                     target = ""
                     session_fn = getattr(self, "activate_workspace_web_chat_session", None)

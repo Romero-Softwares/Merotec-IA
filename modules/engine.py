@@ -335,7 +335,7 @@ class UniversalEngine:
                 return ""
             path = self.resolve_local_gguf_path()
             if not path:
-                return "Modelo local GGUF nao configurado. Abra Configurar IA e selecione um arquivo .gguf."
+                return "Modelo local GGUF nao configurado. Abra Configurações e selecione um arquivo .gguf."
             if not path.exists():
                 return f"Modelo local GGUF nao encontrado: {path}"
             if path.suffix.lower() != ".gguf":
@@ -1280,7 +1280,7 @@ Regras essenciais:
     def validate_local_gguf_for_generation(self):
         path = self.resolve_local_gguf_path()
         if not path:
-            return "Modelo local GGUF nao configurado. Abra Configurar IA e selecione um arquivo .gguf."
+            return "Modelo local GGUF nao configurado. Abra Configurações e selecione um arquivo .gguf."
         if not path.exists():
             return f"Modelo local GGUF nao encontrado: {path}"
         if path.suffix.lower() != ".gguf":
@@ -1299,7 +1299,7 @@ Regras essenciais:
             )
         path = self.resolve_local_gguf_path()
         if not path:
-            return "Modelo local GGUF nao configurado. Abra Configurar IA e selecione um arquivo .gguf."
+            return "Modelo local GGUF nao configurado. Abra Configurações e selecione um arquivo .gguf."
         lock = self._ensure_local_gguf_lock()
         with lock:
             return self._run_local_gguf_completion_worker(path, user_text, max_output_tokens)
@@ -1543,7 +1543,7 @@ for line in sys.stdin:
             )
         path = self.resolve_local_gguf_path()
         if not path:
-            return "Modelo local GGUF nao configurado. Abra Configurar IA e selecione um arquivo .gguf."
+            return "Modelo local GGUF nao configurado. Abra Configurações e selecione um arquivo .gguf."
         payload = {
             "model_path": str(path),
             "n_ctx": self.local_gguf_n_ctx,
@@ -2827,7 +2827,7 @@ except Exception as exc:
     def _generate_openai_solution(self, prompt, image_path=None, code_context=None):
         if not self.openai_api_key:
             return (
-                "Para usar GPT na IDE, abra Configurar IA e cole uma OPENAI_API_KEY. "
+                "Para usar GPT na IDE, abra Configurações e cole uma OPENAI_API_KEY. "
                 "Login no ChatGPT/Codex nao pode ser usado diretamente como chave de API."
             )
 
@@ -2845,7 +2845,7 @@ except Exception as exc:
                 endpoint = f"{base_url}/chat/completions"
                 current_model = str(self.openai_model_name or self.model_id or "").strip()
                 if not current_model:
-                    return "Configure o ID exato do modelo OpenRouter em Configurar IA."
+                    return "Configure o ID exato do modelo OpenRouter em Configurações."
                     
                 payload = {
                     "model": current_model,
@@ -2907,7 +2907,7 @@ except Exception as exc:
         _analysis_continuation=False,
     ):
         if not self.lm_studio_model_name:
-            return "LM Studio sem modelo configurado. Abra Configurar IA e selecione lm_studio."
+            return "LM Studio sem modelo configurado. Abra Configurações e selecione lm_studio."
 
         direct_action = self._lm_studio_direct_protocol_action(prompt)
         if direct_action:
@@ -3472,7 +3472,7 @@ UniversalEngine.cancel_generation = _merotec_chat_cancel_generation
 
 
 # MEROTEC_CONFIGURED_PROVIDER_LOCK_V1
-# A missão deve usar exclusivamente o provedor selecionado em Configurar IA.
+# A missão deve usar exclusivamente o provedor selecionado em Configurações.
 # Fallbacks automáticos só devem existir quando o usuário os habilitar
 # explicitamente em uma versão futura da interface.
 

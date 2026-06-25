@@ -66,12 +66,13 @@ DEFAULT_APP_SETTINGS = {
     "web_chat_include_project_context": True,
     "web_chat_auto_apply_imported_actions": True,
     "web_chat_fallback_enabled": False,
+    "voice_keyword_listener_enabled": False,
 }
 
 SCRATCHPAD_DEFAULT_TEXT = """# Como configurar um modelo de IA nesta IDE
 #
 # Perfis de IA:
-# - Abra Configurar IA e escolha no seletor o perfil ativo.
+# - Abra Configurações e escolha no seletor o perfil ativo.
 # - Cada perfil mantém suas próprias chaves, modelo, URL e limites.
 # - Chat Web aceita qualquer URL HTTP(S), por exemplo https://gemini.google.com/.
 # - A conversa Web é restaurada por projeto; a IDE não cria Nova conversa ao reenviar tarefas.
@@ -86,7 +87,7 @@ SCRATCHPAD_DEFAULT_TEXT = """# Como configurar um modelo de IA nesta IDE
 #
 # Opcao LM Studio (modelo servido localmente):
 # 1. Inicie o servidor local no LM Studio.
-# 2. Abra Configurar IA e escolha lm_studio.
+# 2. Abra Configurações e escolha lm_studio.
 # 3. A IDE detecta os modelos em http://127.0.0.1:1234/v1.
 #
 # Opcao Google:
