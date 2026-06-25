@@ -281,6 +281,34 @@ class AdminExecutionGuardsTest(unittest.TestCase):
 
         self.assertEqual([("EXECUTE_ADMIN", "net stop spooler")], self.app.executed_commands)
 
+    def test_successful_write_requeues_model_for_validation(self):
+        self.app._agent_write = lambda *args, **kwargs: True
+
+        self.app.parse_and_execute_agent_actions(
+            "[WRITE: app.py]print('ok')\n[/WRITE]",
+            task_objective="corrigir e validar o app",
+            action_depth=1,
+            task_id="write-cycle",
+        )
+
+        self.assertEqual(1, len(self.app.queued_ai_tasks))
+        command, kwargs = self.app.queued_ai_tasks[0]
+        self.assertIn("Valide o projeto", command)
+        self.assertEqual(2, kwargs["action_depth"])
+        self.assertIn("app.py", kwargs["extra_context"])
+
+    def test_write_with_execute_does_not_create_duplicate_continuation(self):
+        self.app._agent_write = lambda *args, **kwargs: True
+
+        self.app.parse_and_execute_agent_actions(
+            "[WRITE: app.py]print('ok')\n[/WRITE]\n[EXECUTE: python app.py]",
+            task_objective="corrigir e validar o app",
+            task_id="write-execute-cycle",
+        )
+
+        self.assertEqual([("EXECUTE", "python app.py")], self.app.executed_commands)
+        self.assertEqual([], self.app.queued_ai_tasks)
+
     def test_adjacent_human_test_tags_execute_visual_validation_once(self):
         self.app.parse_and_execute_agent_actions(
             "[HUMAN_TEST: auto][HUMAN_TEST: auto]",
@@ -348,6 +376,68 @@ class AdminExecutionGuardsTest(unittest.TestCase):
         self.assertTrue(
             any("navegador interno da IDE" in message for _sender, message in self.app.messages)
         )
+
+    def test_browser_inspect_returns_dom_context_to_ai(self):
+        self.app.internal_browser_url = "http://127.0.0.1:8000/form"
+
+        def request(action, payload=None, callback=None):
+            self.assertEqual("inspect", action)
+            callback(
+                {
+                    "result": {
+                        "url": self.app.internal_browser_url,
+                        "title": "Formulario",
+                        "text": "Criar projeto",
+                        "elements": [
+                            {"ref": "e1", "tag": "input", "label": "Nome"},
+                            {"ref": "e2", "tag": "button", "label": "Criar"},
+                        ],
+                    }
+                }
+            )
+            return "browser-test"
+
+        self.app.request_internal_browser_action = request
+        self.app.parse_and_execute_agent_actions(
+            "[BROWSER_INSPECT: pagina]",
+            task_objective="testar formulario local",
+            task_id="browser-inspect",
+        )
+
+        self.assertEqual(1, len(self.app.queued_ai_tasks))
+        context = self.app.queued_ai_tasks[0][1]["extra_context"]
+        self.assertIn("Criar projeto", context)
+        self.assertIn("e1: <input> Nome", context)
+        self.assertIn("e2: <button> Criar", context)
+
+    def test_browser_type_parses_target_and_value(self):
+        self.app.internal_browser_url = "http://localhost:3000"
+        requests = []
+
+        def request(action, payload=None, callback=None):
+            requests.append((action, payload))
+            return "browser-type"
+
+        self.app.request_internal_browser_action = request
+        self.app.parse_and_execute_agent_actions(
+            "[BROWSER_TYPE: e4 | Meu novo projeto]",
+            task_objective="preencher formulario local",
+            task_id="browser-type",
+        )
+
+        self.assertEqual([("type", {"target": "e4", "value": "Meu novo projeto"})], requests)
+
+    def test_unrestricted_mode_autoapproves_common_remote_browser_actions(self):
+        self.app.settings = {"autonomous_unrestricted_mode": True}
+        self.app.internal_browser_url = "https://chatgpt.com/"
+        self.app.browser_element_catalog = {
+            "e7": {"tag": "input", "type": "text", "label": "Nome do projeto"},
+            "e8": {"tag": "button", "label": "Criar projeto"},
+        }
+
+        self.assertTrue(self.app._approve_remote_browser_action("type", "e7", "Teste autonomo"))
+        self.assertTrue(self.app._approve_remote_browser_action("click", "e8"))
+        self.assertTrue(any("autoaprovada" in entry for entry in self.app.logs))
 
     def test_inline_action_examples_are_not_executed(self):
         self.app.parse_and_execute_agent_actions(
@@ -554,6 +644,11 @@ class AdminExecutionGuardsTest(unittest.TestCase):
                 self.app.active_ai_objective,
             )
         )
+
+    def test_visual_test_request_is_not_reduced_to_plain_project_run(self):
+        normalized = self.app.normalize_plain_text("execute testes visuais do projeto")
+
+        self.assertFalse(self.app.is_project_run_request(normalized))
 
     def test_codex_app_server_placeholder_approval_is_rejected(self):
         app = DummyCodexApprovalApp()

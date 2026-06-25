@@ -7,6 +7,8 @@ pyttsx3==2.99
 scipy==1.17.1
 sounddevice==0.5.5
 SpeechRecognition==3.16.1
+llama-cpp-python
+openai
 
 # Compatibilidade de voz/audio no Windows e em Python 3.13+
 audioop-lts==0.2.2; python_version >= "3.13"

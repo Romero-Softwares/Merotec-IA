@@ -12,6 +12,7 @@ import queue
 import time
 import textwrap
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 import builtins
@@ -106,11 +107,13 @@ from modules.agent_actions import AgentActionsMixin
 from modules.app_state import AppStateMixin
 from modules.engine import UniversalEngine
 from modules.executor import CodeExecutor
+from modules.editor_intelligence import completion_items, extract_symbols, word_prefix
 from modules.memory import MemorySubnet
 from modules.project_manager import ProjectManager
 from modules.ui_theme import THEME
 from modules.workspace_intelligence import WorkspaceIntelligenceMixin
 from modules.voice import VoiceModule
+from modules.ui_web_chat_bridge import InternalBrowserWebChatBridge
 
 
 BASE_MAIN_WINDOW_TITLE = f"{APP_NAME} - IA Engineering Workspace"
@@ -256,11 +259,17 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.editor_symbol_cache_signature = None
         self.internal_browser_url = "about:blank"
         self.internal_browser_window = None
+        self.internal_browser_process = None
+        self.internal_browser_reader_thread = None
+        self.internal_browser_requests = {}
+        self.browser_element_catalog = {}
+        self.internal_browser_ready_event = threading.Event()
         self.internal_browser_started = False
         self.internal_browser_backend = ""
         self.internal_browser_lock = threading.Lock()
 
         self.engine = UniversalEngine()
+        self.attach_internal_web_chat_bridge()
         self.voice = VoiceModule()
         self.pm = ProjectManager(str(PROJECTS_DIR))
         self.executor = CodeExecutor()
@@ -275,6 +284,47 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.after(450, self.show_local_subnet_status)
         self.after(900, self.ensure_codex_ready)
         self.after(1400, self.start_voice_keyword_listener)
+
+    def attach_internal_web_chat_bridge(self):
+        """Liga o motor Chat Web ao mesmo WebView2 da janela principal.
+
+        Isso impede que uma tarefa abra outra janela de chat e preserva a
+        conversa correta quando o projeto muda.
+        """
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return None
+        profile = dict(getattr(engine, "web_chat_profile", {}) or {})
+        profile.update({
+            "web_chat_url": getattr(engine, "web_chat_url", profile.get("web_chat_url", "https://chatgpt.com/")),
+            "web_chat_timeout_seconds": getattr(engine, "web_chat_timeout_seconds", profile.get("web_chat_timeout_seconds", 300)),
+            "web_chat_message_chars": getattr(engine, "web_chat_message_chars", profile.get("web_chat_message_chars", 28000)),
+            "web_chat_auto_attach_media": getattr(engine, "web_chat_auto_attach_media", profile.get("web_chat_auto_attach_media", True)),
+        })
+        engine.web_chat_bridge = InternalBrowserWebChatBridge(self, profile)
+        return engine.web_chat_bridge
+
+    def _is_configured_web_chat_url(self, url):
+        """Retorna True apenas para a origem do Chat Web configurado.
+
+        Páginas locais e navegação comum não devem substituir a conversa
+        associada ao projeto.
+        """
+        try:
+            configured = self.web_chat_target_for_workspace(self.current_workspace)
+            source_host = (urllib.parse.urlparse(configured).hostname or "").lower()
+            target_host = (urllib.parse.urlparse(str(url or "")).hostname or "").lower()
+            return bool(source_host and target_host and source_host == target_host)
+        except Exception:
+            return False
+
+    def _remember_web_chat_navigation_if_needed(self, url, title=""):
+        if not self._is_configured_web_chat_url(url):
+            return
+        try:
+            self.remember_internal_browser_chat_url(url, title)
+        except Exception as exc:
+            self.log_agent(f"Não consegui salvar a sessão do Chat Web: {exc}")
 
     def _available_screen_area(self):
         if sys.platform == "win32":
@@ -305,6 +355,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.geometry(f"{width}x{height}+{x}+{y}")
         self.minsize(min(1050, max(900, work_width - 80)), min(620, max(560, work_height - 80)))
         self.after(0, self._maximize_initial_window)
+        self.after(180, self._bring_initial_window_to_front)
 
     def _maximize_initial_window(self):
         try:
@@ -320,12 +371,27 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         left, top, work_width, work_height = self._available_screen_area()
         self.geometry(f"{work_width}x{work_height}+{left}+{top}")
 
+    def _bring_initial_window_to_front(self):
+        try:
+            self.lift()
+            self.focus_force()
+        except tk.TclError:
+            pass
+        if sys.platform == "win32":
+            try:
+                self.attributes("-topmost", True)
+                self.after(650, lambda: self.attributes("-topmost", False))
+            except tk.TclError:
+                pass
+
     def _build_menu(self):
         self._configure_native_menu_style()
         self.menu = self._native_menu()
 
         file_menu = self._native_menu()
+        file_menu.add_command(label="Novo projeto...", accelerator="Ctrl+Shift+N", command=self.create_new_project)
         file_menu.add_command(label="Abrir projeto/pasta...", command=self.open_project)
+        file_menu.add_command(label="Abrir arquivo externo...", accelerator="Ctrl+O", command=self.open_external_file)
         self.recent_menu = self._native_menu()
         file_menu.add_cascade(label="Projetos recentes", menu=self.recent_menu)
         file_menu.add_separator()
@@ -348,7 +414,14 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         editor_menu.add_command(label="Buscar classe/metodo", accelerator="Ctrl+Shift+O", command=self.show_symbol_palette)
         self.menu.add_cascade(label="Editor", menu=editor_menu)
 
-        self.visual_menus = [file_menu, view_menu, editor_menu]
+        ai_menu = self._native_menu()
+        ai_menu.add_command(label="Enviar missão ao Chat Web", command=self.send_mission_to_web_chat)
+        ai_menu.add_command(label="Importar resposta do Chat Web", command=self.import_web_chat_response)
+        ai_menu.add_separator()
+        ai_menu.add_command(label="Configurar IA...", command=self.configure_ai)
+        self.menu.add_cascade(label="IA", menu=ai_menu)
+
+        self.visual_menus = [file_menu, view_menu, editor_menu, ai_menu]
 
         self.update_recent_menu()
         self._build_visual_menu_bar()
@@ -363,12 +436,13 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             corner_radius=0,
         )
         self.visual_menu_bar.grid(row=0, column=0, columnspan=3, sticky="ew")
-        self.visual_menu_bar.grid_columnconfigure(3, weight=1)
+        self.visual_menu_bar.grid_columnconfigure(4, weight=1)
 
         menu_items = [
             ("Arquivo", 0),
             ("Visualizar", 1),
             ("Editor", 2),
+            ("IA", 3),
         ]
         for label, index in menu_items:
             button = ctk.CTkButton(
@@ -393,7 +467,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             text_color=THEME["muted"],
             font=("Segoe UI", 10),
             height=18,
-        ).grid(row=0, column=3, sticky="e", padx=(8, 14), pady=(4, 5))
+        ).grid(row=0, column=4, sticky="e", padx=(8, 14), pady=(4, 5))
 
     def _show_visual_menu(self, index, widget=None):
         menus = getattr(self, "visual_menus", [])
@@ -972,11 +1046,91 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             return "break"
 
         editor = info["widget"]
-        self.set_status("A carregar sugestões de código...", "ready")
+        try:
+            text = editor.get("1.0", "end-1c")
+            cursor_offset = len(editor.get("1.0", "insert"))
+        except tk.TclError:
+            return "break"
+        suggestions = completion_items(text, info.get("path"), cursor_offset)
+        if not suggestions:
+            self._hide_editor_completion()
+            self.set_status("Nenhuma sugestão para o contexto atual.", "warning")
+            return "break"
 
-        # TODO: Implementar a lógica que preenche as sugestões baseadas no contexto
-        # Exemplo temporário para testar se o menu funciona sem falhar:
-        print("Atalho de sugestões de código acionado com sucesso!")
+        self._hide_editor_completion()
+        popup = tk.Toplevel(self)
+        popup.overrideredirect(True)
+        popup.configure(bg=THEME["border"])
+        popup.attributes("-topmost", True)
+        listbox = tk.Listbox(
+            popup,
+            height=min(10, len(suggestions)),
+            width=34,
+            activestyle="none",
+            bg=THEME["panel_alt"],
+            fg=THEME["text"],
+            selectbackground=THEME["accent_dark"],
+            selectforeground="#ffffff",
+            borderwidth=1,
+            relief="solid",
+            font=("Consolas", 11),
+        )
+        listbox.pack(fill="both", expand=True)
+        for suggestion in suggestions:
+            listbox.insert("end", suggestion)
+        listbox.selection_set(0)
+        listbox._editor = editor
+        listbox._prefix = word_prefix(text, cursor_offset)
+        listbox.bind("<Return>", lambda _event: self._accept_editor_completion(listbox))
+        listbox.bind("<Double-Button-1>", lambda _event: self._accept_editor_completion(listbox))
+        listbox.bind("<Escape>", lambda _event: self._hide_editor_completion(force=True))
+        try:
+            bbox = editor.bbox("insert") or (0, 0, 0, 20)
+            x = editor.winfo_rootx() + bbox[0]
+            y = editor.winfo_rooty() + bbox[1] + bbox[3] + 4
+            popup.geometry(f"+{x}+{y}")
+        except tk.TclError:
+            pass
+        self.editor_completion_popup = popup
+        self.set_status(f"{len(suggestions)} sugestão(ões) locais.", "ready")
+        listbox.focus_set()
+        return "break"
+
+    def _accept_editor_completion(self, listbox):
+        selection = listbox.curselection()
+        if not selection:
+            return "break"
+        value = listbox.get(selection[0])
+        editor = listbox._editor
+        prefix = listbox._prefix
+        try:
+            if prefix:
+                editor.delete(f"insert-{len(prefix)}c", "insert")
+            editor.insert("insert", value)
+            editor.focus_set()
+            tab_name, _info = self._current_editor_info()
+            if tab_name:
+                self._schedule_editor_content_changed(tab_name, delay=20)
+        except tk.TclError:
+            pass
+        self._hide_editor_completion()
+        return "break"
+
+    def _hide_editor_completion(self, force=False):
+        popup = getattr(self, "editor_completion_popup", None)
+        if popup is not None and not force:
+            try:
+                focused = self.focus_get()
+                if focused is not None and focused.winfo_toplevel() == popup:
+                    return "break"
+            except tk.TclError:
+                pass
+        self.editor_completion_popup = None
+        if popup is not None:
+            try:
+                popup.destroy()
+            except tk.TclError:
+                pass
         return "break"
 
     def show_symbol_palette(self, event=None):
@@ -985,10 +1139,67 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         if not info:
             return "break"
 
-        self.set_status("Abrindo busca de símbolos...", "ready")
+        editor = info["widget"]
+        try:
+            symbols = extract_symbols(editor.get("1.0", "end-1c"), info.get("path"))
+        except tk.TclError:
+            return "break"
+        if not symbols:
+            self.set_status("Nenhum símbolo encontrado no arquivo atual.", "warning")
+            return "break"
 
-        # TODO: Implementar a lógica da paleta de símbolos (parsing de classes/funções)
-        print("Atalho de busca de classe/método (Ctrl+Shift+O) acionado com sucesso!")
+        dialog = tk.Toplevel(self)
+        dialog.title(f"Símbolos — {tab_name}")
+        dialog.transient(self)
+        dialog.configure(bg=THEME["panel"])
+        dialog.geometry("560x420")
+        entry = tk.Entry(
+            dialog, bg=THEME["panel_alt"], fg=THEME["text"],
+            insertbackground=THEME["accent"], font=("Segoe UI", 12),
+        )
+        entry.pack(fill="x", padx=12, pady=(12, 8), ipady=6)
+        listbox = tk.Listbox(
+            dialog, bg=THEME["panel_alt"], fg=THEME["text"],
+            selectbackground=THEME["accent_dark"], selectforeground="#fff",
+            font=("Consolas", 11), activestyle="none",
+        )
+        listbox.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        visible = []
+
+        def refresh(_event=None):
+            query = entry.get().strip().lower()
+            visible[:] = [symbol for symbol in symbols if query in symbol.name.lower() or query in symbol.kind.lower()]
+            listbox.delete(0, "end")
+            for symbol in visible:
+                listbox.insert("end", f"{symbol.kind:<10} {symbol.name}{symbol.detail}  · linha {symbol.line}")
+            if visible:
+                listbox.selection_set(0)
+
+        def navigate(_event=None):
+            selection = listbox.curselection()
+            if not selection:
+                return "break"
+            symbol = visible[selection[0]]
+            try:
+                editor.mark_set("insert", f"{symbol.line}.0")
+                editor.see(f"{symbol.line}.0")
+                editor.focus_set()
+                self.update_editor_markers(tab_name)
+            except tk.TclError:
+                pass
+            dialog.destroy()
+            self.set_status(f"{symbol.kind.title()} {symbol.name} — linha {symbol.line}.", "ready")
+            return "break"
+
+        entry.bind("<KeyRelease>", refresh)
+        entry.bind("<Return>", navigate)
+        entry.bind("<Down>", lambda _event: (listbox.focus_set(), "break")[1])
+        listbox.bind("<Return>", navigate)
+        listbox.bind("<Double-Button-1>", navigate)
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        refresh()
+        entry.focus_set()
+        self.set_status(f"{len(symbols)} símbolo(s) encontrado(s).", "ready")
         return "break"
 
     def show_editor_find_bar(self, event=None):
@@ -1349,6 +1560,16 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             fg_color=THEME["border"],
         )
         self.terminal_activity_bar.grid(row=1, column=0, sticky="ew", padx=8, pady=(3, 6))
+        self.terminal_cancel_button = self._elevated_button(
+            self.terminal_activity_frame,
+            text="Cancelar terminal",
+            width=136,
+            height=28,
+            command=self.cancel_terminal_command,
+            fg_color=THEME["danger"],
+            hover_color="#b83737",
+        )
+        self.terminal_cancel_button.elevation_shadow.grid(row=0, column=1, rowspan=2, sticky="e", padx=8, pady=6)
         self.terminal_activity_frame.grid_remove()
 
         self.local_term_in = ctk.CTkEntry(
@@ -1398,14 +1619,20 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.browser_url_entry.grid(row=0, column=0, sticky="ew", padx=(8, 6), pady=8)
         self.browser_url_entry.bind("<Return>", self.browse_internal_url_from_entry)
 
-        go_button = self._elevated_button(toolbar, text="Ir", width=64, height=30, command=self.browse_internal_url_from_entry)
-        go_button.elevation_shadow.grid(row=0, column=1, padx=4, pady=8)
+        back_button = self._elevated_button(toolbar, text="Voltar", width=70, height=30, command=self.browser_go_back)
+        back_button.elevation_shadow.grid(row=0, column=1, padx=4, pady=8)
+
+        forward_button = self._elevated_button(toolbar, text="Avancar", width=76, height=30, command=self.browser_go_forward)
+        forward_button.elevation_shadow.grid(row=0, column=2, padx=4, pady=8)
+
+        go_button = self._elevated_button(toolbar, text="Ir", width=58, height=30, command=self.browse_internal_url_from_entry)
+        go_button.elevation_shadow.grid(row=0, column=3, padx=4, pady=8)
 
         reload_button = self._elevated_button(toolbar, text="Recarregar", width=96, height=30, command=self.reload_internal_browser)
-        reload_button.elevation_shadow.grid(row=0, column=2, padx=4, pady=8)
+        reload_button.elevation_shadow.grid(row=0, column=4, padx=4, pady=8)
 
         external_button = self._elevated_button(toolbar, text="Externo", width=78, height=30, command=self.open_current_browser_url_external)
-        external_button.elevation_shadow.grid(row=0, column=3, padx=(4, 8), pady=8)
+        external_button.elevation_shadow.grid(row=0, column=5, padx=(4, 8), pady=8)
 
         body = ctk.CTkFrame(self.tab_browser, fg_color=THEME["bg"], corner_radius=6, border_width=1, border_color=THEME["border"])
         body.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 8))
@@ -1435,8 +1662,10 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             self.browser_info,
             "Navegador interno da Merotec IA IDE\n\n"
             "- URLs abertas pela IA via [OPEN_URL] aparecem aqui.\n"
-            "- Com pywebview/WebView2 instalado, a IDE abre uma janela web controlada por ela.\n"
-            "- Se o motor interno nao estiver disponivel, a IDE avisa e pode usar o navegador externo como fallback.\n",
+            "- O perfil Chat Web usa esta mesma janela para enviar tarefas, anexar prints e ler respostas.\n"
+            "- A URL da conversa é memorizada por projeto; a IDE não clica em Nova conversa automaticamente.\n"
+            "- A sessão e os cookies ficam preservados entre as aberturas.\n"
+            "- Se o motor interno não estiver disponível, a IDE avisa e pode usar o navegador externo como fallback.\n",
         )
 
     def normalize_internal_browser_url(self, url):
@@ -1463,7 +1692,14 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         return "break"
 
     def reload_internal_browser(self):
-        self.open_internal_browser(self.internal_browser_url, source="reload")
+        if not self._send_internal_browser_command("reload"):
+            self.open_internal_browser(self.internal_browser_url, source="reload")
+
+    def browser_go_back(self):
+        self._send_internal_browser_command("back")
+
+    def browser_go_forward(self):
+        self._send_internal_browser_command("forward")
 
     def open_current_browser_url_external(self):
         url = self.normalize_internal_browser_url(self.internal_browser_url)
@@ -1494,7 +1730,25 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             self.set_internal_browser_status("URL vazia recebida pelo navegador interno.", "error")
             return ""
 
+        # Reabrir a mesma URL reiniciava páginas SPA e podia interromper a
+        # conversa corrente. Para a sessão já aberta, apenas trazemos a janela
+        # para frente; navegação acontece somente quando o destino muda.
+        current = str(getattr(self, "internal_browser_url", "") or "")
+        process = getattr(self, "internal_browser_process", None)
+        if (
+            process is not None
+            and process.poll() is None
+            and current.rstrip("/") == normalized.rstrip("/")
+        ):
+            self.internal_browser_url = normalized
+            self._send_internal_browser_command("focus")
+            self.set_internal_browser_status(
+                f"Navegador interno já está na conversa atual: {normalized}", "ready"
+            )
+            return normalized
+
         self.internal_browser_url = normalized
+        self.browser_element_catalog = {}
         try:
             self.tabview.set("Navegador")
             self.browser_url_entry.delete(0, "end")
@@ -1505,7 +1759,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         opened, detail = self._open_pywebview_browser(normalized)
         if opened:
             self.internal_browser_backend = "pywebview"
-            self.set_internal_browser_status(f"Navegador interno abriu: {normalized}", "ready")
+            self.set_internal_browser_status(f"Iniciando navegador WebView2: {normalized}", "ready")
             return normalized
 
         self.internal_browser_backend = "external-fallback"
@@ -1521,45 +1775,292 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         return normalized
 
     def _open_pywebview_browser(self, url):
-        try:
-            import webview
-        except Exception as exc:
-            return False, f"pywebview/WebView2 nao instalado: {exc}"
-
         with self.internal_browser_lock:
-            window = self.internal_browser_window
-            if self.internal_browser_started and window is not None:
-                try:
-                    window.load_url(url)
-                    return True, "url carregada"
-                except Exception as exc:
-                    return False, f"nao consegui recarregar a janela interna: {exc}"
+            process = self.internal_browser_process
+            if process is not None and process.poll() is None:
+                if self._write_internal_browser_command(process, "navigate", url=url):
+                    return True, "url enviada"
 
-            self.internal_browser_started = True
+            helper = PROJECT_ROOT / "modules" / "browser_runtime.py"
+            if not helper.exists():
+                return False, f"componente ausente: {helper.name}"
 
-        def run_browser():
+            creationflags = 0
+            if sys.platform == "win32":
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
             try:
-                window = webview.create_window(
-                    "Merotec IA - Navegador Interno",
-                    url,
-                    width=1280,
-                    height=820,
-                    resizable=True,
+                process = subprocess.Popen(
+                    [sys.executable, "-u", "-m", "modules.browser_runtime", "--url", url],
+                    cwd=str(PROJECT_ROOT),
+                    env=env,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    creationflags=creationflags,
                 )
-                self.internal_browser_window = window
-                start_kwargs = {"debug": False}
-                if sys.platform == "win32":
-                    start_kwargs["gui"] = "edgechromium"
-                webview.start(**start_kwargs)
             except Exception as exc:
-                self.set_internal_browser_status(f"Falha no motor interno WebView: {exc}", "error")
-            finally:
-                with self.internal_browser_lock:
-                    self.internal_browser_window = None
-                    self.internal_browser_started = False
+                return False, f"nao consegui iniciar o WebView2: {exc}"
 
-        threading.Thread(target=run_browser, daemon=True).start()
-        return True, "janela criada"
+            self.internal_browser_process = process
+            self.internal_browser_started = True
+            self.internal_browser_ready_event.clear()
+            reader = threading.Thread(
+                target=self._read_internal_browser_events,
+                args=(process,),
+                daemon=True,
+            )
+            self.internal_browser_reader_thread = reader
+            reader.start()
+        return True, "processo iniciado"
+
+    def _write_internal_browser_command(self, process, action, **payload):
+        try:
+            if process is None or process.poll() is not None or process.stdin is None:
+                return False
+            process.stdin.write(json.dumps({"action": action, **payload}, ensure_ascii=False) + "\n")
+            process.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError, ValueError):
+            return False
+
+    def _send_internal_browser_command(self, action, **payload):
+        with self.internal_browser_lock:
+            return self._write_internal_browser_command(self.internal_browser_process, action, **payload)
+
+    def request_internal_browser_action(self, action, payload=None, callback=None):
+        request_id = f"browser-{time.time_ns()}"
+        with self.internal_browser_lock:
+            process = self.internal_browser_process
+            if process is None or process.poll() is not None:
+                return ""
+            if callback is not None:
+                self.internal_browser_requests[request_id] = callback
+            sent = self._write_internal_browser_command(
+                process,
+                action,
+                request_id=request_id,
+                **(payload or {}),
+            )
+            if not sent:
+                self.internal_browser_requests.pop(request_id, None)
+                return ""
+        return request_id
+
+    def browser_ai_fallback_enabled(self):
+        return bool(self.settings.get("browser_ai_fallback_enabled", True))
+
+    def _browser_ai_fallback_prompt(self, command, code_context):
+        max_chars = int(self.settings.get("browser_ai_fallback_max_context_chars", 18000) or 18000)
+        context = self.redact_local_training_text(str(code_context or ""))
+        if len(context) > max_chars:
+            head = max_chars * 2 // 3
+            tail = max_chars - head
+            context = context[:head] + "\n[...contexto reduzido pela IDE...]\n" + context[-tail:]
+        return (
+            "Voce e o agente de contingencia da Merotec IA IDE. Continue a mesma missao de engenharia.\n"
+            "Escolha a proxima acao concreta e responda com exatamente uma tag da IDE quando precisar agir: "
+            "READ, SEARCH_TEXT, WEB_SEARCH, WRITE, REPLACE, EXECUTE, OPEN_URL, BROWSER_INSPECT, "
+            "BROWSER_CLICK, BROWSER_TYPE, BROWSER_SCROLL, SCREENSHOT ou HUMAN_TEST. "
+            "Se a tarefa terminou, responda com a conclusao final objetiva. Nao use placeholders.\n\n"
+            f"MISSAO ORIGINAL:\n{command}\n\n"
+            f"CONTEXTO ATUAL DA IDE:\n{context}"
+        )
+
+    def request_browser_ai_fallback(self, command, code_context=None, task_id=None):
+        if not self.browser_ai_fallback_enabled() or self.is_task_cancelled(task_id):
+            return ""
+        url = str(self.settings.get("browser_ai_fallback_url") or "https://chatgpt.com/").strip()
+        timeout = max(30, min(600, int(self.settings.get("browser_ai_fallback_timeout_seconds", 240) or 240)))
+
+        try:
+            current_host = (urllib.parse.urlparse(self.internal_browser_url).hostname or "").lower()
+            fallback_host = (urllib.parse.urlparse(url).hostname or "").lower()
+        except ValueError:
+            current_host = ""
+            fallback_host = ""
+
+        process = self.internal_browser_process
+        needs_open = process is None or process.poll() is not None or current_host != fallback_host
+        if needs_open:
+            opened = threading.Event()
+            outcome = {"url": ""}
+
+            def open_chat():
+                try:
+                    outcome["url"] = self.open_internal_browser(url, source="fallback IA")
+                finally:
+                    opened.set()
+
+            self.after(0, open_chat)
+            if not opened.wait(timeout=15) or not outcome["url"]:
+                return ""
+        if not self.internal_browser_ready_event.wait(timeout=35):
+            self.log_agent("Fallback pelo navegador indisponivel: WebView2 nao ficou pronto.")
+            return ""
+
+        completed = threading.Event()
+        result_holder = {}
+
+        def receive(event):
+            result_holder["event"] = event
+            completed.set()
+
+        prompt = self._browser_ai_fallback_prompt(command, code_context)
+        request_id = self.request_internal_browser_action(
+            "chat",
+            payload={"prompt": prompt, "timeout": timeout},
+            callback=receive,
+        )
+        if not request_id:
+            return ""
+        self.log_agent(f"Fallback de IA enviado ao chat web: {fallback_host or url}")
+        self.set_status("Sem cota nos provedores; aguardando IA pelo navegador...", "busy")
+        deadline = time.time() + timeout + 30
+        while not completed.wait(timeout=1):
+            if self.is_task_cancelled(task_id):
+                self.log_agent("Fallback pelo chat web cancelado com a tarefa.")
+                return ""
+            if time.time() >= deadline:
+                self.log_agent("Fallback pelo chat web expirou sem resposta.")
+                return ""
+        event = result_holder.get("event") or {}
+        raw = event.get("result", "")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                raw = {"response": raw}
+        response = str((raw or {}).get("response") or "").strip() if isinstance(raw, dict) else ""
+        if response:
+            self.log_agent("Fallback pelo chat web respondeu; retomando o loop da IDE.")
+            return f"[Fallback navegador: {fallback_host or 'chat web'}]\n\n{response}"
+        self.log_agent(f"Fallback pelo chat web falhou: {(raw or {}).get('error', 'sem resposta') if isinstance(raw, dict) else 'sem resposta'}")
+        return ""
+
+    def _read_internal_browser_events(self, process):
+        try:
+            if process.stdout is None:
+                return
+            for line in process.stdout:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                name = event.get("event")
+                if name == "ready":
+                    self.internal_browser_ready_event.set()
+                    self.set_internal_browser_status(
+                        "Navegador WebView2 pronto — use cliques e teclado normalmente.",
+                        "ready",
+                    )
+                elif name == "navigated":
+                    current = str(event.get("url") or self.internal_browser_url)
+                    self.internal_browser_url = current
+                    self.set_internal_browser_status(f"Pagina aberta: {current}", "ready")
+                    self.after(0, lambda url=current: self._remember_web_chat_navigation_if_needed(url))
+                elif name in {"error", "command_error"}:
+                    message = str(event.get("message") or "Falha no navegador WebView2.")
+                    self.set_internal_browser_status(message, "error")
+                    request_id = str(event.get("request_id") or "")
+                    if request_id:
+                        failure_event = {
+                            "event": "browser_result",
+                            "request_id": request_id,
+                            "action": str(event.get("action") or "chat"),
+                            "ok": False,
+                            "result": json.dumps({"ok": False, "error": message}, ensure_ascii=False),
+                        }
+                        with self.internal_browser_lock:
+                            callback = self.internal_browser_requests.pop(request_id, None)
+                        if callable(callback):
+                            callback(failure_event)
+                elif name == "browser_progress":
+                    request_id = str(event.get("request_id") or "")
+                    phase = str(event.get("phase") or "working")
+                    message = str(event.get("message") or "Chat Web processando a tarefa.")
+                    # Progresso não resolve o callback: ele apenas mantém a UI
+                    # honesta enquanto o WebView aguarda o provedor externo.
+                    self.set_internal_browser_status(message, "busy")
+                    if phase in {"attachment_paste", "attachment_verified", "sent", "waiting", "timeout"}:
+                        self.log_agent(f"Chat Web [{request_id or 'sem-id'}] {phase}: {message}")
+                elif name == "browser_result":
+                    request_id = str(event.get("request_id") or "")
+                    with self.internal_browser_lock:
+                        callback = self.internal_browser_requests.pop(request_id, None)
+                    raw_result = event.get("result", "")
+                    try:
+                        decoded_result = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
+                    except json.JSONDecodeError:
+                        decoded_result = {}
+                    if isinstance(decoded_result, dict):
+                        result_url = str(decoded_result.get("url") or "")
+                        result_title = str(decoded_result.get("title") or "")
+                        if result_url:
+                            self.internal_browser_url = result_url
+                            self.after(0, lambda url=result_url, title=result_title: self._remember_web_chat_navigation_if_needed(url, title))
+                    if callable(callback):
+                        try:
+                            callback(event)
+                        except Exception as exc:
+                            self.set_internal_browser_status(f"Falha ao processar automacao: {exc}", "error")
+                elif name == "closed":
+                    self.set_internal_browser_status("Janela do navegador fechada.", "warning")
+                    with self.internal_browser_lock:
+                        if self.internal_browser_process is process:
+                            self.internal_browser_process = None
+                            self.internal_browser_started = False
+                            self.internal_browser_requests.clear()
+                            self.internal_browser_ready_event.clear()
+                    try:
+                        if process.stdin is not None:
+                            process.stdin.close()
+                    except OSError:
+                        pass
+        finally:
+            pending_callbacks = []
+            with self.internal_browser_lock:
+                if self.internal_browser_process is process:
+                    pending_callbacks = list(self.internal_browser_requests.values())
+                    self.internal_browser_requests.clear()
+                    self.internal_browser_process = None
+                    self.internal_browser_started = False
+                    self.internal_browser_ready_event.clear()
+            for callback in pending_callbacks:
+                try:
+                    callback({
+                        "event": "browser_result",
+                        "ok": False,
+                        "result": json.dumps(
+                            {"ok": False, "error": "O navegador interno foi encerrado durante a tarefa."},
+                            ensure_ascii=False,
+                        ),
+                    })
+                except Exception:
+                    pass
+
+    def close_internal_browser(self):
+        with self.internal_browser_lock:
+            process = self.internal_browser_process
+            if process is None or process.poll() is not None:
+                return
+            self._write_internal_browser_command(process, "close")
+
+        def ensure_closed():
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+
+        threading.Thread(target=ensure_closed, daemon=True).start()
 
     def _build_input_bar(self):
         self.input_frame = ctk.CTkFrame(self, fg_color=THEME["panel"], corner_radius=0)
@@ -1687,6 +2188,10 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.status_label.grid(row=0, column=0, sticky="nsew", padx=10, pady=5)
 
     def _bind_shortcuts(self):
+        self.bind_all("<Control-Shift-N>", lambda _event: self.create_new_project())
+        self.bind_all("<Control-Shift-n>", lambda _event: self.create_new_project())
+        self.bind_all("<Control-o>", lambda _event: self.open_external_file())
+        self.bind_all("<Control-O>", lambda _event: self.open_external_file())
         self.bind_all("<Control-s>", self.save_current_tab)
         self.bind_all("<Control-S>", self.save_current_tab)
         self.bind_all("<Control-w>", self.close_current_tab)
@@ -1714,12 +2219,11 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 pass
 
     def interrupt_terminal_from_keyboard(self, event=None):
-        if not self.agent_busy and not self.has_terminal_processes():
+        if not self.has_terminal_processes():
             return None
 
         self.append_to_term("\n^C\n")
-        self.cancel_ai_task()
-        self.set_status("Interrompido pelo Ctrl+C.", "warning")
+        self.cancel_terminal_command(source="Ctrl+C")
         return "break"
 
     def _create_editor(self, parent, tab_name):
@@ -2118,7 +2622,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             else:
                 self.ai_progress.stop()
                 self.ai_progress.grid_remove()
-                self.btn_send.configure(state="normal", text="Cancelar" if self.has_terminal_processes() else "Enviar")
+                self.btn_send.configure(state="normal", text="Enviar")
                 self.ai_busy_started_at = None
                 self.ai_activity_text = "IA trabalhando"
                 self.set_status("Pronto.", "ready")
@@ -2268,9 +2772,23 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         except ValueError:
             return path.name
 
-    def open_file_in_editor(self, file_path):
+    def unique_tab_name(self, preferred_name, file_path):
+        if preferred_name not in self.open_editors:
+            return preferred_name
         path = Path(file_path)
-        tab_name = self.path_to_tab.get(str(path.resolve())) or self.make_tab_name(path)
+        parent = path.parent.name
+        candidate = f"{parent}/{path.name}" if parent else path.name
+        if candidate not in self.open_editors:
+            return candidate
+        index = 2
+        while f"{candidate} ({index})" in self.open_editors:
+            index += 1
+        return f"{candidate} ({index})"
+
+    def open_file_in_editor(self, file_path):
+        path = Path(file_path).resolve()
+        existing_tab = self.path_to_tab.get(str(path))
+        tab_name = existing_tab or self.unique_tab_name(self.make_tab_name(path), path)
 
         if tab_name in self.open_editors:
             self.tabview.set(tab_name)
@@ -2349,6 +2867,116 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.highlight_code(tab_name)
         self.update_editor_markers(tab_name)
         self.add_chat_message("Sistema", f"Arquivo aberto: {tab_name}")
+
+    def build_chatgpt_web_mission(self, command):
+        objective = (command or "").strip() or self.active_ai_objective or "Analise o projeto e proponha a proxima melhoria concreta."
+        return (
+            "PROTOCOLO INCREMENTAL MEROTEC IA IDE V9 — esta mensagem substitui qualquer protocolo anterior, inclusive V8, quando houver conflito.\n"
+            "A IDE suporta desenvolvimento incremental: arquivos grandes NAO precisam ser reescritos por completo para receber uma correcao.\n\n"
+            "Você está colaborando com a Merotec IA IDE. Responda em português e emita ações aplicáveis.\n\n"
+            f"MISSÃO:\n{objective}\n\n"
+            f"WORKSPACE ATIVO:\n{self.current_workspace}\n\n"
+            f"ARQUIVOS VISÍVEIS:\n{self.get_workspace_tree(limit=120)}\n\n"
+            "REGRAS DE EXECUÇÃO:\n"
+            "- Não recuse uma tarefa porque o arquivo é grande ou porque não cabe inteiro no contexto. Peça somente o trecho necessário.\n"
+            "- Leitura total: [READ: caminho/arquivo.ext]. Leitura parcial preferida para arquivos grandes: [READ: caminho/arquivo.ext | linhas 120-260].\n"
+            "- Pesquisa precisa: [SEARCH_TEXT: padrao | caminho/arquivo.ext].\n"
+            "- Alteração localizada: [REPLACE: caminho/arquivo.ext] com [OLD] e [NEW] em cercas Markdown.\n"
+            "- Patch incremental também é aceito: [PATCH] *** Begin Patch / *** Update File / hunks @@ / *** End Patch [/PATCH].\n"
+            "- [WRITE] é somente para arquivo novo ou reescrita realmente intencional; não é obrigatório para modificar arquivo existente.\n"
+            "- A IDE cria backup antes de cada alteração e valida o conteúdo antes de salvar.\n"
+            "- Você pode emitir mais de uma alteração independente na mesma resposta. Quando precisar do resultado de uma leitura, teste ou ação anterior, aguarde a resposta da IDE antes do próximo passo.\n"
+            "- Nunca diga que alterou, testou ou validou sem uma ação real. Depois de editar, use [EXECUTE: comando de teste real] ou [HUMAN_TEST: auto] quando apropriado.\n\n"
+            "FORMATOS:\n"
+            "[REPLACE: caminho/arquivo.ext]\n[OLD]\n```linguagem\ntrecho exato atual\n```\n[/OLD]\n[NEW]\n```linguagem\ntrecho novo\n```\n[/NEW]\n[/REPLACE]\n\n"
+            "[PATCH]\n*** Begin Patch\n*** Update File: caminho/arquivo.ext\n@@\n-linha antiga\n+linha nova\n*** End Patch\n[/PATCH]\n\n"
+            "[WRITE: caminho/arquivo.ext]\n```linguagem\nconteúdo completo\n```\n[/WRITE]\n\n"
+            "Python exige 4 espaços por nível e nunca tab. Nunca use EXECUTE para imprimir/ler arquivo; use READ ou SEARCH_TEXT. Após alterar, valide e corrija até concluir."
+        )
+
+    def send_mission_to_web_chat(self):
+        command = self.text_input.get("1.0", "end-1c").strip()
+        if command:
+            self.active_ai_objective = command
+        if getattr(self.engine, "provider", "") == "web_chat":
+            self.add_chat_message(
+                "Sistema",
+                "Missao enviada diretamente ao Chat Web. A IDE vai aplicar acoes, validar e continuar sem copiar/colar manual.",
+            )
+            self.tabview.set(CHAT_TAB_NAME)
+            self._run_ai_task(command or self.active_ai_objective or "Continue a missao ativa pelo Chat Web.")
+            return
+        mission = self.build_chatgpt_web_mission(command)
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(mission)
+            self.update_idletasks()
+        except tk.TclError as exc:
+            self.add_chat_message("Erro", f"Nao consegui copiar a missao: {exc}")
+            return
+        self.tabview.set("Navegador")
+        target = self.web_chat_target_for_workspace(self.current_workspace)
+        self.open_internal_browser(target, source="Chat Web")
+        self.add_chat_message(
+            "Sistema",
+            "Missão estruturada copiada. Cole no Chat Web configurado; depois copie a resposta e use IA > Importar resposta do Chat Web.",
+        )
+
+    def send_mission_to_chatgpt_web(self):
+        # Compatibilidade com atalhos e integrações anteriores.
+        return self.send_mission_to_web_chat()
+
+    def import_web_chat_response(self):
+        try:
+            response = self.clipboard_get().strip()
+        except tk.TclError:
+            response = ""
+        if not response:
+            messagebox.showerror(APP_NAME, "Copie primeiro a resposta textual do Chat Web.", parent=self)
+            return
+        if len(response) > 500000:
+            messagebox.showerror(APP_NAME, "A resposta copiada e grande demais para importar com seguranca.", parent=self)
+            return
+
+        self.last_response = response
+        visible = self.strip_agent_action_markup(response) or "Resposta com acao recebida."
+        self.add_chat_message("Chat Web", visible)
+        if not self.response_has_agent_action(response):
+            self.set_status("Resposta do ChatGPT importada como contexto.", "ready")
+            return
+        auto_apply = self.web_chat_auto_apply_imported_actions()
+        if not auto_apply:
+            if not messagebox.askyesno(
+                APP_NAME,
+                "A resposta contem acoes para o projeto ativo. Deseja valida-las e aplica-las agora?",
+                parent=self,
+            ):
+                self.set_status("Resposta importada sem aplicar alteracoes.", "warning")
+                return
+        objective = self.active_ai_objective or "Aplicar resposta importada do Chat Web"
+        if auto_apply:
+            self.add_chat_message("Sistema", "Resposta importada aplicada automaticamente pelo modo autonomo do Chat Web.")
+        self.parse_and_execute_agent_actions(response, task_objective=objective)
+        self.load_workspace_files()
+
+    def web_chat_auto_apply_imported_actions(self):
+        settings = getattr(self, "settings", {})
+        profile = (
+            settings.get("ai_profiles", {}).get("web_chat", {})
+            if isinstance(settings, dict)
+            else {}
+        )
+        value = profile.get(
+            "web_chat_auto_apply_imported_actions",
+            settings.get("web_chat_auto_apply_imported_actions", True) if isinstance(settings, dict) else True,
+        )
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "sim", "on"}
+
+    def import_chatgpt_web_response(self):
+        # Compatibilidade com o menu anterior.
+        return self.import_web_chat_response()
 
     def _on_editor_key(self, _event, tab_name):
         if tab_name in self.open_editors:
@@ -2589,6 +3217,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             self.voice.stop_keyword_listener()
         except Exception:
             pass
+        self.close_internal_browser()
         self.cancel_active_terminal_processes()
         self.destroy()
 
@@ -2729,7 +3358,6 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     self.terminal_activity_label.configure(text=label)
                 self.terminal_activity_frame.grid()
                 self.terminal_activity_bar.start()
-                self.btn_send.configure(state="normal", text="Cancelar")
             else:
                 self.terminal_activity_bar.stop()
                 self.terminal_activity_frame.grid_remove()
@@ -2765,8 +3393,19 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 continue
             if self.terminate_process_tree(process):
                 killed += 1
-        if killed:
+        if killed or processes:
             self.reset_terminal_busy()
+        return killed
+
+    def cancel_terminal_command(self, source="usuario"):
+        killed = self.cancel_active_terminal_processes()
+        if killed:
+            self.append_to_term(f"\n[cancelado] {killed} processo(s) encerrado(s) no Terminal Local.\n")
+            self.add_chat_message("Sistema", f"Terminal Local cancelado ({killed} processo(s)).")
+            self.set_status("Terminal Local cancelado.", "warning")
+        else:
+            self.set_status("Nenhum processo ativo no Terminal Local.", "ready")
+        self.log_agent(f"Cancelamento do terminal solicitado por {source}: {killed} processo(s).")
         return killed
 
     def reset_terminal_busy(self):
@@ -2888,7 +3527,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 self.ai_live_trace_last_log_at == 0
                 or now - self.ai_live_trace_last_log_at >= 1.25
                 or current_length - self.ai_live_trace_last_length >= 360
-                or bool(re.search(r"\[(READ|WRITE|REPLACE|EXECUTE|EXECUTE_ADMIN|OPEN_URL|SCREENSHOT|HUMAN_TEST|SEARCH_TEXT|WEB_SEARCH|SCAN_TEXT|UNDO)\s*:", chunk, re.IGNORECASE))
+                or bool(re.search(r"\[(READ|WRITE|REPLACE|EXECUTE|EXECUTE_ADMIN|OPEN_URL|BROWSER_INSPECT|BROWSER_CLICK|BROWSER_TYPE|BROWSER_SCROLL|SCREENSHOT|HUMAN_TEST|SEARCH_TEXT|WEB_SEARCH|SCAN_TEXT|UNDO)\s*:", chunk, re.IGNORECASE))
             )
             if not should_log:
                 self.update_ai_activity_from_stream(chunk)
@@ -2924,10 +3563,15 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
     def describe_live_ai_trace(self, trace, chunk):
         action_matches = re.findall(
-            r"\[(READ|WRITE|REPLACE|SEARCH_TEXT|WEB_SEARCH|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|EXECUTE_ADMIN|OPEN_URL|SCREENSHOT|HUMAN_TEST)\s*:\s*([^\]]*)\]",
+            r"(?:\[(READ|WRITE|REPLACE|SEARCH_TEXT|WEB_SEARCH|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|EXECUTE_ADMIN|OPEN_URL|BROWSER_INSPECT|BROWSER_CLICK|BROWSER_TYPE|BROWSER_SCROLL|SCREENSHOT|HUMAN_TEST)\s*:\s*([^\]]*)\]|\[(READ|WRITE|REPLACE|SEARCH_TEXT|WEB_SEARCH|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|EXECUTE_ADMIN|OPEN_URL|BROWSER_INSPECT|BROWSER_CLICK|BROWSER_TYPE|BROWSER_SCROLL|SCREENSHOT|HUMAN_TEST)\]\s*([^\r\n]*)|^(READ|WRITE|REPLACE|SEARCH_TEXT|WEB_SEARCH|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|EXECUTE_ADMIN|OPEN_URL|BROWSER_INSPECT|BROWSER_CLICK|BROWSER_TYPE|BROWSER_SCROLL|SCREENSHOT|HUMAN_TEST)\s*(?::|\s+)\s*([^\r\n]+))",
             trace or "",
-            re.IGNORECASE,
+            re.IGNORECASE | re.MULTILINE,
         )
+        action_matches = [
+            ((match[0] or match[2] or match[4]).upper(), (match[1] or match[3] or match[5]).strip())
+            for match in action_matches
+            if (match[0] or match[2] or match[4]) and (match[1] or match[3] or match[5]).strip()
+        ]
         if action_matches:
             action, payload = action_matches[-1]
             payload = self.clean_live_ai_text(payload, limit=140)
@@ -2943,6 +3587,10 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 "EXECUTE": "pediu execucao",
                 "EXECUTE_ADMIN": "pediu administrador",
                 "OPEN_URL": "pediu abertura",
+                "BROWSER_INSPECT": "pediu leitura da pagina",
+                "BROWSER_CLICK": "pediu clique",
+                "BROWSER_TYPE": "pediu digitacao",
+                "BROWSER_SCROLL": "pediu rolagem",
                 "SCREENSHOT": "pediu print",
                 "HUMAN_TEST": "pediu teste visual",
             }
@@ -2955,18 +3603,24 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
     def update_ai_activity_from_stream(self, text):
         normalized = self.normalize_plain_text(text or "")
-        if re.search(r"\[(write|replace|fix_mojibake|undo)\s*:", normalized):
+        if re.search(r"(?:\[(write|replace|fix_mojibake|undo)(?:\s*:|\])|^(write|replace|fix_mojibake|undo)\s*(?::|\s))", normalized, re.MULTILINE):
             self.set_ai_activity("IA preparando alteracao")
-        elif re.search(r"\[(execute|execute_admin|open_url|screenshot|human_test)\s*:", normalized):
+        elif re.search(r"(?:\[(execute|execute_admin|open_url|browser_inspect|browser_click|browser_type|browser_scroll|screenshot|human_test)(?:\s*:|\])|^(execute|execute_admin|open_url|browser_inspect|browser_click|browser_type|browser_scroll|screenshot|human_test)\s*(?::|\s))", normalized, re.MULTILINE):
             self.set_ai_activity("IA preparando validacao")
-        elif re.search(r"\[(read|search_text|web_search|scan_text)\s*:", normalized):
+        elif re.search(r"(?:\[(read|search_text|web_search|scan_text)(?:\s*:|\])|^(read|search_text|web_search|scan_text)\s*(?::|\s))", normalized, re.MULTILINE):
             self.set_ai_activity("IA pedindo contexto")
         elif any(term in normalized for term in ("patch", "filechange", "apply", "alterando", "escrevendo")):
-            self.set_ai_activity("Codex alterando arquivos")
+            self.set_ai_activity(f"{self.ai_assistant_display_name()} alterando arquivos")
         elif any(term in normalized for term in ("command", "execut", "rodando", "testando")):
-            self.set_ai_activity("Codex executando")
+            self.set_ai_activity(f"{self.ai_assistant_display_name()} executando")
         else:
             self.set_ai_activity("IA respondendo ao vivo")
+
+    def ai_assistant_display_name(self):
+        engine = getattr(self, "engine", None)
+        if engine is not None and hasattr(engine, "assistant_display_name"):
+            return engine.assistant_display_name()
+        return "IA"
 
     def _append_text(self, widget, text):
         widget.configure(state="normal")
@@ -3269,12 +3923,13 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         raw = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
         if not raw:
             return ""
+        repair = getattr(self, "repair_common_mojibake", None)
+        if callable(repair) and self.mojibake_score(raw):
+            raw = repair(raw)
         raw = re.sub(r"(?<=[.!?])(?=[A-ZÁÉÍÓÚÂÊÔÃÕÇ])", " ", raw)
         raw = re.sub(r"(?<=[.!?])\s+(?=(Resumo|Arquitetura|Fluxo|Arquivos|Riscos?|Pontos|Próxim|Proxim|Sugest|Implementaç|Implementac|Diagnóstico|Diagnostico)\b)", "\n\n", raw)
         raw = re.sub(r"(?<=[a-záéíóúâêôãõç0-9])(?=(Resumo|Arquitetura|Fluxo|Arquivos|Riscos|Pontos|Próxim|Proxim|Sugest|Implementaç|Implementac|Diagnóstico|Diagnostico)\b)", "\n\n", raw)
         raw = re.sub(r"(?<!\n)([-*]\s+)", r"\n\1", raw)
-        raw = re.sub(r"[ \t]{2,}", " ", raw)
-        raw = re.sub(r"\n[ \t]+", "\n", raw)
         return raw.strip()
 
     def resize_chat_textbox(self, textbox, text, max_height=560):
@@ -3495,9 +4150,11 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
     def text_command(self):
         command = self.text_input.get("1.0", "end-1c").strip()
         image_path = self.pending_image_path
-        if self.agent_busy or self.has_terminal_processes():
+        if self.agent_busy:
             self.cancel_ai_task()
             return
+        if self.has_terminal_processes():
+            self.set_status("Terminal Local em execucao; use Cancelar terminal na aba Terminal Local.", "warning")
         if not command and not image_path:
             if self.last_failed_ai_task:
                 self.retry_last_ai_task()
@@ -3565,38 +4222,30 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             self.engine.cancel_generation()
         except Exception:
             pass
-        killed = self.cancel_active_terminal_processes()
-        self.add_chat_message("Sistema", "Cancelando tarefa atual...")
-        if killed:
-            self.add_chat_message("Sistema", f"Processos encerrados: {killed}")
-            self.append_to_term(f"\n[cancelado] {killed} processo(s) encerrado(s) pela IDE.\n")
-        self.reset_busy_indicators_after_cancel()
+        self.add_chat_message("Sistema", "Cancelando tarefa do Chat IA...")
+        self.reset_ai_busy_after_cancel()
 
     def is_task_cancelled(self, task_id):
         return task_id is not None and task_id in self.cancelled_task_ids
 
-    def reset_busy_indicators_after_cancel(self):
+    def reset_ai_busy_after_cancel(self):
         with self.ai_work_lock:
             self.ai_work_count = 0
             self.agent_busy = False
             self.ai_busy_started_at = None
-        with self.terminal_work_lock:
-            self.terminal_work_count = 0
-            self.terminal_activity_generation += 1
-            generation = self.terminal_activity_generation
 
         def update():
-            if generation != self.terminal_activity_generation:
-                return
             self.ai_progress.stop()
             self.ai_progress.grid_remove()
-            self.terminal_activity_bar.stop()
-            self.terminal_activity_frame.grid_remove()
             self.btn_send.configure(state="normal", text="Enviar")
-            self.status_label.configure(text="Cancelado.", text_color=THEME["warning"])
+            self.status_label.configure(text="Chat IA cancelado.", text_color=THEME["warning"])
             self.refresh_ai_status()
 
         self.after(0, update)
+
+    def reset_busy_indicators_after_cancel(self):
+        self.reset_ai_busy_after_cancel()
+        self.reset_terminal_busy()
 
     def should_retry_last_task(self, command, image_path=None):
         if image_path or not self.last_failed_ai_task:
@@ -4007,6 +4656,308 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         return str(value)
 
+    def build_web_chat_visual_receipt_contract(self, image_path):
+        """Inclui uma instrução curta para análise do print anexado.
+
+        O recebimento técnico do anexo é confirmado pelo navegador interno.
+        Não exigimos uma tag textual do modelo, porque ela conflita com a ação
+        executável que o agente precisa devolver na mesma resposta.
+        """
+        if not image_path or getattr(self.engine, "provider", "") != "web_chat":
+            return ""
+        name = Path(str(image_path)).name or "screenshot.png"
+        return (
+            "EVIDÊNCIA VISUAL DISPONÍVEL:\n"
+            f"- A IDE anexou a imagem `{name}` nesta mesma mensagem e confirmou o envio pelo navegador.\n"
+            "- Use a imagem na análise, mas responda diretamente com a próxima ação executável da IDE ou uma conclusão objetiva.\n"
+            "- Só informe que não recebeu a imagem quando ela realmente não estiver visível para você."
+        )
+
+    def web_chat_response_recovery_reason(self, response_text, task_objective=None, task_id=None, direct_action_happened=False):
+        """Retorna um motivo quando o Chat Web não entregou ação verificável.
+
+        A resposta em linguagem natural é mantida no histórico, mas não pode
+        encerrar uma missão de correção sem alteração, leitura, execução ou
+        conclusão verificável. Antes esta situação virava apenas um aviso e a
+        tarefa terminava silenciosamente.
+        """
+        if getattr(self.engine, "provider", "") != "web_chat":
+            return ""
+        metrics = self.get_ai_task_metrics(task_id)
+        pending_diagnostic = metrics.get("requires_error_correction")
+        # Depois de um erro real de terminal/teste, uma leitura ou acao anterior
+        # nao basta para encerrar a recuperacao. O Chat Web precisa devolver uma
+        # proxima tag aplicavel; sem isso o diagnostico some da conversa e o ciclo
+        # aparenta travar mesmo com o erro visivel no Terminal Local.
+        if direct_action_happened:
+            return ""
+        if not pending_diagnostic and self.task_has_real_action(task_id):
+            return ""
+        objective = task_objective or self.active_ai_objective or ""
+        if not self.objective_requires_concrete_change(objective):
+            return ""
+        response = str(response_text or "").strip()
+        if not response:
+            return "O Chat Web não devolveu texto utilizável."
+        if self.response_has_agent_action(response):
+            return ""
+        if pending_diagnostic:
+            command_name = str(pending_diagnostic.get("command") or "o ultimo teste/comando") if isinstance(pending_diagnostic, dict) else "o ultimo teste/comando"
+            return (
+                "A IDE enviou um diagnostico real de falha para o Chat Web, mas a resposta "
+                f"nao trouxe uma proxima acao executavel para corrigir {command_name}."
+            )
+        normalized = self.normalize_plain_text(response)
+        transport_failures = (
+            "chat web nao concluiu",
+            "tempo esgotado aguardando resposta",
+            "terminou sem texto de resposta",
+            "navegador interno foi encerrado",
+            "campo de conversa nao encontrado",
+            "nao confirmou o envio",
+        )
+        if any(item in normalized for item in transport_failures):
+            return "O Chat Web não concluiu uma resposta executável."
+        if self.claims_concrete_result_without_real_action(response, task_objective=objective):
+            return "O Chat Web afirmou alteração, teste ou correção sem enviar uma ação que a IDE possa executar."
+        return "O Chat Web respondeu sem uma ação executável para a missão ativa."
+
+    def continue_after_web_chat_protocol_stall(
+        self,
+        *,
+        command,
+        image_path,
+        extra_context,
+        task_objective,
+        action_depth,
+        task_id,
+        response_text,
+        reason,
+    ):
+        """Reenvia uma instrução curta ao mesmo chat, sem criar outra conversa.
+
+        O padrão é contínuo (limite 0). Um limite positivo pode ser definido
+        em `web_chat_protocol_recovery_max_attempts` por quem quiser controlar
+        consumo de um provedor externo.
+        """
+        if self.is_task_cancelled(task_id) or not self.should_continue_development_loop(action_depth, task_id):
+            return False
+        metrics = self.get_ai_task_metrics(task_id)
+        attempts = int(metrics.get("web_chat_protocol_recovery_attempts", 0) or 0)
+        try:
+            configured_limit = int(self.settings.get("web_chat_protocol_recovery_max_attempts", 4) or 4)
+        except (TypeError, ValueError, AttributeError):
+            configured_limit = 4
+        configured_limit = max(0, min(200, configured_limit))
+        if configured_limit and attempts >= configured_limit:
+            self.add_chat_message(
+                "Erro",
+                "O Chat Web repetiu respostas sem ação executável até o limite configurado. "
+                "A missão permanece pendente; use Reenviar ou aumente o limite de recuperação.",
+            )
+            self.set_status("Chat Web sem ação executável; missão pendente.", "warning")
+            return False
+
+        fingerprint = self.normalize_plain_text(response_text or "")[:1400]
+        previous = str(metrics.get("web_chat_last_protocol_response", ""))
+        repeated = int(metrics.get("web_chat_repeated_protocol_response", 0) or 0)
+        repeated = repeated + 1 if fingerprint and fingerprint == previous else 0
+        metrics["web_chat_last_protocol_response"] = fingerprint
+        metrics["web_chat_repeated_protocol_response"] = repeated
+        metrics["web_chat_protocol_recovery_attempts"] = attempts + 1
+        metrics["protocol_violations"] = int(metrics.get("protocol_violations", 0) or 0) + 1
+
+        # A mesma resposta no mesmo estado não adiciona evidência nova.
+        # Pausar antes de reenviar impede que o ciclo recrie a mesma rodada.
+        if repeated >= 2:
+            self.add_chat_message(
+                "Erro",
+                "O Chat Web repetiu a mesma resposta sem uma ação executável. "
+                "A missão foi pausada para evitar ciclo infinito; nenhum arquivo foi alterado.",
+            )
+            self.log_agent("Recuperação do Chat Web pausada por resposta repetida sem progresso.")
+            self.set_status("Pausado: Chat Web repetiu resposta sem ação.", "warning")
+            return False
+
+        cadence = (
+            f"{attempts + 1}/{configured_limit}"
+            if configured_limit else f"{attempts + 1}/contínuo"
+        )
+        self.add_chat_message(
+            "Sistema",
+            "O Chat Web não entregou uma ação verificável. A IDE preservou o estado atual e "
+            f"vai continuar a mesma missão na conversa existente ({cadence}).\n\nMotivo: {reason}",
+        )
+        self.log_agent(f"Recuperação contínua do Chat Web {cadence}: {reason}")
+        self.set_ai_activity("IA recuperando resposta do Chat Web")
+
+        # ``repeated_warning`` precisa existir em todas as tentativas.
+        # A versão anterior concatenava essa variável sem inicializá-la e
+        # encerrava a recuperação com ``NameError`` depois que o Chat Web
+        # devolvia uma resposta sem ação.
+        repeated_warning = ""
+        if repeated:
+            repeated_warning = (
+                "\nATENÇÃO: a resposta atual é semelhante à anterior e ainda não contém "
+                "uma ação executável. Não repita a explicação; emita somente a próxima tag "
+                "da IDE com os parâmetros necessários.\n"
+            )
+
+        recovery_context = (
+            f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or command}\n\n"
+            "RECUPERAÇÃO OBRIGATÓRIA DO PROTOCOLO:\n"
+            f"{reason}\n"
+            "A resposta anterior não foi aceita como conclusão porque nenhuma ação da IDE foi aplicada. "
+            "Não resuma, não prometa e não diga que corrigiu/testou. Protocolo incremental V9: não exija WRITE completo para arquivo grande. Responda agora com a próxima ação necessária: "
+            "[READ: arquivo | linhas inicio-fim], [SEARCH_TEXT: padrão | arquivo], [PATCH]...[/PATCH], [WRITE: arquivo]...[/WRITE], "
+            "[REPLACE: arquivo]...[OLD]...[/OLD][NEW]...[/NEW][/REPLACE], "
+            "[EXECUTE: comando real] ou [HUMAN_TEST: auto].\n"
+            + repeated_warning
+            + "\nRESPOSTA ANTERIOR SEM AÇÃO:\n"
+            + str(response_text or "")[:7000]
+        )
+        if extra_context:
+            recovery_context += "\n\nCONTEXTO TÉCNICO ANTERIOR:\n" + str(extra_context)[-8000:]
+
+        # Esta função é chamada por uma thread de trabalho. Usar ``after`` de
+        # Tk diretamente daqui pode falhar silenciosamente em alguns Windows e
+        # deixar a missão parada. Um Timer agenda a próxima rodada fora da UI;
+        # _run_ai_task por sua vez cria a thread de trabalho e atualiza a tela
+        # por seus métodos sincronizados.
+        def resume_same_mission():
+            if self.is_task_cancelled(task_id):
+                return
+            self._run_ai_task(
+                "Continue a missão com uma ação executável da IDE.",
+                image_path=image_path,
+                extra_context=recovery_context,
+                task_objective=task_objective or self.active_ai_objective,
+                action_depth=action_depth + 1,
+                task_id=task_id,
+            )
+
+        timer = threading.Timer(0.45, resume_same_mission)
+        timer.daemon = True
+        timer.start()
+        return True
+
+    def web_chat_visual_delivery_problem(self, image_path):
+        """Valida a entrega visual pelo estado do navegador, não por tag textual.
+
+        Quando o WebView confirma preview/arquivo enviado (ou a imagem já aparece
+        na mensagem do usuário), o print está disponível para o Chat Web mesmo
+        que o modelo responda diretamente com uma ação e não escreva um recibo.
+        """
+        if not image_path or getattr(self.engine, "provider", "") != "web_chat":
+            return ""
+        delivery = getattr(self.engine, "latest_web_chat_delivery", {})
+        if not isinstance(delivery, dict):
+            return "O navegador não devolveu o estado da entrega visual."
+        if not delivery.get("attachments_requested"):
+            return str(delivery.get("attachment_error") or "A IDE não conseguiu preparar o print para o Chat Web.")
+        if not delivery.get("ok"):
+            return str(delivery.get("error") or "O Chat Web não concluiu o envio do print.")
+        attachment_error = str(delivery.get("attachment_error") or "").strip()
+        if attachment_error:
+            return attachment_error
+        if not delivery.get("attachment_verified"):
+            return "O navegador não confirmou o recebimento do print antes do envio."
+        if int(delivery.get("attachment_count") or 0) <= 0:
+            return "O navegador não confirmou a seleção do print para upload."
+        receipt = str(delivery.get("visual_receipt") or "").strip().lower()
+        if receipt == "missing":
+            return "O próprio Chat Web informou que a imagem não ficou visível para análise."
+        # receipt pode ser 'received', 'conversation_confirmed' ou
+        # 'transport_confirmed'. Todos representam entrega confirmada.
+        if receipt in {"received", "conversation_confirmed", "transport_confirmed"}:
+            return ""
+        return "O navegador enviou a mensagem, mas não conseguiu confirmar o anexo."
+
+    def retry_web_chat_visual_delivery(
+        self,
+        *,
+        command,
+        image_path,
+        extra_context,
+        task_objective,
+        action_depth,
+        task_id,
+        reason,
+    ):
+        """Repete o envio visual sem criar conversa; depois deixa o ciclo seguir.
+
+        A tarefa nunca é marcada como validada sem entrega técnica confirmada,
+        mas uma falha de upload também não pode encerrar toda a missão de desenvolvimento.
+        """
+        metrics = self.ai_task_metrics.setdefault(task_id, {})
+        retries = int(metrics.get("web_chat_visual_delivery_retries", 0) or 0)
+        try:
+            limit = max(1, min(3, int(self.settings.get("web_chat_visual_delivery_retries", 2))))
+        except (AttributeError, TypeError, ValueError):
+            limit = 2
+        if retries >= limit:
+            return False
+        metrics["web_chat_visual_delivery_retries"] = retries + 1
+        self.log_agent(f"Evidência visual sem confirmação técnica ({retries + 1}/{limit}): {reason}")
+        delivery = getattr(self.engine, "latest_web_chat_delivery", {})
+        delivery_state = str(delivery.get("attachment_delivery") or "desconhecido") if isinstance(delivery, dict) else "desconhecido"
+        self.add_chat_message(
+            "Sistema",
+            "O navegador não confirmou o envio técnico do print. A IDE vai reenviar a mesma evidência na conversa atual, sem abrir outra sessão. "
+            f"Estado técnico do anexo: {delivery_state}.",
+        )
+        retry_context = (
+            f"{extra_context or ''}\n\n"
+            "RECUPERAÇÃO DE EVIDÊNCIA VISUAL:\n"
+            "A mensagem anterior não confirmou tecnicamente o anexo. O mesmo print será anexado de novo. "
+            "Depois de receber a imagem, responda diretamente com a próxima ação executável da IDE ou com uma conclusão objetiva.\n"
+            f"Motivo técnico anterior: {reason}"
+        ).strip()
+        self._run_ai_task(
+            command,
+            image_path=image_path,
+            extra_context=retry_context,
+            task_objective=task_objective,
+            action_depth=action_depth + 1,
+            task_id=task_id,
+        )
+        return True
+
+    def continue_after_visual_delivery_failure(
+        self,
+        *,
+        command,
+        extra_context,
+        task_objective,
+        action_depth,
+        task_id,
+        reason,
+    ):
+        """Mantém a missão ativa após bloqueio de mídia sem forjar validação."""
+        metrics = self.ai_task_metrics.setdefault(task_id, {})
+        if metrics.get("visual_delivery_fallback_started"):
+            return False
+        metrics["visual_delivery_fallback_started"] = True
+        self.add_chat_message(
+            "Sistema",
+            "A evidência visual não foi confirmada pelo navegador. A missão continua com diagnóstico, código e testes locais; a IDE não aceitará conclusão de validação visual sem entrega técnica confirmada.",
+        )
+        fallback_context = (
+            f"{extra_context or ''}\n\n"
+            "BLOQUEIO EXTERNO DE EVIDÊNCIA VISUAL:\n"
+            f"O navegador não confirmou o envio do print após as tentativas automáticas. Motivo: {reason}\n"
+            "Continue a missão sem afirmar que a tela foi validada. Use o diagnóstico do terminal, READ/SEARCH_TEXT, "
+            "edições e testes reais para corrigir o que puder. Quando precisar novamente de validação visual, use [HUMAN_TEST: auto]."
+        ).strip()
+        self._run_ai_task(
+            "Continue a mesma missão. A validação visual permanece pendente; faça a próxima correção ou teste real.",
+            extra_context=fallback_context,
+            task_objective=task_objective,
+            action_depth=action_depth + 1,
+            task_id=task_id,
+        )
+        return True
+
     def _run_ai_task(self, command, image_path=None, extra_context=None, task_objective=None, action_depth=0, task_id=None, answer_only=False):
         def process():
             retry_available = False
@@ -4063,10 +5014,18 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             try:
                 if self.is_task_cancelled(current_task_id):
                     return
+                autonomy_directive = (
+                    "- Modo irrestrito ativo: o modelo configurado dirige a estrategia, escolhe ferramentas e continua os ciclos necessarios ate concluir.\n"
+                    "- A IDE nao deve substituir uma tarefa executavel por relatorio local, briefing ou classificacao de gatilhos.\n"
+                    "- Limites restantes: escopo do workspace e confirmacao para efeitos externos sensiveis ou irreversiveis.\n"
+                    if self.model_directed_autonomy_enabled()
+                    else ""
+                )
                 context = (
                     f"Workspace atual: {self.current_workspace}\n\n"
                     f"MISSAO ATIVA DA IA:\n{objective}\n\n"
                     "MODO CODEX DA IDE:\n"
+                    f"{autonomy_directive}"
                     "- Comporte-se como um agente de engenharia, nao como um assistente passivo.\n"
                     "- Use raciocinio altissimo: antes de responder, escolha o proximo passo que realmente muda, executa, valida ou conclui.\n"
                     "- Para perguntas simples ou perguntas de capacidade, responda direto antes de qualquer execucao.\n"
@@ -4074,31 +5033,33 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     "- Para analise/planejamento, entregue diagnostico completo em texto e nao execute/edite sem pedido claro.\n"
                     "- Para implementacao/correcao, avance ate uma mudanca aplicada e uma verificacao plausivel.\n"
                     "- Trabalhe de forma produtiva: responda com conclusao util, diagnostico objetivo ou acao real quando precisar mexer no projeto.\n"
-                    "- Use tags da IDE ou ferramentas diretas do app-server; escolha o caminho real mais confiavel e nao bloqueie uma resposta tecnica util so por nao conter tag.\n"
+                    "- PROTOCOLO INCREMENTAL V9 ATIVO: esta instrucao substitui V8 e qualquer regra anterior conflitante. Arquivo grande nao exige reescrita completa. Use [READ: arquivo | linhas inicio-fim] e [SEARCH_TEXT] para obter somente o contexto necessario; aplique [REPLACE] ou [PATCH] para mudancas locais e [WRITE] apenas para arquivo novo ou reescrita intencional.\n"
                     "- Se afirmar que alterou, executou ou validou, garanta que houve acao real da IDE ou mudanca direta detectavel no workspace.\n"
                     "- Leia o contexto necessario sem entrar em loop; prefira agir quando ja houver informacao suficiente.\n"
                     "- Preserve a estrutura existente e faca alteracoes pequenas quando o projeto ja funciona.\n"
                     "- Depois de editar, valide com uma tag EXECUTE/EXECUTE_ADMIN ja preenchida, [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST] quando isso for util.\n\n"
                     "Continue essa missao de forma autonoma. "
                     "Atue como especialista senior em desenvolvimento de sistemas, apps e jogos: diagnostique, implemente, valide e corrija ate resolver. "
-                    "Se precisar de arquivo, use [READ] ou ferramenta direta equivalente; o conteudo retornado passa a ser sua memoria de trabalho. "
+                    "Se precisar de arquivo, use [READ] ou ferramenta direta equivalente; o conteudo retornado passa a ser sua memoria de trabalho. Nunca use [EXECUTE] para imprimir, enumerar ou extrair linhas de arquivo: isso deve ser [READ]. "
                     "Se precisar verificar se um recurso/termo existe no projeto, use [SEARCH_TEXT: padrao | arquivo] ou busca direta equivalente. "
                     "Se a solucao depender de informacao atual, documentacao externa ou erro desconhecido, use [WEB_SEARCH: consulta objetiva] para a IDE buscar na internet. "
                     "Use [SCAN_TEXT]/[FIX_MOJIBAKE] ou ferramenta direta equivalente quando fizer sentido para a missao. "
-                    "Se souber a mudanca completa, use [WRITE] ou edicao direta no workspace. "
-                    "Se souber apenas um trecho a trocar, use [REPLACE] ou patch direto equivalente. "
+                    "Para criar arquivo novo ou reescrever um arquivo inteiro, use [WRITE] com conteúdo completo. "
+                    "Para mudar um trecho de arquivo existente, use [REPLACE] com [OLD] exato e [NEW] ou [PATCH] incremental no formato *** Begin Patch / *** Update File / hunks @@ / *** End Patch. Nao exija o arquivo inteiro quando uma mudanca local resolver. "
                     "Se precisar rodar, use uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: python -m unittest]. "
                     "Se o comando realmente exigir administrador no Windows, use uma tag EXECUTE_ADMIN ja preenchida, por exemplo [EXECUTE_ADMIN: whoami /groups]; nao escreva 'como administrador' dentro do comando. "
                     "Nunca use reticencias, 'comando', 'comando real', texto entre sinais de menor/maior ou qualquer texto demonstrativo como se fosse comando real. "
                     "Nunca copie literalmente 'comando concreto' nas tags [EXECUTE] ou [EXECUTE_ADMIN]; se ainda nao houver comando real, entregue uma conclusao em texto. "
                     "Para testar projeto HTML/Web, use [EXECUTE: python -m http.server 8000]; a IDE troca pelo Python real, escolhe porta livre e valida a URL. "
                     "Para abrir uma pagina validada no navegador interno da IDE, use [OPEN_URL: http://127.0.0.1:porta/]. "
+                    "Para controlar a pagina, comece com [BROWSER_INSPECT: pagina]; use os refs retornados em [BROWSER_CLICK: e1] e [BROWSER_TYPE: e2 | texto], ou role com [BROWSER_SCROLL: down]. "
+                    "Use somente uma acao BROWSER por resposta e inspecione novamente depois que a pagina mudar. No modo irrestrito, interacoes web comuns sao autoaprovadas; apenas dados sensiveis e acoes destrutivas/financeiras podem pedir autorizacao. "
                     "Para validar visualmente um app/jogo como usuario, use [HUMAN_TEST: auto]; a IDE executa, abre, espera a tela, captura print e devolve a imagem para voce analisar. "
                     "Use [SCREENSHOT: tela] apenas quando a tela ja estiver aberta. "
                     "Depois de analisar o print, corrija com [REPLACE] ou [WRITE] e teste novamente ate funcionar. "
-                    "Para arquivo grande, prefira [READ: arquivo] uma vez; a IDE fara uma varredura completa e entregara um mapa do arquivo. "
+                    "Para arquivo grande, prefira [READ: arquivo | linhas inicio-fim] e [SEARCH_TEXT: padrao | arquivo]. A IDE devolve o intervalo exato sem forcar reescrita completa. "
                     "Entenda a estrutura antes de editar, mas nao fique repetindo leituras do mesmo arquivo. "
-                    "Em tarefa grande, faca no maximo algumas leituras estrategicas; depois aja com [REPLACE], [WRITE], uma tag EXECUTE/EXECUTE_ADMIN ja preenchida, [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST]. "
+                    "Em tarefa grande, continue coletando apenas os intervalos e buscas que forem indispensaveis para uma alteracao segura; depois aja com [REPLACE], [PATCH], [WRITE], EXECUTE/EXECUTE_ADMIN, [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST]. "
                     "Evite narrar intencoes vazias; avance com leitura, alteracao, validacao ou uma conclusao clara. "
                     "Nao peca o objetivo novamente enquanto houver uma missao ativa.\n\n"
                     f"Alteracoes recentes feitas pela IDE neste projeto:\n{self.format_recent_changes_for_agent(limit=8)}\n\n"
@@ -4109,9 +5070,22 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 local_training_context = self.build_local_training_context(objective or command)
                 if local_training_context:
                     context += f"\n\n{local_training_context}"
-                if extra_context:
-                    context += f"\n\nContexto adicional:\n{extra_context}"
+                # Contexto geral vem antes. Resultados de execucao, erros reais e
+                # estado de recuperacao precisam ir no final: o bridge do Chat Web
+                # compacta prompts longos preservando cabeca e cauda; quando o
+                # diagnostico ficava no meio, podia ser descartado antes do envio.
                 context += f"\n\n{self.build_project_intelligence_context()}"
+                visual_contract = self.build_web_chat_visual_receipt_contract(image_path)
+                priority_tail = []
+                if extra_context:
+                    priority_tail.append(
+                        "CONTEXTO TECNICO PRIORITARIO DA IDE — nao omita este bloco na proxima acao:\n"
+                        + str(extra_context)
+                    )
+                if visual_contract:
+                    priority_tail.append(visual_contract)
+                if priority_tail:
+                    context += "\n\n" + "\n\n".join(priority_tail)
 
                 direct_snapshot = self.snapshot_workspace_for_direct_actions()
                 response = self.engine.generate_solution(
@@ -4125,7 +5099,54 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 streamed_joined = "".join(streamed_text)
                 if self.is_task_cancelled(current_task_id):
                     return
+                visual_delivery_problem = self.web_chat_visual_delivery_problem(image_path)
+                if visual_delivery_problem:
+                    if self.retry_web_chat_visual_delivery(
+                        command=command,
+                        image_path=image_path,
+                        extra_context=extra_context,
+                        task_objective=objective,
+                        action_depth=action_depth,
+                        task_id=current_task_id,
+                        reason=visual_delivery_problem,
+                    ):
+                        return
+                    self.log_agent(f"Evidência visual indisponível após tentativas: {visual_delivery_problem}")
+                    if self.continue_after_visual_delivery_failure(
+                        command=command,
+                        extra_context=extra_context,
+                        task_objective=objective,
+                        action_depth=action_depth,
+                        task_id=current_task_id,
+                        reason=visual_delivery_problem,
+                    ):
+                        return
+                    self.last_response = (
+                        "A validação visual continua pendente porque o Chat Web não confirmou o print. "
+                        "O código e os testes locais foram preservados; a missão não foi marcada como concluída.\n\n"
+                        f"Motivo técnico: {visual_delivery_problem}"
+                    )
+                    self.add_chat_message("Erro", self.last_response)
+                    self.set_status("Validação visual pendente de confirmação.", "warning")
+                    return
                 self.last_response = response or streamed_joined
+                provider_failed = self.is_external_model_failure_response(self.last_response)
+                try:
+                    provider_failed = provider_failed or self.engine.should_try_external_ai_fallback(self.last_response)
+                except Exception:
+                    pass
+                if provider_failed and not image_path:
+                    self.add_chat_message(
+                        "Sistema",
+                        "Os provedores configurados ficaram indisponiveis. Continuando a mesma missao pelo chat web...",
+                    )
+                    browser_fallback = self.request_browser_ai_fallback(
+                        objective,
+                        code_context=context,
+                        task_id=current_task_id,
+                    )
+                    if browser_fallback:
+                        self.last_response = browser_fallback
                 local_fallback = self.local_llm_fallback_reply(
                     command,
                     self.last_response,
@@ -4135,7 +5156,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     self.last_response = local_fallback
                 if not (self.last_response or "").strip():
                     self.last_response = (
-                        "O Codex terminou sem devolver texto para a IDE. "
+                        f"{self.ai_assistant_display_name()} terminou sem devolver texto para a IDE. "
                         "A tarefa nao foi concluida. Clique em Reenviar para tentar novamente, "
                         "ou abra o Log do Agente para verificar se houve interrupcao."
                     )
@@ -4152,6 +5173,29 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     cleaned_answer = self.strip_agent_action_markup(self.last_response or "").strip()
                     if cleaned_answer:
                         self.last_response = cleaned_answer
+
+                # O navegador mantém a mídia na conversa do provedor. Exibir a
+                # confirmação aqui torna a criação de imagem/áudio verificável na
+                # própria IDE, sem tentar baixar URLs autenticadas de terceiros.
+                web_artifacts = getattr(self.engine, "latest_web_chat_artifacts", {})
+                if (
+                    getattr(self.engine, "provider", "") == "web_chat"
+                    and isinstance(web_artifacts, dict)
+                ):
+                    image_count = len(web_artifacts.get("images") or [])
+                    audio_count = len(web_artifacts.get("audio") or [])
+                    if image_count or audio_count:
+                        generated = []
+                        if image_count:
+                            generated.append(f"{image_count} imagem(ns)")
+                        if audio_count:
+                            generated.append(f"{audio_count} áudio(s)")
+                        self.add_chat_message(
+                            "Sistema",
+                            "Chat Web detectou "
+                            + " e ".join(generated)
+                            + ". O resultado permanece disponível na conversa restaurada do navegador interno.",
+                        )
                 direct_changes, direct_change_total = self.detect_direct_workspace_changes(direct_snapshot)
                 direct_action_happened = direct_change_total > 0
                 if direct_action_happened:
@@ -4162,15 +5206,21 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     )
 
                 invalid_claim = False
-                if (
-                    not direct_action_happened
-                    and not self.task_has_real_action(current_task_id)
-                    and self.claims_concrete_result_without_real_action(
+                web_chat_recovery_reason = self.web_chat_response_recovery_reason(
+                    self.last_response,
+                    task_objective=objective,
+                    task_id=current_task_id,
+                    direct_action_happened=direct_action_happened,
+                )
+                if web_chat_recovery_reason:
+                    invalid_claim = self.claims_concrete_result_without_real_action(
                         self.last_response,
                         task_objective=objective,
                     )
-                ):
-                    self.log_agent("Aviso: resposta afirma acao sem evidencia direta; exibindo sem bloquear.")
+                    self.log_agent(
+                        "Chat Web devolveu texto sem ação verificável; iniciando recuperação contínua: "
+                        + web_chat_recovery_reason
+                    )
                 has_agent_action = self.response_has_agent_action(self.last_response)
                 display_response = self.build_ai_display_response(
                     self.last_response,
@@ -4194,7 +5244,19 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     self.finish_stream_message()
                 else:
                     if display_response or not has_agent_action:
-                        self.add_chat_message("Merotec IA", display_response or self.last_response)
+                        self.add_chat_message(self.ai_assistant_display_name(), display_response or self.last_response)
+                if web_chat_recovery_reason and not answer_only:
+                    if self.continue_after_web_chat_protocol_stall(
+                        command=command,
+                        image_path=image_path,
+                        extra_context=extra_context,
+                        task_objective=objective,
+                        action_depth=action_depth,
+                        task_id=current_task_id,
+                        response_text=self.last_response,
+                        reason=web_chat_recovery_reason,
+                    ):
+                        return
                 if retry_available:
                     pass
                 elif self.is_codex_capacity_response(self.last_response):
@@ -4238,35 +5300,42 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             return False
         return bool(self.extract_agent_action_names(text))
 
+
+    # MEROTEC_AUTONOMOUS_STRIP_V2
     def strip_agent_action_markup(self, text):
         if not text:
             return ""
         cleaned = text
-        block_patterns = [
+        for pattern in (
+            r"\[PATCH(?:\s*:\s*[^\]\r\n]+)?\].*?\[/PATCH\]",
             r"\[WRITE:\s*.+?\].*?\[/WRITE\]",
             r"\[REPLACE:\s*.+?\].*?\[/REPLACE\]",
-        ]
-        for pattern in block_patterns:
+        ):
             cleaned = re.sub(pattern, "", cleaned, flags=re.DOTALL | re.IGNORECASE)
-        action_tag = (
-            r"\[(READ|SEARCH_TEXT|WEB_SEARCH|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|EXECUTE_ADMIN|OPEN_URL|SCREENSHOT|HUMAN_TEST)"
-            r"[ \t]*:[^\]\r\n]+\]"
+        # ``.*`` até o fim da linha preserva comandos com regex/listas, por
+        # exemplo [EXECUTE: python -c "re.findall(r'<script[^>]*>', html)"].
+        action_names = (
+            "READ|SEARCH_TEXT|WEB_SEARCH|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|"
+            "EXECUTE_ADMIN|OPEN_URL|BROWSER_INSPECT|BROWSER_CLICK|BROWSER_TYPE|"
+            "BROWSER_SCROLL|BROWSER_CHAT|SCREENSHOT|HUMAN_TEST"
         )
-        cleaned_lines = []
-        for line in cleaned.splitlines():
-            if re.sub(action_tag, "", line, flags=re.IGNORECASE).strip():
-                cleaned_lines.append(line)
-        cleaned = "\n".join(cleaned_lines)
-        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-        return cleaned
+        # Mantém a visualização coerente com o executor: além da forma
+        # canônica [READ: arquivo], remove as variantes que chats web às vezes
+        # produzem, como [READ] arquivo e READ arquivo.
+        action_line = re.compile(
+            rf"^\s*(?:\[(?:{action_names})(?:[ \t]*:\s*[^\r\n]*)?\][ \t]*[^\r\n]*|(?:{action_names})[ \t]*(?::|[ \t]+)[ \t]*.+)\s*$",
+            re.IGNORECASE,
+        )
+        kept = [line for line in cleaned.splitlines() if not action_line.fullmatch(line)]
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
 
     def action_execution_message(self, text):
         if not text:
             return ""
         tags = self.extract_agent_action_names(text)
-        if tags & {"WRITE", "REPLACE", "FIX_MOJIBAKE", "UNDO"}:
-            return "A IDE recebeu uma alteracao real e iniciou a aplicacao no projeto."
-        if tags & {"EXECUTE", "EXECUTE_ADMIN", "OPEN_URL", "SCREENSHOT", "HUMAN_TEST"}:
+        if tags & {"PATCH", "WRITE", "REPLACE", "FIX_MOJIBAKE", "UNDO"}:
+            return "A IDE recebeu uma alteracao real e iniciou aplicacao, validacao e teste automatico quando necessario."
+        if tags & {"EXECUTE", "EXECUTE_ADMIN", "OPEN_URL", "BROWSER_INSPECT", "BROWSER_CLICK", "BROWSER_TYPE", "BROWSER_SCROLL", "BROWSER_CHAT", "SCREENSHOT", "HUMAN_TEST"}:
             return "A IDE recebeu uma execucao real e iniciou a validacao."
         if tags & {"READ", "SEARCH_TEXT", "WEB_SEARCH", "SCAN_TEXT"}:
             return "A IDE esta coletando contexto objetivo para executar o proximo passo."
@@ -4545,6 +5614,206 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self._run_ai_task("Analise a imagem e aponte problemas, oportunidades ou proximos passos.", image_path=image_path)
 
 
+
+# MEROTEC_VISUAL_AUTONOMY_V3
+def _merotec_visual_browser_state(self):
+    state = getattr(self, "_merotec_visual_browser", None)
+    if not isinstance(state, dict):
+        state = {
+            "process": None,
+            "reader": None,
+            "ready": __import__("threading").Event(),
+            "url": "",
+            "title": "",
+            "last_error": "",
+        }
+        self._merotec_visual_browser = state
+    return state
+
+
+def _merotec_read_visual_browser_events(self, process):
+    state = self._merotec_visual_browser_state()
+    try:
+        if process.stdout is None:
+            return
+        for raw_line in process.stdout:
+            try:
+                event = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
+            event_name = str(event.get("event") or "")
+            if event_name in {"ready", "navigated"}:
+                state["url"] = str(event.get("url") or state.get("url") or "")
+                state["ready"].set()
+                self.set_internal_browser_status(
+                    f"Teste visual aberto em navegador dedicado: {state['url']}",
+                    "ready",
+                )
+            elif event_name in {"error", "command_error"}:
+                state["last_error"] = str(event.get("message") or "Falha no navegador de teste.")
+                self.log_agent(f"Navegador visual: {state['last_error']}")
+            elif event_name == "closed":
+                state["ready"].clear()
+    finally:
+        if state.get("process") is process:
+            state["process"] = None
+            state["ready"].clear()
+
+
+def _merotec_open_visual_test_browser(self, url, task_id=None):
+    normalized = self.normalize_internal_browser_url(url)
+    if not normalized:
+        return {"opened": False, "error": "URL de teste visual vazia."}
+
+    state = self._merotec_visual_browser_state()
+    state["url"] = normalized
+    state["last_error"] = ""
+    state["ready"].clear()
+    workspace_name = Path(str(getattr(self, "current_workspace", "projeto"))).name or "projeto"
+    title = f"Merotec IA - Teste Visual - {workspace_name}"
+    state["title"] = title
+
+    process = state.get("process")
+    if process is not None and process.poll() is None:
+        if self._write_internal_browser_command(process, "navigate", url=normalized):
+            if threading.current_thread() is not threading.main_thread():
+                state["ready"].wait(timeout=12)
+            return {
+                "opened": bool(state["ready"].is_set()),
+                "url": normalized,
+                "title": title,
+                "error": state.get("last_error", ""),
+            }
+
+    helper = PROJECT_ROOT / "modules" / "browser_runtime.py"
+    if not helper.exists():
+        return {"opened": False, "error": f"Componente ausente: {helper}"}
+
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["MEROTEC_VISUAL_TEST_BROWSER"] = "1"
+    try:
+        process = subprocess.Popen(
+            [
+                sys.executable, "-u", "-m", "modules.browser_runtime",
+                "--url", normalized,
+                "--title", title,
+                "--storage-scope", "visual-tests",
+            ],
+            cwd=str(PROJECT_ROOT),
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=creationflags,
+        )
+    except Exception as exc:
+        return {"opened": False, "error": f"Não consegui iniciar o navegador visual: {exc}"}
+
+    state["process"] = process
+    reader = threading.Thread(target=self._read_visual_test_browser_events, args=(process,), daemon=True)
+    state["reader"] = reader
+    reader.start()
+    if threading.current_thread() is not threading.main_thread():
+        state["ready"].wait(timeout=18)
+    return {
+        "opened": bool(state["ready"].is_set()),
+        "url": normalized,
+        "title": title,
+        "error": state.get("last_error", ""),
+    }
+
+
+def _merotec_get_visual_test_browser_info(self):
+    state = self._merotec_visual_browser_state()
+    process = state.get("process")
+    if process is None or process.poll() is not None:
+        return {}
+    return {
+        "url": state.get("url", ""),
+        "title": state.get("title", ""),
+        "ready": bool(state.get("ready") and state["ready"].is_set()),
+    }
+
+
+def _merotec_close_visual_test_browser(self):
+    state = self._merotec_visual_browser_state()
+    process = state.get("process")
+    if process is None or process.poll() is not None:
+        return
+    self._write_internal_browser_command(process, "close")
+    def terminate_later():
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+    threading.Thread(target=terminate_later, daemon=True).start()
+
+
+_original_merotec_request_app_close = UniversalApp.request_app_close
+
+def _merotec_request_app_close_with_visual_browser(self):
+    # Não use ``return`` em ``finally``: além do SyntaxWarning, isso pode
+    # mascarar uma falha do navegador e interromper o fechamento normal.
+    try:
+        self.close_visual_test_browser()
+    except Exception as exc:
+        try:
+            self.log_agent(f"Falha ao fechar navegador visual: {exc}")
+        except Exception:
+            pass
+    return _original_merotec_request_app_close(self)
+
+
+UniversalApp._merotec_visual_browser_state = _merotec_visual_browser_state
+UniversalApp._visual_browser_state = _merotec_visual_browser_state
+UniversalApp._read_visual_test_browser_events = _merotec_read_visual_browser_events
+UniversalApp.open_visual_test_browser = _merotec_open_visual_test_browser
+UniversalApp.get_visual_test_browser_info = _merotec_get_visual_test_browser_info
+UniversalApp.close_visual_test_browser = _merotec_close_visual_test_browser
+UniversalApp.request_app_close = _merotec_request_app_close_with_visual_browser
+
+# MEROTEC_BROWSER_ERROR_DISPATCH_V1
+UniversalApp._merotec_browser_error_dispatch_v1 = True
+
+
+# MEROTEC_CONFIGURED_PROVIDER_LOCK_V1
+# Não troca para ChatGPT/navegador externo nem modelo local quando o provedor
+# ativo falha. A tarefa retorna o erro do provedor configurado ao usuário.
+
+def _merotec_locked_browser_ai_fallback_enabled(self):
+    return False
+
+
+def _merotec_locked_request_browser_ai_fallback(self, command, code_context=None, task_id=None):
+    self.log_agent(
+        "Fallback pelo navegador bloqueado: a tarefa permanece no provedor configurado."
+    )
+    return ""
+
+
+def _merotec_locked_is_external_model_failure_response(self, text):
+    return False
+
+
+def _merotec_locked_local_llm_fallback_reply(self, command, external_response="", image_path=None):
+    return ""
+
+
+UniversalApp.browser_ai_fallback_enabled = _merotec_locked_browser_ai_fallback_enabled
+UniversalApp.request_browser_ai_fallback = _merotec_locked_request_browser_ai_fallback
+UniversalApp.is_external_model_failure_response = _merotec_locked_is_external_model_failure_response
+UniversalApp.local_llm_fallback_reply = _merotec_locked_local_llm_fallback_reply
+
+# Inicialize somente depois de registrar todos os patches da aplicação.
 if __name__ == "__main__":
     if not _activate_existing_instance():
         app = UniversalApp()

@@ -17,6 +17,14 @@ class TextRepairTest(unittest.TestCase):
             self.app.repair_common_mojibake(broken),
         )
 
+    def test_replacement_character_mojibake_from_local_ai_is_repaired(self):
+        broken = "Diagn\ufffdstico: aplica\ufffd\ufffdo com mem\ufffdria/RAG e m\ufffddulos de orquestra\ufffd\ufffdo."
+
+        self.assertEqual(
+            "Diagnostico: aplicacao com memoria/RAG e modulos de orquestracao.",
+            self.app.repair_common_mojibake(broken),
+        )
+
     def test_text_repair_methods_are_not_duplicated_in_source(self):
         source = inspect.getsource(AgentActionsMixin)
 

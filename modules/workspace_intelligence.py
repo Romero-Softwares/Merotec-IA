@@ -16,6 +16,10 @@ from modules.memory import MemorySubnet
 
 
 class WorkspaceIntelligenceMixin:
+    def model_directed_autonomy_enabled(self):
+        settings = getattr(self, "settings", None)
+        return isinstance(settings, dict) and bool(settings.get("autonomous_unrestricted_mode", False))
+
     def local_quick_reply(self, command, image_path=None):
         if image_path:
             return None
@@ -29,9 +33,10 @@ class WorkspaceIntelligenceMixin:
         if calculation_reply:
             return calculation_reply
 
-        capability_reply = self.local_capability_question_reply(command, normalized)
-        if capability_reply:
-            return capability_reply
+        if not self.model_directed_autonomy_enabled():
+            capability_reply = self.local_capability_question_reply(command, normalized)
+            if capability_reply:
+                return capability_reply
 
         if self.is_local_llm_request(normalized):
             return self.local_llm_reply(command)
@@ -320,9 +325,13 @@ class WorkspaceIntelligenceMixin:
         if image_path:
             return None
 
-        discovery_reply = self.local_autonomous_discovery_reply(command, normalized)
-        if discovery_reply:
-            return discovery_reply
+        # No modo irrestrito, pedidos gerais seguem para o modelo configurado.
+        # Mantemos o atalho local apenas para a operacao especializada que
+        # realmente exporta os artefatos da sub-rede offline.
+        if not self.model_directed_autonomy_enabled() or self.is_local_training_subnet_request(normalized):
+            discovery_reply = self.local_autonomous_discovery_reply(command, normalized)
+            if discovery_reply:
+                return discovery_reply
 
         if self.is_zoom_mobile_verification_request(normalized):
             return self.verify_zoom_mobile_locally(command)
@@ -382,24 +391,8 @@ class WorkspaceIntelligenceMixin:
         discovery_terms = {
             "descoberta",
             "descobrir",
-            "interacao",
-            "interacoes",
             "gatilho",
             "gatilhos",
-            "stress",
-            "estresse",
-            "teste",
-            "testes",
-            "mapear",
-            "mapeamento",
-            "mercado",
-            "ciclo",
-            "clube",
-            "varredura",
-            "varrer",
-            "subrede",
-            "sub",
-            "rede",
         }
         human_terms = {"humano", "humanos", "usuario", "pessoa", "interacao", "interacoes"}
         has_autonomy = bool(words & autonomy_terms) or "sem humano" in normalized or "sem o humano" in normalized
@@ -904,6 +897,10 @@ class WorkspaceIntelligenceMixin:
             "nao esta logado",
             "nao conseguiu iniciar",
             "terminou sem devolver texto",
+            "tempo esgotado no modelo local gguf",
+            "erro no lm studio",
+            "nao consegui conectar ao lm studio",
+            "o lm studio demorou mais",
             "app-server retornou erro",
             "retornou erro",
         }
@@ -1461,6 +1458,17 @@ class WorkspaceIntelligenceMixin:
         return matches
 
     def is_project_run_request(self, normalized):
+        if any(
+            marker in normalized
+            for marker in (
+                "teste visual",
+                "testes visuais",
+                "testar visualmente",
+                "teste de interface",
+                "testar a interface",
+            )
+        ):
+            return False
         words = set(re.findall(r"[a-z0-9_]+", normalized))
         run_terms = {"execute", "executa", "executar", "rode", "roda", "rodar", "abrir", "inicie", "iniciar"}
         build_terms = {"build", "builde", "compila", "compile", "compilar"}

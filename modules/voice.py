@@ -1,9 +1,29 @@
-import speech_recognition as sr
-import pyttsx3
-import sounddevice as sd
+try:
+    import speech_recognition as sr
+    SPEECH_RECOGNITION_AVAILABLE = True
+except ModuleNotFoundError:
+    SPEECH_RECOGNITION_AVAILABLE = False
+
+    class _SpeechRecognitionStub:
+        class UnknownValueError(Exception):
+            pass
+
+    sr = _SpeechRecognitionStub()
+try:
+    import pyttsx3
+except ModuleNotFoundError:
+    pyttsx3 = None
+try:
+    import sounddevice as sd
+except ModuleNotFoundError:
+    sd = None
 import numpy as np
-import scipy.io.wavfile as wav
-from scipy import signal
+try:
+    import scipy.io.wavfile as wav
+    from scipy import signal
+except ModuleNotFoundError:
+    wav = None
+    signal = None
 import tempfile
 import os
 import threading
@@ -18,7 +38,7 @@ def _normalizar_texto_para_fala(text):
     texto = str(text or "")
     texto = re.sub(r"```.*?```", " ", texto, flags=re.DOTALL)
     texto = re.sub(
-        r"\[(?:READ|WRITE|REPLACE|SEARCH_TEXT|SCAN_TEXT|FIX_MOJIBAKE|EXECUTE|EXECUTE_ADMIN|OPEN_URL|SCREENSHOT|HUMAN_TEST|UNDO):[^\]]+\]",
+        r"\[(?:READ|WRITE|REPLACE|SEARCH_TEXT|SCAN_TEXT|FIX_MOJIBAKE|EXECUTE|EXECUTE_ADMIN|OPEN_URL|BROWSER_INSPECT|BROWSER_CLICK|BROWSER_TYPE|BROWSER_SCROLL|SCREENSHOT|HUMAN_TEST|UNDO):[^\]]+\]",
         " ",
         texto,
     )
@@ -29,10 +49,11 @@ def _normalizar_texto_para_fala(text):
 
 class VoiceModule:
     def __init__(self):
-        self.recognizer = sr.Recognizer()
-        self.recognizer.dynamic_energy_threshold = True
-        self.recognizer.pause_threshold = 0.8
-        self.recognizer.non_speaking_duration = 0.4
+        self.recognizer = sr.Recognizer() if SPEECH_RECOGNITION_AVAILABLE else None
+        if self.recognizer is not None:
+            self.recognizer.dynamic_energy_threshold = True
+            self.recognizer.pause_threshold = 0.8
+            self.recognizer.non_speaking_duration = 0.4
         self.fs = 16000
         self.input_device = None
         self.input_samplerate = self.fs
@@ -87,7 +108,8 @@ class VoiceModule:
         self.queue = Queue()
 
         # Processo auxiliar que gerencia o motor de voz sem conflitos
-        threading.Thread(target=self._worker, daemon=True).start()
+        if pyttsx3 is not None:
+            threading.Thread(target=self._worker, daemon=True).start()
 
     def _worker(self):
         """Processo auxiliar simplificado para gerenciar pedidos de fala"""
@@ -121,6 +143,8 @@ class VoiceModule:
                 self.queue.task_done()
 
     def speak(self, text):
+        if pyttsx3 is None:
+            return
         """Lê o texto completo reconstruindo o motor para evitar travamentos"""
 
         def run_speech():
@@ -189,6 +213,8 @@ class VoiceModule:
         self.is_paused = False
 
     def _get_input_device_config(self):
+        if sd is None:
+            raise RuntimeError("sounddevice nao esta instalado; captura de voz indisponivel.")
         if self.input_device is not None:
             return self.input_device, self.input_samplerate
 
@@ -308,6 +334,10 @@ class VoiceModule:
         return audio.astype(np.int16)
 
     def _recognize_wav_array(self, audio, samplerate, keywords=()):
+        if self.recognizer is None:
+            raise RuntimeError("speech_recognition nao esta instalado; recurso de voz indisponivel.")
+        if wav is None:
+            raise RuntimeError("scipy nao esta instalado; transcricao de voz indisponivel.")
         temp_filename = None
         try:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_wav:

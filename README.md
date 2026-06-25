@@ -3,6 +3,22 @@
 Projeto Python desktop com interface em CustomTkinter para automação assistida por IA, gerenciamento de projetos, execução de comandos e captura de voz.
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/3d1391d1-e5d6-4e6d-af41-9fe28b041629" />
 
+## Fluxo de projetos
+
+- `Arquivo > Novo projeto`: cria projetos vazios, Python ou Web sem sobrescrever pastas existentes.
+- `Arquivo > Abrir projeto/pasta`: troca o workspace ativo; a pasta da propria IDE e bloqueada como projeto.
+- `Arquivo > Abrir arquivo externo`: edita arquivos avulsos sem trocar o projeto ativo.
+- Ao iniciar, a IDE restaura o ultimo projeto editado.
+- `IA > Enviar missao ao ChatGPT Web`: prepara uma missao com o mapa do workspace.
+- `IA > Importar resposta do ChatGPT`: traz a resposta para a IDE e, com confirmacao, executa as acoes de codigo no projeto.
+
+## Recursos de editor
+
+- `Ctrl+Espaco`: autocompletar local por contexto, identificadores do arquivo e vocabulario da linguagem.
+- `Ctrl+Shift+O`: navegar por classes, metodos, funcoes, headings, seletores CSS e IDs HTML.
+- `Ctrl+/`: comentar ou descomentar a selecao.
+- Identacao inteligente, pares automaticos, busca, zoom, numeros de linha e marcadores de alteracao.
+
 ## Requisitos
 
 - Python 3.11 ou superior
@@ -21,6 +37,16 @@ pip install -r requirements.txt
 
 ```bash
 python main.py
+```
+
+No Windows, `init_System.cmd` localiza a propria pasta e cria o ambiente virtual na primeira execucao. O projeto pode ser movido ou clonado sem editar caminhos absolutos.
+
+## Validacao
+
+```bash
+venv\Scripts\python.exe -m unittest discover -s tests -v
+venv\Scripts\python.exe -m compileall -q main.py modules
+venv\Scripts\python.exe -m pip check
 ```
 
 ## Sequência de acesso

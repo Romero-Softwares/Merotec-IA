@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="pt-BR">
+<head><meta charset="utf-8"><title>Teste de automacao</title></head>
+<body>
+  <label>Nome <input placeholder="Nome"></label>
+  <button onclick="this.innerText = 'OK ' + document.querySelector('input').value">Criar</button>
+  <div contenteditable="plaintext-only" aria-label="Prompt moderno"></div>
+  <textarea id="prompt-textarea" placeholder="Mensagem para a IA"></textarea>
+  <button data-testid="send-button" onclick="setTimeout(() => {
+    const answer = document.createElement('div');
+    answer.setAttribute('data-message-author-role', 'assistant');
+    answer.innerText = '[WRITE: app.txt]conteudo criado pelo fallback[/WRITE]';
+    document.body.appendChild(answer);
+  }, 150)">Enviar</button>
+</body>
+</html>

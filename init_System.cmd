@@ -9,31 +9,35 @@ echo                      MEROTEC IA
 echo =======================================================
 echo [SISTEMA] Iniciando processos locais...
 
-:: Navega ate o diretorio do projeto
-cd /d "C:\Users\Merotec\Desktop\AI_Software_Enginering"
+:: Usa sempre a pasta onde este iniciador esta, inclusive apos mover/clonar a IDE.
+cd /d "%~dp0"
 
 :: Ativa o ambiente virtual e inicia a IDE
-if not exist venv (
+if not exist "venv\Scripts\python.exe" (
     color 0C
     echo [ERRO] Ambiente venv nao encontrado em: %cd%
     echo [AVISO] criando ambiente venv...
-    python -m venv venv
-    echo [AVISO] Ambiente venv criado em: %cd%
-    pause
-    exit
+    py -3 -m venv venv 2>nul || python -m venv venv
+    if errorlevel 1 goto :startup_error
+    echo [VENV] Instalando dependencias iniciais...
+    "venv\Scripts\python.exe" -m pip install -r requirements.txt
+    if errorlevel 1 goto :startup_error
 )
 
-echo [VENV] Ativando ambiente virtual...
-call venv\Scripts\activate
-echo [VENV] ambiente virtual ativado!
-
-set "TCL_LIBRARY=%LOCALAPPDATA%\Programs\Python\Python314\tcl\tcl8.6"
-set "TK_LIBRARY=%LOCALAPPDATA%\Programs\Python\Python314\tcl\tk8.6"
+echo [VENV] Ambiente virtual localizado.
 
 echo [SISTEMA] Carregando configuracoes automáticas do painel...
 echo.
 echo ********************************************************
 echo.
 echo [SISTEMA] Abrindo a interface grafica da IDE...
-python main.py
+"venv\Scripts\python.exe" main.py
+if errorlevel 1 goto :startup_error
+exit /b 0
+
+:startup_error
+color 0C
+echo.
+echo [ERRO] Nao foi possivel iniciar a IDE. Revise a mensagem acima.
 pause
+exit /b 1

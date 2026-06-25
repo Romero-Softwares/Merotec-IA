@@ -72,6 +72,25 @@ class AutonomousDiscoveryTriggersTest(unittest.TestCase):
                     self.app.classify_autonomous_discovery_trigger(text),
                 )
 
+    def test_browser_task_with_autonomous_text_is_not_hijacked_by_discovery_reply(self):
+        command = (
+            "Inspecione a pagina aberta, preencha o campo Nome com Teste autonomo, "
+            "clique em Criar e confirme o resultado"
+        )
+
+        reply = self.app.local_autonomous_task(command, self.app.normalize_plain_text(command))
+
+        self.assertIsNone(reply)
+        self.assertFalse(self.app.is_autonomous_discovery_request(self.app.normalize_plain_text(command)))
+
+    def test_unrestricted_mode_routes_discovery_language_to_configured_model(self):
+        self.app.settings = {"autonomous_unrestricted_mode": True}
+        command = "investigue autonomamente os gatilhos de descoberta deste projeto"
+
+        reply = self.app.local_autonomous_task(command, self.app.normalize_plain_text(command))
+
+        self.assertIsNone(reply)
+
     def test_local_training_subnet_request_exports_redacted_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir)

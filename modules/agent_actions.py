@@ -206,7 +206,8 @@ class AgentActionsMixin:
         if not self.last_failed_ai_task:
             return
         self.btn_send.configure(state="normal", text="Reenviar")
-        self.set_status("Codex ocupado. Clique Reenviar para tentar de novo.", "busy")
+        model_name = self.ai_assistant_display_name() if hasattr(self, "ai_assistant_display_name") else "IA"
+        self.set_status(f"{model_name} indisponivel. Clique Reenviar para tentar de novo.", "busy")
 
     def resolve_workspace_path(self, requested_path):
         clean = requested_path.strip().strip("\"'")
@@ -258,47 +259,91 @@ class AgentActionsMixin:
 
         return None
 
+
     def iter_agent_action_lines(self, response_text, action_names=None):
+        """Extrai ações curtas do protocolo, inclusive variantes comuns de chat web.
+
+        A IDE sempre pede o formato ``[READ: arquivo]``, mas alguns chats —
+        em diferentes chats web — retornam ``[READ] arquivo`` ou ``READ arquivo``.
+        Antes da correção essas respostas eram exibidas como se a IDE estivesse
+        trabalhando, porém não chegavam ao executor e a missão parava. O parser
+        aceita as três formas somente quando a linha inteira é um comando, sem
+        interpretar parágrafos comuns como ação.
+        """
         if not response_text:
             return
         if action_names is None:
             action_names = (
-                "READ",
-                "SEARCH_TEXT",
-                "WEB_SEARCH",
-                "SCAN_TEXT",
-                "FIX_MOJIBAKE",
-                "UNDO",
-                "EXECUTE",
-                "EXECUTE_ADMIN",
-                "OPEN_URL",
-                "SCREENSHOT",
-                "HUMAN_TEST",
+                "READ", "SEARCH_TEXT", "WEB_SEARCH", "SCAN_TEXT",
+                "FIX_MOJIBAKE", "UNDO", "EXECUTE", "EXECUTE_ADMIN",
+                "OPEN_URL", "BROWSER_INSPECT", "BROWSER_CLICK",
+                "BROWSER_TYPE", "BROWSER_SCROLL", "BROWSER_CHAT", "SCREENSHOT", "HUMAN_TEST",
             )
-        action_names = tuple(str(name).upper() for name in action_names)
-        action_pattern = "|".join(re.escape(name) for name in action_names)
-        tag_pattern = re.compile(
-            rf"\[({action_pattern})[ \t]*:[ \t]*([^\]\r\n]+?)[ \t]*\]",
-            re.IGNORECASE,
-        )
+        allowed = {str(name).upper() for name in action_names}
+        action_pattern = "|".join(re.escape(name) for name in sorted(allowed, key=len, reverse=True))
+        lines = str(response_text).splitlines()
         in_fenced_block = False
-        for line in str(response_text).splitlines():
-            stripped = line.strip()
-            if stripped.startswith("```"):
+
+        for index, raw_line in enumerate(lines):
+            line = raw_line.strip()
+            if line.startswith("```"):
                 in_fenced_block = not in_fenced_block
                 continue
-            if in_fenced_block:
-                continue
-            matches = list(tag_pattern.finditer(line))
-            if not matches:
+            if in_fenced_block or not line:
                 continue
 
-            without_tags = tag_pattern.sub("", line).strip()
-            if without_tags:
+            adjacent_actions = re.fullmatch(
+                rf"(?:\[(?:{action_pattern})(?:[ \t]*:[^\]\r\n]*)?\]){{2,}}",
+                line,
+                re.IGNORECASE,
+            )
+            if adjacent_actions:
+                for match in re.finditer(
+                    rf"\[({action_pattern})(?:[ \t]*:[ \t]*([^\]\r\n]*))?\]",
+                    line,
+                    re.IGNORECASE,
+                ):
+                    action = match.group(1).upper()
+                    value = (match.group(2) or "").strip()
+                    if action in allowed and value:
+                        yield action, value
                 continue
 
-            for match in matches:
-                yield match.group(1).upper(), match.group(2).strip()
+            # Formatos aceitos:
+            #   [READ: main.py]      (canônico da IDE)
+            #   [READ] main.py       (variante recorrente de chats web)
+            #   READ: main.py / READ main.py
+            bracketed = re.fullmatch(
+                r"\[([A-Za-z_]+)(?:[ \t]*:[ \t]*(.*))?\][ \t]*(.*)",
+                line,
+                re.DOTALL,
+            )
+            if bracketed:
+                action = bracketed.group(1).upper()
+                if action not in allowed:
+                    continue
+                value = (bracketed.group(2) or bracketed.group(3) or "").strip()
+                # Alguns provedores quebram a tag e o parâmetro em duas linhas.
+                if not value and index + 1 < len(lines):
+                    next_line = lines[index + 1].strip()
+                    if next_line and not next_line.startswith("[") and not next_line.startswith("```"):
+                        value = next_line
+                if value:
+                    yield action, value
+                continue
+
+            # Formas sem colchetes são limitadas a um nome de ação inteiro no
+            # início da linha para evitar transformar explicações em comandos.
+            plain = re.fullmatch(
+                r"([A-Z][A-Z_]{1,})[ \t]*(?::|[ \t]+)[ \t]*(.+)",
+                line,
+            )
+            if not plain:
+                continue
+            action = plain.group(1).upper()
+            value = plain.group(2).strip()
+            if action in allowed and value:
+                yield action, value
 
     def extract_agent_action_values(self, response_text, action_name):
         values = []
@@ -312,13 +357,496 @@ class AgentActionsMixin:
             seen.add(value)
         return values
 
+    def _extract_fenced_code_payload(self, content):
+        """Retorna o código de um bloco Markdown sem perder indentação.
+
+        Chats web às vezes envelopam um WRITE em explicações e um único bloco
+        de código. Para a escrita, somente o bloco é conteúdo do arquivo.
+        """
+        raw = str(content or "").replace("\r\n", "\n").replace("\r", "\n")
+        match = re.search(r"```[^\n`]*\n(.*?)\n```", raw, re.DOTALL)
+        if match:
+            return match.group(1).strip("\n") + "\n"
+        return raw.strip("\n") + ("\n" if raw.strip("\n") else "")
+
+    def _looks_like_write_payload(self, raw_path, content):
+        """Evita converter texto explicativo em sobrescrita de arquivo."""
+        payload = str(content or "").strip()
+        if not payload:
+            return False
+        if "```" in payload:
+            return True
+
+        suffix = Path(str(raw_path or "").strip()).suffix.lower()
+        code_prefix = re.compile(
+            r"(?m)^\s*(?:from\s+\w+|import\s+\w+|def\s+\w+|class\s+\w+|"
+            r"async\s+def\s+\w+|[A-Za-z_]\w*\s*=|if\s+__name__\s*==|"
+            r"<!(?:doctype)|<html|<\?xml|function\s+\w+|const\s+\w+|let\s+\w+|"
+            r"var\s+\w+|#include|package\s+|public\s+(?:class|static)|"
+            r"{\s*[\"']|\[\s*[\"'{])"
+        )
+        if code_prefix.search(payload):
+            return True
+        if suffix in {".md", ".txt", ".csv", ".ini", ".env", ".yml", ".yaml"}:
+            return "\n" in payload or len(payload) >= 24
+        return False
+
+    def extract_write_blocks(self, response_text):
+        """Extrai WRITEs fechados e recupera um WRITE cujo fechamento sumiu.
+
+        O WebView pode entregar uma resposta completa em Markdown, mas alguns
+        chats removem a linha ``[/WRITE]`` ao renderizar/copiar. O cabeçalho
+        ainda identifica com segurança o arquivo; o conteúdo só é aceito se
+        parecer código ou estiver dentro de um bloco Markdown. A validação por
+        linguagem acontece antes de qualquer gravação em disco.
+        """
+        payload = str(response_text or "")
+        closed_pattern = re.compile(
+            r"\[WRITE\s*:\s*([^\]\r\n]+)\]\s*(.*?)\s*\[/WRITE\]",
+            re.DOTALL | re.IGNORECASE,
+        )
+        blocks = []
+        closed_spans = []
+        for match in closed_pattern.finditer(payload):
+            raw_path = match.group(1).strip()
+            content = match.group(2)
+            if raw_path and content.strip():
+                blocks.append((raw_path, content, False))
+                closed_spans.append(match.span())
+
+        header_pattern = re.compile(
+            r"(?im)^\s*\[WRITE\s*:\s*([^\]\r\n]+)\]\s*(?:\r?\n)?"
+        )
+        next_action_pattern = re.compile(
+            r"(?im)^\s*\[(?:PATCH|WRITE|REPLACE|READ|SEARCH_TEXT|WEB_SEARCH|SCAN_TEXT|"
+            r"FIX_MOJIBAKE|UNDO|EXECUTE(?:_ADMIN)?|OPEN_URL|BROWSER_INSPECT|BROWSER_CLICK|"
+            r"BROWSER_TYPE|BROWSER_SCROLL|BROWSER_CHAT|SCREENSHOT|HUMAN_TEST|FINAL)\s*:",
+        )
+        seen = {(item[0].strip().lower(), item[1].strip()) for item in blocks}
+        for header in header_pattern.finditer(payload):
+            if any(start <= header.start() < end for start, end in closed_spans):
+                continue
+            raw_path = header.group(1).strip()
+            body_start = header.end()
+            next_action = next_action_pattern.search(payload, body_start)
+            body_end = next_action.start() if next_action else len(payload)
+            content = payload[body_start:body_end].strip("\r\n")
+            if not raw_path or not self._looks_like_write_payload(raw_path, content):
+                continue
+            key = (raw_path.lower(), content.strip())
+            if key in seen:
+                continue
+            seen.add(key)
+            blocks.append((raw_path, content, True))
+        return blocks
+
+    def validate_write_content(self, path, content):
+        """Valida formatos estruturados antes de substituir um arquivo existente."""
+        suffix = Path(path).suffix.lower()
+        if suffix == ".py":
+            try:
+                compile(content, str(path), "exec")
+            except (SyntaxError, ValueError, TypeError) as exc:
+                line = getattr(exc, "lineno", None)
+                position = f" na linha {line}" if line else ""
+                return False, f"Código Python inválido antes de salvar{position}: {getattr(exc, 'msg', str(exc))}"
+        elif suffix == ".json":
+            try:
+                json.loads(content)
+            except json.JSONDecodeError as exc:
+                return False, f"JSON inválido antes de salvar na linha {exc.lineno}: {exc.msg}"
+        elif suffix in {".toml", ".tml"}:
+            try:
+                import tomllib
+                tomllib.loads(content)
+            except (ModuleNotFoundError, ValueError, TypeError) as exc:
+                return False, f"TOML inválido antes de salvar: {exc}"
+        return True, ""
+
     def extract_agent_action_names(self, response_text):
+        """Identifica ações de linha e blocos multi-linha do protocolo da IDE."""
         names = {action for action, _value in self.iter_agent_action_lines(response_text)}
-        if re.search(r"\[WRITE:\s*.+?\].*?\[/WRITE\]", response_text or "", re.DOTALL | re.IGNORECASE):
+        payload = response_text or ""
+        if self.extract_write_blocks(payload):
             names.add("WRITE")
-        if re.search(r"\[REPLACE:\s*.+?\].*?\[/REPLACE\]", response_text or "", re.DOTALL | re.IGNORECASE):
+        if re.search(r"\[REPLACE:\s*.+?\].*?\[/REPLACE\]", payload, re.DOTALL | re.IGNORECASE):
             names.add("REPLACE")
+        if re.search(r"\[PATCH(?:\s*:\s*[^\]\r\n]+)?\].*?\[/PATCH\]", payload, re.DOTALL | re.IGNORECASE):
+            names.add("PATCH")
         return names
+
+
+    # MEROTEC_AUTONOMOUS_DELIVERY_V2
+    def autonomous_delivery_enabled(self):
+        return self.bool_setting_enabled(
+            "autonomous_delivery_enabled",
+            env_name="MEROTEC_AUTONOMOUS_DELIVERY",
+            default=True,
+        )
+
+    def autonomous_visual_validation_enabled(self):
+        return self.bool_setting_enabled(
+            "autonomous_visual_validation_enabled",
+            env_name="MEROTEC_AUTONOMOUS_VISUAL_VALIDATION",
+            default=True,
+        )
+
+    def autonomous_development_loop_enabled(self):
+        """Mantém a missão ativa até validação, cancelamento ou bloqueio real."""
+        return self.bool_setting_enabled(
+            "continuous_development_loop_enabled",
+            env_name="MEROTEC_CONTINUOUS_DEVELOPMENT_LOOP",
+            default=True,
+        )
+
+    def autonomous_max_repair_cycles(self):
+        """0 significa ciclo contínuo; um limite só existe se o usuário configurar."""
+        raw = getattr(self, "settings", {}).get("continuous_development_max_cycles", 0)
+        try:
+            return max(0, min(200, int(raw)))
+        except (TypeError, ValueError):
+            return 0
+
+    def should_continue_development_loop(self, action_depth=0, task_id=None):
+        if not self.autonomous_development_loop_enabled():
+            return int(action_depth or 0) < 12
+        limit = self.autonomous_max_repair_cycles()
+        return limit == 0 or int(action_depth or 0) < limit
+
+    def _autonomous_metrics(self, task_id=None):
+        metrics = self.get_ai_task_metrics(task_id)
+        metrics.setdefault("autonomous_delivery_active", False)
+        metrics.setdefault("autonomous_validation_command", "")
+        metrics.setdefault("autonomous_visual_pending", False)
+        metrics.setdefault("autonomous_repair_cycles", 0)
+        metrics.setdefault("autonomous_changed_files", [])
+        return metrics
+
+    def workspace_requires_visual_validation(self):
+        if not self.autonomous_visual_validation_enabled():
+            return False
+        workspace = Path(self.current_workspace).resolve()
+        if (workspace / "index.html").exists():
+            return True
+        package_json = workspace / "package.json"
+        if package_json.exists():
+            try:
+                package = json.loads(package_json.read_text(encoding="utf-8", errors="replace"))
+                scripts = package.get("scripts", {}) if isinstance(package, dict) else {}
+                if any(name in scripts for name in ("dev", "start", "preview")):
+                    return True
+            except (OSError, json.JSONDecodeError):
+                pass
+        for name in ("main.py", "app.py"):
+            candidate = workspace / name
+            if not candidate.exists():
+                continue
+            try:
+                source = candidate.read_text(encoding="utf-8", errors="replace").lower()
+            except OSError:
+                continue
+            if any(marker in source for marker in (
+                "tkinter", "customtkinter", "pyqt", "pyside", "kivy",
+                "pygame", "flet", "flask", "fastapi", "streamlit",
+            )):
+                return True
+        return False
+
+    def infer_autonomous_validation_command(self, objective=None):
+        workspace = Path(self.current_workspace).resolve()
+        if (workspace / "index.html").exists():
+            # Validação estática curta que termina sozinha. O teste visual,
+            # quando aplicável, é iniciado depois dela.
+            check = (
+                "from pathlib import Path; import sys; "
+                "s=Path('index.html').read_text(encoding='utf-8',errors='replace').lower(); "
+                "need=('!doctype','html','body'); bad=[x for x in need if x not in s]; "
+                "print('HTML static validation OK' if not bad else 'HTML static validation FAILED: '+', '.join(bad)); "
+                "sys.exit(0 if not bad else 1)"
+            )
+            return f'"{sys.executable}" -c "{check}"'
+        return self.infer_default_validation_command(objective or self.active_ai_objective or "")
+
+    def arm_autonomous_delivery(self, task_objective=None, task_id=None, changed_paths=None):
+        if not self.autonomous_delivery_enabled():
+            return False
+        metrics = self._autonomous_metrics(task_id)
+        metrics["autonomous_delivery_active"] = True
+        metrics["autonomous_validation_command"] = self.infer_autonomous_validation_command(task_objective)
+        metrics["autonomous_visual_pending"] = self.workspace_requires_visual_validation()
+        metrics["autonomous_changed_files"] = list(changed_paths or [])
+        return True
+
+    def start_autonomous_delivery_validation(self, task_objective=None, action_depth=0, task_id=None):
+        metrics = self._autonomous_metrics(task_id)
+        if not metrics.get("autonomous_delivery_active"):
+            return False
+        command = str(metrics.get("autonomous_validation_command") or "").strip()
+        if command:
+            self.add_chat_message(
+                "Sistema",
+                "Ciclo autônomo: alteração aplicada. Iniciando validação automática.",
+            )
+            self.log_agent(f"Ciclo autônomo iniciou validação: {command}")
+            self.mark_ai_active_action("execute", task_id=task_id)
+            self._agent_execute(
+                command,
+                task_objective=task_objective or self.active_ai_objective,
+                action_depth=action_depth,
+                task_id=task_id,
+            )
+            return True
+        if metrics.get("autonomous_visual_pending"):
+            metrics["autonomous_visual_pending"] = False
+            self.add_chat_message("Sistema", "Ciclo autônomo: iniciando teste visual automático.")
+            self.mark_ai_active_action("human_test", task_id=task_id)
+            self._agent_human_test(
+                "auto",
+                task_objective=task_objective or self.active_ai_objective,
+                action_depth=action_depth,
+                task_id=task_id,
+            )
+            return True
+        metrics["autonomous_delivery_active"] = False
+        return False
+
+    def advance_autonomous_delivery_after_validation(self, command, task_objective=None, action_depth=0, task_id=None):
+        metrics = self._autonomous_metrics(task_id)
+        if not metrics.get("autonomous_delivery_active"):
+            return False
+        expected = str(metrics.get("autonomous_validation_command") or "").strip()
+        if expected and command.strip() != expected:
+            return False
+        if metrics.get("autonomous_visual_pending"):
+            metrics["autonomous_visual_pending"] = False
+            self.add_chat_message(
+                "Sistema",
+                "Validação automática aprovada. Iniciando teste visual do projeto.",
+            )
+            self.log_agent("Ciclo autônomo avançou para HUMAN_TEST.")
+            self.mark_ai_active_action("human_test", task_id=task_id)
+            self._agent_human_test(
+                "auto",
+                task_objective=task_objective or self.active_ai_objective,
+                action_depth=action_depth + 1,
+                task_id=task_id,
+            )
+            return True
+        metrics["autonomous_delivery_active"] = False
+        self.add_chat_message(
+            "Sistema",
+            "Ciclo autônomo concluído: alteração criada e validação automática aprovada.",
+        )
+        self.set_status("Alteração validada automaticamente.", "ready")
+        return True
+
+    def can_continue_autonomous_repair(self, command, output, returncode, task_objective=None, task_id=None):
+        """Decide se o erro de validação deve voltar ao mesmo agente.
+
+        O padrão é contínuo. A IDE só para por cancelamento, indisponibilidade do
+        provedor ou por um limite explicitamente configurado pelo usuário.
+        """
+        metrics = self._autonomous_metrics(task_id)
+        if not metrics.get("autonomous_delivery_active"):
+            return True
+        metrics["autonomous_repair_cycles"] += 1
+        current = metrics["autonomous_repair_cycles"]
+        limit = self.autonomous_max_repair_cycles()
+        if limit and current > limit:
+            metrics["autonomous_delivery_active"] = False
+            self.add_chat_message(
+                "Erro",
+                "O ciclo contínuo foi pausado porque atingiu o limite configurado pelo usuário "
+                f"({limit} ciclos). O último erro permanece no Terminal Local.",
+            )
+            self.set_status("Limite configurado do ciclo atingido.", "warning")
+            self.log_agent("Ciclo de correção pausado pelo limite configurado.")
+            return False
+        cadence = f"{current}/{limit}" if limit else f"{current}/contínuo"
+        self.add_chat_message(
+            "Sistema",
+            f"Validação falhou. A IDE vai devolver o diagnóstico ao mesmo chat e continuar a correção ({cadence}).",
+        )
+        self.log_agent(f"Ciclo contínuo de correção {cadence}: código {returncode}.")
+        return True
+
+    def continue_after_mutation_failure(
+        self, response_text, target_paths, task_objective=None, action_depth=0, task_id=None
+    ):
+        """Não encerra REPLACE/WRITE inválido: devolve o estado atual e continua."""
+        if not self.autonomous_development_loop_enabled() or not self.should_continue_development_loop(action_depth, task_id):
+            return False
+        metrics = self._autonomous_metrics(task_id)
+        metrics["autonomous_repair_cycles"] += 1
+        current = metrics["autonomous_repair_cycles"]
+        limit = self.autonomous_max_repair_cycles()
+        if limit and current > limit:
+            self.add_chat_message("Erro", "O ciclo foi pausado pelo limite de tentativas configurado pelo usuário.")
+            self.set_status("Limite configurado do ciclo atingido.", "warning")
+            return False
+
+        contexts = []
+        seen = set()
+        for raw_path in target_paths or []:
+            raw_path = str(raw_path or "").strip()
+            if not raw_path or raw_path in seen:
+                continue
+            seen.add(raw_path)
+            try:
+                candidate = self.resolve_workspace_path(raw_path)
+                if candidate.exists() and candidate.is_file():
+                    body = candidate.read_text(encoding="utf-8", errors="replace")
+                    try:
+                        relative = candidate.relative_to(Path(self.current_workspace).resolve()).as_posix()
+                    except ValueError:
+                        relative = candidate.name
+                    if len(body) > 56000:
+                        total_lines = body.count("\n") + 1
+                        contexts.append(
+                            f"ARQUIVO GRANDE ATUAL: {relative} ({total_lines} linhas).\n"
+                            "Nao reescreva o arquivo inteiro. Localize o alvo com [SEARCH_TEXT] ou leia somente o intervalo necessario, por exemplo "
+                            f"[READ: {relative} | linhas 120-260], e aplique [REPLACE] ou [PATCH] incremental."
+                        )
+                    else:
+                        contexts.append(f"ARQUIVO ATUAL: {relative}\n```\n{body}\n```")
+            except Exception as exc:
+                contexts.append(f"Não foi possível reler `{raw_path}`: {exc}")
+
+        cadence = f"{current}/{limit}" if limit else f"{current}/contínuo"
+        self.add_chat_message(
+            "Sistema",
+            "A alteração não foi aplicada, mas a missão continua. A IDE devolveu o estado atual ao mesmo chat "
+            f"para uma nova correção ({cadence}).",
+        )
+        context = (
+            f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or ''}\n\n"
+            "A ÚLTIMA EDIÇÃO NÃO FOI APLICADA. Não declare conclusão e não abra uma conversa nova. "
+            "Use o conteúdo atual abaixo, corrija o contexto desatualizado e responda com a próxima ação necessária da IDE. "
+            "PROTOCOLO INCREMENTAL V9: para arquivo grande, nao exija reescrita completa; use [READ: caminho | linhas inicio-fim] ou [SEARCH_TEXT] e aplique [REPLACE] ou [PATCH] local. "
+            "Para reescrever de propósito, use [WRITE: caminho] ... [/WRITE].\n\n"
+            f"RESPOSTA ANTERIOR QUE FALHOU:\n{response_text[:6000]}\n\n"
+            + "\n\n".join(contexts or ["A IDE não identificou o arquivo alvo; leia o arquivo antes de editar."])
+        )
+        self._run_ai_task(
+            "A edição anterior falhou. Continue a mesma missão aplicando uma correção compatível com o arquivo atual.",
+            extra_context=context,
+            task_objective=task_objective or self.active_ai_objective,
+            action_depth=action_depth + 1,
+            task_id=task_id,
+        )
+        return True
+
+
+    # MEROTEC_VISUAL_AUTONOMY_V3
+    def _agent_apply_patch(self, patch_text, task_id=None, task_objective=None):
+        # Formato: [PATCH] *** Begin Patch ... *** End Patch [/PATCH]
+        raw = str(patch_text or "").strip()
+        raw = re.sub(r"^```(?:diff|patch)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw).strip()
+        if "*** Begin Patch" not in raw or "*** End Patch" not in raw:
+            self.add_chat_message(
+                "Erro",
+                "PATCH recusado: use *** Begin Patch / *** Update File / *** End Patch dentro de [PATCH].",
+            )
+            return []
+
+        body = raw.split("*** Begin Patch", 1)[1].split("*** End Patch", 1)[0]
+        sections = []
+        current_kind = ""
+        current_path = ""
+        current_lines = []
+
+        def flush_section():
+            if current_kind and current_path:
+                sections.append((current_kind, current_path, list(current_lines)))
+
+        for line in body.splitlines():
+            match = re.match(r"^\*\*\* (Update File|Add File|Delete File):\s*(.+?)\s*$", line)
+            if match:
+                flush_section()
+                current_kind = match.group(1).lower().replace(" ", "_")
+                current_path = match.group(2).strip()
+                current_lines = []
+            elif current_kind:
+                current_lines.append(line)
+        flush_section()
+        if not sections:
+            self.add_chat_message("Erro", "PATCH recusado: nenhum arquivo foi identificado.")
+            return []
+
+        changed = []
+        try:
+            for kind, raw_path, lines in sections:
+                path = self.resolve_workspace_path(raw_path)
+                if kind == "add_file":
+                    if path.exists():
+                        raise ValueError(f"O arquivo novo já existe: {raw_path}")
+                    content = "\n".join(line[1:] for line in lines if line.startswith("+"))
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    self.record_file_change_snapshot(path, "PATCH", f"Patch criou {raw_path}.")
+                    path.write_text(content + ("\n" if content else ""), encoding="utf-8")
+                elif kind == "delete_file":
+                    if not path.exists():
+                        raise ValueError(f"O arquivo para remover não existe: {raw_path}")
+                    self.record_file_change_snapshot(path, "PATCH", f"Patch removeu {raw_path}.")
+                    path.unlink()
+                else:
+                    if not path.exists():
+                        raise ValueError(f"Arquivo para atualizar não existe: {raw_path}")
+                    source = path.read_text(encoding="utf-8", errors="replace")
+                    updated = self._apply_openai_style_patch_hunks(source, lines, raw_path)
+                    if updated == source:
+                        raise ValueError(f"PATCH não alterou conteúdo em {raw_path}.")
+                    self.record_file_change_snapshot(path, "PATCH", f"Patch atualizou {raw_path}.")
+                    path.write_text(updated, encoding="utf-8")
+                changed.append(raw_path)
+        except Exception as exc:
+            self.add_chat_message("Erro", f"PATCH não aplicado: {exc}")
+            self.log_agent(f"Falha ao aplicar PATCH: {exc}")
+            return []
+
+        self.load_workspace_files()
+        self.add_chat_message("Sistema", "PATCH aplicado: " + ", ".join(changed))
+        self.log_agent("PATCH aplicado no workspace: " + ", ".join(changed))
+        return changed
+
+    def _apply_openai_style_patch_hunks(self, source, lines, raw_path):
+        source_lines = source.splitlines()
+        has_final_newline = source.endswith("\n")
+        hunks = []
+        current = []
+        seen_hunk = False
+        for line in lines:
+            if line.startswith("@@"):
+                if current:
+                    hunks.append(current)
+                current = []
+                seen_hunk = True
+                continue
+            if seen_hunk:
+                current.append(line)
+        if current:
+            hunks.append(current)
+        if not hunks:
+            raise ValueError(f"PATCH de {raw_path} não contém @@ com trecho de troca.")
+
+        for hunk in hunks:
+            old_lines = [line[1:] for line in hunk if line.startswith((" ", "-"))]
+            new_lines = [line[1:] for line in hunk if line.startswith((" ", "+"))]
+            if not old_lines:
+                raise ValueError(f"PATCH de {raw_path} não possui contexto para inserir com segurança.")
+            found_at = -1
+            for index in range(0, len(source_lines) - len(old_lines) + 1):
+                if source_lines[index:index + len(old_lines)] == old_lines:
+                    found_at = index
+                    break
+            if found_at < 0:
+                preview = "\n".join(old_lines[:4])
+                raise ValueError(f"Contexto do PATCH não encontrado em {raw_path}: {preview[:180]}")
+            source_lines[found_at:found_at + len(old_lines)] = new_lines
+
+        result = "\n".join(source_lines)
+        return result + "\n" if has_final_newline else result
 
     def parse_and_execute_agent_actions(self, response_text, task_objective=None, action_depth=0, task_id=None, direct_action_happened=False):
         if not response_text:
@@ -327,16 +855,44 @@ class AgentActionsMixin:
             self.log_agent("Acao da IA ignorada porque a tarefa foi cancelada.")
             return
 
-        write_blocks = re.findall(r"\[WRITE:\s*(.+?)\](.*?)\[/WRITE\]", response_text, re.DOTALL | re.IGNORECASE)
-        has_action = bool(write_blocks)
+        mutation_attempted = False
+        mutation_succeeded = False
+        mutation_paths = []
+        mutation_targets = []
+        patch_blocks = re.findall(r"\[PATCH(?:\s*:\s*[^\]\r\n]+)?\](.*?)\[/PATCH\]", response_text, re.DOTALL | re.IGNORECASE)
+        has_action = bool(patch_blocks)
+        if "[PATCH" in response_text.upper() and not patch_blocks:
+            self.add_chat_message("Erro", "A IA enviou um PATCH incompleto. Use [PATCH] ... [/PATCH].")
+        for patch_text in patch_blocks:
+            mutation_attempted = True
+            mutation_targets.extend(
+                item.strip()
+                for item in re.findall(r"^\*\*\* (?:Update File|Add File|Delete File):\s*(.+?)\s*$", patch_text, re.MULTILINE)
+                if item.strip()
+            )
+            self.mark_ai_active_action("patch", task_id=task_id)
+            patched_paths = self._agent_apply_patch(patch_text, task_id=task_id, task_objective=task_objective)
+            if patched_paths:
+                mutation_succeeded = True
+                mutation_paths.extend(patched_paths)
+        write_blocks = self.extract_write_blocks(response_text)
+        has_action = has_action or bool(write_blocks)
         if "[WRITE:" in response_text.upper() and not write_blocks:
             self.add_chat_message(
                 "Erro",
-                "A IA enviou um WRITE incompleto. Ela precisa mandar [WRITE: arquivo] conteudo [/WRITE].",
+                "A IA iniciou um WRITE, mas não trouxe conteúdo de código utilizável. O arquivo atual foi preservado.",
             )
-        for raw_path, content in write_blocks:
+        for raw_path, content, recovered_without_closing_tag in write_blocks:
+            mutation_attempted = True
+            mutation_targets.append(raw_path.strip())
             self.mark_ai_active_action("write", task_id=task_id)
-            self._agent_write(raw_path, content, task_id=task_id, task_objective=task_objective)
+            if recovered_without_closing_tag:
+                self.log_agent(
+                    f"WRITE de {raw_path.strip()} recuperado sem a linha final [/WRITE]; validando antes de salvar."
+                )
+            if self._agent_write(raw_path, content, task_id=task_id, task_objective=task_objective):
+                mutation_succeeded = True
+                mutation_paths.append(raw_path.strip())
 
         replace_blocks = re.findall(r"\[REPLACE:\s*(.+?)\](.*?)\[/REPLACE\]", response_text, re.DOTALL | re.IGNORECASE)
         has_action = has_action or bool(replace_blocks)
@@ -346,6 +902,8 @@ class AgentActionsMixin:
                 "A IA enviou um REPLACE incompleto. Ela precisa mandar [REPLACE: arquivo] [OLD]...[/OLD] [NEW]...[/NEW] [/REPLACE].",
             )
         for raw_path, block in replace_blocks:
+            mutation_attempted = True
+            mutation_targets.append(raw_path.strip())
             old_match = re.search(r"\[OLD\](.*?)\[/OLD\]", block, re.DOTALL | re.IGNORECASE)
             new_match = re.search(r"\[NEW\](.*?)\[/NEW\]", block, re.DOTALL | re.IGNORECASE)
             if not old_match or not new_match:
@@ -355,12 +913,21 @@ class AgentActionsMixin:
                 )
                 continue
             self.mark_ai_active_action("replace", task_id=task_id)
-            self._agent_replace(
+            if self._agent_replace(
                 raw_path,
                 old_match.group(1),
                 new_match.group(1),
                 task_id=task_id,
                 task_objective=task_objective,
+            ):
+                mutation_succeeded = True
+                mutation_paths.append(raw_path.strip())
+
+        if mutation_succeeded and hasattr(self, "settings"):
+            self.arm_autonomous_delivery(
+                task_objective=task_objective or self.active_ai_objective,
+                task_id=task_id,
+                changed_paths=mutation_paths,
             )
 
         unrestricted_mode = self.autonomous_unrestricted_mode_enabled()
@@ -488,6 +1055,38 @@ class AgentActionsMixin:
             self.mark_ai_active_action("open_url", task_id=task_id)
             self._agent_open_url(raw_url)
 
+        browser_actions = (
+            ("BROWSER_INSPECT", "inspect"),
+            ("BROWSER_CLICK", "click"),
+            ("BROWSER_TYPE", "type"),
+            ("BROWSER_SCROLL", "scroll"),
+        )
+        for tag_name, action_name in browser_actions:
+            requests = self.extract_agent_action_values(response_text, tag_name)
+            has_action = has_action or bool(requests)
+            if requests:
+                self.mark_ai_active_action("browser", task_id=task_id)
+                self._agent_browser_action(
+                    action_name,
+                    requests[0],
+                    task_objective=task_objective,
+                    action_depth=action_depth,
+                    task_id=task_id,
+                )
+                return
+
+        browser_chat_requests = self.extract_agent_action_values(response_text, "BROWSER_CHAT")
+        has_action = has_action or bool(browser_chat_requests)
+        if browser_chat_requests:
+            self.mark_ai_active_action("browser", task_id=task_id)
+            self._agent_browser_chat(
+                browser_chat_requests[0],
+                task_objective=task_objective,
+                action_depth=action_depth,
+                task_id=task_id,
+            )
+            return
+
         screenshot_requests = self.extract_agent_action_values(response_text, "SCREENSHOT")
         has_action = has_action or bool(screenshot_requests)
         for request in screenshot_requests:
@@ -523,6 +1122,22 @@ class AgentActionsMixin:
         for command in execute_commands:
             if self.reject_placeholder_execute_action("EXECUTE", command):
                 continue
+            # Mesmo no modo irrestrito, usar EXECUTE apenas para imprimir o
+            # conteúdo de um arquivo quebra o ciclo: o shell retorna 0 e o
+            # Chat Web não recebe o código. Transforme em READ, que envia o
+            # contexto de volta ao mesmo chat e exige a próxima ação concreta.
+            if self.is_source_read_command(command):
+                if self.should_block_passive_ai_action(
+                    "EXECUTE_SOURCE_READ", [command], task_objective, action_depth, task_id
+                ):
+                    continue
+                self.redirect_source_read_command_to_read(
+                    command,
+                    task_objective=task_objective,
+                    action_depth=action_depth,
+                    task_id=task_id,
+                )
+                return
             if self.should_route_execute_to_human_test(command, task_objective):
                 self.mark_ai_active_action("human_test", task_id=task_id)
                 self._agent_human_test(
@@ -555,6 +1170,85 @@ class AgentActionsMixin:
             self.mark_ai_active_action("execute", task_id=task_id)
             self._agent_execute(command, task_objective=task_objective, action_depth=action_depth, task_id=task_id)
 
+        followup_action_requested = any(
+            (
+                fix_paths,
+                undo_paths,
+                open_urls,
+                screenshot_requests,
+                human_test_requests,
+                admin_execute_commands,
+                execute_commands,
+            )
+        )
+        explicit_validation = bool(
+            execute_commands or admin_execute_commands or human_test_requests
+        )
+        if mutation_succeeded and not explicit_validation and self.should_continue_development_loop(action_depth, task_id):
+            if self.start_autonomous_delivery_validation(
+                task_objective=task_objective or self.active_ai_objective,
+                action_depth=action_depth,
+                task_id=task_id,
+            ):
+                return
+
+        if (
+            mutation_attempted
+            and mutation_succeeded
+            and not followup_action_requested
+            and hasattr(self, "settings")
+            and self.should_continue_development_loop(action_depth, task_id)
+            and self.autonomous_visual_test_required(task_objective)
+        ):
+            changed = ", ".join(mutation_paths) if mutation_paths else "arquivo alterado"
+            self.add_chat_message(
+                "Sistema",
+                "Alteração aplicada. A IDE abriu automaticamente o teste visual no navegador dedicado antes de concluir.",
+            )
+            self.log_agent(f"Teste visual automático após alteração: {changed}")
+            self.mark_ai_active_action("human_test", task_id=task_id)
+            self._agent_human_test(
+                "auto",
+                task_objective=task_objective or self.active_ai_objective,
+                action_depth=action_depth + 1,
+                task_id=task_id,
+            )
+            return
+
+        if mutation_attempted and not mutation_succeeded and not followup_action_requested:
+            if self.continue_after_mutation_failure(
+                response_text,
+                mutation_targets,
+                task_objective=task_objective,
+                action_depth=action_depth,
+                task_id=task_id,
+            ):
+                return
+            self.add_chat_message(
+                "Sistema",
+                "Alteração não aplicada. Os arquivos foram preservados e o ciclo foi pausado por cancelamento ou limite configurado.",
+            )
+            self.set_status("Alteração recusada; ciclo pausado.", "warning")
+            return
+
+        if mutation_attempted and mutation_succeeded and not followup_action_requested and self.should_continue_development_loop(action_depth, task_id):
+            changed = ", ".join(mutation_paths) if mutation_paths else "arquivo"
+            self.add_chat_message(
+                "Sistema",
+                "Alteração aplicada. A IDE continuará somente com a validação necessária.",
+            )
+            self._run_ai_task(
+                "Valide o projeto apos a alteracao aplicada com uma acao real e conclua objetivamente.",
+                extra_context=(
+                    f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or ''}\n\n"
+                    f"Arquivos alterados: {changed}."
+                ),
+                task_objective=task_objective or self.active_ai_objective,
+                action_depth=action_depth + 1,
+                task_id=task_id,
+            )
+            return
+
         if direct_action_happened and not has_action:
             self.load_workspace_files()
             return
@@ -576,12 +1270,12 @@ class AgentActionsMixin:
                 task_id=task_id,
             ):
                 return
-            if action_depth >= 4:
+            if not self.should_continue_development_loop(action_depth, task_id):
                 self.add_chat_message(
                     "Erro",
-                    "A IA continuou respondendo com intencao sem executar. A IDE interrompeu o ciclo; envie o pedido novamente de forma direta.",
+                    "A IA continuou respondendo sem ação real e o ciclo atingiu o limite configurado.",
                 )
-                self.set_status("Sem acao real.", "warning")
+                self.set_status("Sem ação real; ciclo pausado.", "warning")
                 return
             self.add_chat_message("Sistema", "A IA respondeu com intencao, mas nao executou uma acao. Reforcando a tarefa.")
             self._run_ai_task(
@@ -844,20 +1538,51 @@ class AgentActionsMixin:
                         break
 
                 if process.poll() is not None and process.returncode not in (0, None) and not ready:
+                    # O processo pode encerrar antes da thread leitora terminar de
+                    # esvaziar stderr. Drene a fila por um curto periodo para que
+                    # o Chat Web receba o traceback real, e nao apenas a primeira
+                    # linha ou um diagnostico generico.
+                    drain_deadline = time.monotonic() + 1.5
+                    while time.monotonic() < drain_deadline:
+                        try:
+                            line = line_queue.get(timeout=0.12)
+                        except queue.Empty:
+                            if process.poll() is not None:
+                                continue
+                            break
+                        if line is None:
+                            break
+                        if line:
+                            output_lines.append(line)
+                            self.append_to_term(line)
                     output = "".join(output_lines)
                     self.append_to_term(f"\n[teste visual falhou com codigo {process.returncode}]\n")
                     diagnostic = self.build_command_failure_diagnostic(command_display, output, process.returncode)
+                    metrics = self.get_ai_task_metrics(task_id)
+                    metrics["requires_error_correction"] = {
+                        "kind": "human_test",
+                        "command": command_display,
+                        "returncode": int(process.returncode),
+                        "output_tail": output[-12000:],
+                        "created_at": time.time(),
+                    }
+                    self.add_chat_message(
+                        "Sistema",
+                        "Teste visual falhou. A IDE vai enviar o traceback real e o codigo de saida ao mesmo Chat Web para a proxima correcao.",
+                    )
                     context = (
+                        "DIAGNOSTICO DE FALHA GERADO PELA IDE — PRIORIDADE MAXIMA:\n"
                         f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or 'Testar visualmente'}\n\n"
                         f"Teste visual tentou executar: {command_display}\n"
                         f"Codigo de saida: {process.returncode}\n"
                         f"{diagnostic}\n"
-                        f"Saida:\n```\n{output[-7000:]}\n```\n\n"
-                        "Corrija a causa antes de tentar o mesmo teste de novo."
+                        f"SAIDA REAL COMPLETA DISPONIVEL (trecho final):\n```\n{output[-12000:]}\n```\n\n"
+                        "O erro acima ocorreu de verdade no processo local. Nao peca para o usuario copiar o log; "
+                        "use-o como fonte de verdade, leia o arquivo indicado e emita a proxima tag da IDE para corrigir a causa antes de repetir o teste."
                     )
                     self.set_ai_busy(False)
                     self._run_ai_task(
-                        "O teste visual falhou antes de abrir a tela. Analise e corrija.",
+                        "O teste visual falhou com diagnostico real. Continue a mesma missao corrigindo a causa concreta.",
                         extra_context=context,
                         task_objective=task_objective or self.active_ai_objective,
                         action_depth=action_depth + 1,
@@ -876,6 +1601,7 @@ class AgentActionsMixin:
 
                 image = self.grab_human_test_image(plan)
                 screenshot_path = self.save_agent_screenshot(image)
+                self.get_ai_task_metrics(task_id).pop("requires_error_correction", None)
                 self.log_agent(f"Print do teste visual capturado: {screenshot_path.name}")
                 self.add_chat_image_message("Merotec AI", screenshot_path, "")
                 output = "".join(output_lines)
@@ -886,10 +1612,12 @@ class AgentActionsMixin:
                     f"URL: {url or 'sem URL; tela capturada do desktop'}\n"
                     f"Print: {screenshot_path.name}\n"
                     f"Saida relevante:\n```\n{output[-7000:]}\n```\n\n"
-                    "Analise o print como um usuario humano: tela vazia, layout quebrado, botao fora do lugar, erro visual, "
+                    "O print e a evidencia primaria deste teste e precisa ser analisado antes de qualquer conclusao. "
+                    "Procure primeiro por banners, dialogs, tracebacks, mensagens de erro, tela em branco, layout quebrado, botao fora do lugar, "
                     "fluxo confuso, jogo injogavel, controle invertido, asset faltando ou comportamento incoerente. "
-                    "Se houver problema, corrija com [READ], [REPLACE] ou [WRITE] e depois rode novo [HUMAN_TEST: auto]. "
-                    "Se estiver bom, entregue uma conclusao objetiva com o que foi validado."
+                    "Nao declare que a tela esta boa se nao conseguir enxergar o anexo; nesse caso use [READ] para investigar o codigo em vez de inventar uma validacao. "
+                    "Se houver problema, transcreva a mensagem visivel/diagnostico, corrija com [READ], [REPLACE] ou [WRITE] e depois rode novo [HUMAN_TEST: auto]. "
+                    "Se estiver bom, entregue uma conclusao objetiva com o que foi validado visualmente."
                 )
                 self.set_ai_busy(False)
                 self._run_ai_task(
@@ -930,11 +1658,14 @@ class AgentActionsMixin:
         wants_browser_target = any(term in objective for term in browser_terms)
 
         try:
-            candidates = [
-                Path(candidate).resolve()
-                for candidate in self.find_runnable_workspaces()
-                if str(Path(candidate).resolve()).startswith(str(workspace))
-            ]
+            candidates = []
+            for candidate in self.find_runnable_workspaces():
+                resolved = Path(candidate).resolve()
+                try:
+                    if os.path.commonpath([str(workspace), str(resolved)]) == str(workspace):
+                        candidates.append(resolved)
+                except ValueError:
+                    continue
         except Exception:
             candidates = []
 
@@ -1628,7 +2359,7 @@ class AgentActionsMixin:
             "A partir de agora, a IDE nao vai aceitar nova leitura/busca como proxima acao desta mesma missao.\n\n"
             "PROXIMA RESPOSTA OBRIGATORIA:\n"
             "- Se a missao pede implementar/corrigir, responda com [REPLACE] pequeno e exato ou [WRITE] apenas para arquivo novo/reescrita pedida.\n"
-            "- Se a missao pede executar/testar, responda com uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: python -m unittest].\n"
+            "- Se a missao pede executar/testar, responda com uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: comando de teste da stack detectada].\n"
             "- Se precisa validar visualmente, responda com [HUMAN_TEST: auto].\n"
             "- Se ja sabe que nao da para fazer com seguranca, entregue conclusao curta dizendo exatamente o bloqueio.\n"
             "- Nao use [READ], [SEARCH_TEXT], [WEB_SEARCH], [SCAN_TEXT] ou comando de inspecao na proxima resposta."
@@ -1714,9 +2445,229 @@ class AgentActionsMixin:
                 self.add_chat_message("Merotec AI", f"Abri a pagina no navegador externo: {opened_url}")
             else:
                 self.add_chat_message("Merotec AI", f"Abri a pagina no navegador interno da IDE: {opened_url}")
+            remember = getattr(self, "remember_internal_browser_chat_url", None)
+            if callable(remember) and ("chat" in opened_url.lower() or "gemini" in opened_url.lower()):
+                remember(opened_url)
             self.log_agent(f"URL aberta pela IA: {opened_url}")
         except Exception as exc:
             self.add_chat_message("Erro", f"Nao consegui abrir a URL: {exc}")
+
+    def _browser_url_is_local(self):
+        url = str(getattr(self, "internal_browser_url", "") or "")
+        try:
+            host = (urllib.parse.urlparse(url).hostname or "").lower()
+        except ValueError:
+            host = ""
+        return host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or url.startswith("file:")
+
+    def web_chat_remote_actions_enabled(self):
+        """Lê a permissão do perfil Chat Web sem depender do perfil de IA ativo."""
+        settings = getattr(self, "settings", {})
+        profile = (
+            settings.get("ai_profiles", {}).get("web_chat", {})
+            if isinstance(settings, dict)
+            else {}
+        )
+        value = profile.get(
+            "web_chat_allow_remote_actions",
+            settings.get("web_chat_allow_remote_actions", False) if isinstance(settings, dict) else False,
+        )
+        if isinstance(value, bool):
+            return value
+        return self.normalize_plain_text(str(value)) in {
+            "1", "true", "yes", "sim", "on", "enabled", "habilitado"
+        }
+
+    def _approve_remote_browser_action(self, action, target, value=""):
+        if self._browser_url_is_local() or action in {"inspect", "scroll"}:
+            return True
+        element = (getattr(self, "browser_element_catalog", None) or {}).get(target, {})
+        label = self.normalize_plain_text(
+            " ".join(
+                str(element.get(key) or "")
+                for key in ("label", "type", "role", "tag")
+            )
+        )
+        sensitive_markers = {
+            "senha", "password", "passcode", "otp", "codigo de verificacao",
+            "token", "api key", "chave api", "secret", "segredo", "cvv",
+            "cartao", "card number", "pagamento", "payment", "billing",
+            "comprar", "purchase", "excluir conta", "delete account",
+            "remover conta", "permissao", "permission",
+        }
+        sensitive = any(marker in label for marker in sensitive_markers)
+        if self.autonomous_unrestricted_mode_enabled() and not sensitive:
+            self.log_agent(f"Interacao web autoaprovada no modo irrestrito: {action} {target}")
+            return True
+        title = "Autorizar interacao no site?"
+        if action == "type":
+            detail = f"A IA quer digitar no elemento {target}:\n\n{value[:600]}"
+        else:
+            detail = f"A IA quer clicar no elemento {target}."
+        message = (
+            f"{detail}\n\nDestino: {getattr(self, 'internal_browser_url', '')}\n\n"
+            "Sites podem enviar dados ou produzir efeitos externos. Autorizar esta interacao?"
+        )
+        if threading.current_thread() is threading.main_thread():
+            return bool(messagebox.askyesno(title, message))
+        result_queue = queue.Queue(maxsize=1)
+
+        def ask():
+            try:
+                result_queue.put(bool(messagebox.askyesno(title, message)))
+            except Exception as exc:
+                result_queue.put(exc)
+
+        self.after(0, ask)
+        result = result_queue.get()
+        if isinstance(result, Exception):
+            raise result
+        return bool(result)
+
+    def _agent_browser_action(self, action, raw_request, task_objective=None, action_depth=0, task_id=None):
+        if self.is_task_cancelled(task_id):
+            return
+        requester = getattr(self, "request_internal_browser_action", None)
+        if not callable(requester):
+            self.add_chat_message("Erro", "O navegador atual nao oferece automacao.")
+            return
+
+        raw = str(raw_request or "").strip()
+        parts = [part.strip() for part in raw.split("|", 1)]
+        target = parts[0] if parts else ""
+        value = parts[1] if len(parts) > 1 else ""
+        if action == "inspect":
+            target = "page"
+        elif action == "scroll":
+            target = target.lower() if target.lower() in {"up", "down"} else "down"
+        elif not target:
+            self.add_chat_message("Erro", f"BROWSER_{action.upper()} veio sem elemento alvo.")
+            return
+        if action == "type" and len(parts) < 2:
+            self.add_chat_message("Erro", "BROWSER_TYPE precisa usar: elemento | texto.")
+            return
+        if not self._approve_remote_browser_action(action, target, value):
+            self.add_chat_message("Sistema", "Interacao remota do navegador cancelada pelo usuario.")
+            return
+
+        payload = {"target": target}
+        if action == "type":
+            payload["value"] = value
+
+        def completed(event):
+            if self.is_task_cancelled(task_id):
+                return
+            result = event.get("result", "")
+            if isinstance(result, str):
+                try:
+                    result = json.loads(result)
+                except json.JSONDecodeError:
+                    pass
+            if isinstance(result, dict) and result.get("url"):
+                self.internal_browser_url = str(result["url"])
+                remember = getattr(self, "remember_internal_browser_chat_url", None)
+                if callable(remember):
+                    remember(self.internal_browser_url, str(result.get("title") or ""))
+            if action == "inspect" and isinstance(result, dict):
+                elements = result.get("elements") or []
+                self.browser_element_catalog = {
+                    str(item.get("ref")): item
+                    for item in elements
+                    if item.get("ref")
+                }
+                element_lines = [
+                    f"{item.get('ref')}: <{item.get('tag')}> {item.get('label') or '(sem rotulo)'}"
+                    + (f" -> {item.get('href')}" if item.get("href") else "")
+                    for item in elements[:120]
+                ]
+                evidence = (
+                    f"URL: {result.get('url', '')}\nTitulo: {result.get('title', '')}\n\n"
+                    f"TEXTO VISIVEL:\n{str(result.get('text') or '')[:12000]}\n\n"
+                    "ELEMENTOS INTERATIVOS:\n" + "\n".join(element_lines)
+                )
+            else:
+                evidence = json.dumps(result, ensure_ascii=False, indent=2) if isinstance(result, (dict, list)) else str(result)
+            context = (
+                f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or 'Usar o navegador'}\n\n"
+                f"RESULTADO DA ACAO BROWSER_{action.upper()}:\n{evidence[:18000]}\n\n"
+                "Continue autonomamente. Inspecione novamente se o DOM mudou; use apenas uma acao de navegador por resposta. "
+                "Em localhost, teste o fluxo ate obter evidencia suficiente. Se a missao estiver concluida, entregue a conclusao."
+            )
+            self._run_ai_task(
+                "Continue a tarefa usando o resultado real do navegador.",
+                extra_context=context,
+                task_objective=task_objective or self.active_ai_objective,
+                action_depth=action_depth + 1,
+                task_id=task_id,
+            )
+
+        request_id = requester(action, payload=payload, callback=completed)
+        if not request_id:
+            self.add_chat_message("Erro", "Abra uma pagina no navegador antes de pedir interacao autonoma.")
+            return
+        activity = getattr(self, "set_ai_activity", None)
+        if callable(activity):
+            activity(f"IA usando navegador: {action}")
+        self.log_agent(f"Automacao do navegador enviada: {action} {target}")
+
+    def _agent_browser_chat(self, prompt, task_objective=None, action_depth=0, task_id=None):
+        """Envia uma mensagem ao chat aberto no WebView sem criar conversa nova."""
+        if self.is_task_cancelled(task_id):
+            return
+        requester = getattr(self, "request_internal_browser_action", None)
+        if not callable(requester):
+            self.add_chat_message("Erro", "O navegador atual não oferece envio de chat.")
+            return
+        prompt = str(prompt or "").strip()
+        if not prompt:
+            self.add_chat_message("Erro", "BROWSER_CHAT veio sem mensagem.")
+            return
+        if not self._approve_remote_browser_action("type", "chat", prompt):
+            self.add_chat_message("Sistema", "Envio ao Chat Web cancelado pelo usuário.")
+            return
+
+        def completed(event):
+            if self.is_task_cancelled(task_id):
+                return
+            result = event.get("result", "")
+            if isinstance(result, str):
+                try:
+                    result = json.loads(result)
+                except json.JSONDecodeError:
+                    result = {"response": result}
+            result = result if isinstance(result, dict) else {"response": str(result)}
+            if result.get("url"):
+                self.internal_browser_url = str(result["url"])
+                remember = getattr(self, "remember_internal_browser_chat_url", None)
+                if callable(remember):
+                    remember(self.internal_browser_url, str(result.get("title") or ""))
+            response = str(result.get("response") or "").strip()
+            if not response:
+                self.add_chat_message("Erro", str(result.get("error") or "O Chat Web não devolveu texto."))
+                return
+            context = (
+                f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or 'Usar Chat Web'}\n\n"
+                f"RESPOSTA REAL DO CHAT WEB:\n{response[:22000]}\n\n"
+                "Continue a missão com uma ação concreta da IDE ou conclua objetivamente."
+            )
+            self._run_ai_task(
+                "Continue a tarefa com a resposta do Chat Web.",
+                extra_context=context,
+                task_objective=task_objective or self.active_ai_objective,
+                action_depth=action_depth + 1,
+                task_id=task_id,
+            )
+
+        request_id = requester(
+            "chat",
+            payload={"prompt": prompt, "timeout": 300},
+            callback=completed,
+        )
+        if not request_id:
+            self.add_chat_message("Erro", "Abra o Chat Web antes de usar BROWSER_CHAT.")
+            return
+        self.set_ai_activity("IA conversando pelo Chat Web")
+        self.log_agent("Mensagem enviada ao Chat Web pela automação.")
 
     def _agent_screenshot(self, request, task_objective=None, action_depth=0, task_id=None):
         if self.is_task_cancelled(task_id):
@@ -1785,7 +2736,7 @@ class AgentActionsMixin:
             return False
         return bool(
             re.search(
-                r"\[(WRITE|REPLACE|FIX_MOJIBAKE|UNDO|EXECUTE|EXECUTE_ADMIN|OPEN_URL|SCREENSHOT|HUMAN_TEST)\s*:",
+                r"\[(WRITE|REPLACE|FIX_MOJIBAKE|UNDO|EXECUTE|EXECUTE_ADMIN|OPEN_URL|BROWSER_INSPECT|BROWSER_CLICK|BROWSER_TYPE|BROWSER_SCROLL|BROWSER_CHAT|SCREENSHOT|HUMAN_TEST)\s*:",
                 text,
                 re.IGNORECASE,
             )
@@ -1864,7 +2815,7 @@ class AgentActionsMixin:
                 "Proxima resposta obrigatoria:\n"
                 "- Se precisa entender codigo, use [READ: arquivo | linhas inicio-fim].\n"
                 "- Se ja sabe a mudanca, use [REPLACE] ou [WRITE].\n"
-                "- Se precisa validar, use uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: python -m unittest].\n\n"
+                "- Se precisa validar, use uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: comando de teste da stack detectada].\n\n"
                 f"Resposta desviada:\n{response_text}"
             ),
             task_objective=objective,
@@ -1904,6 +2855,78 @@ class AgentActionsMixin:
         if not any(marker in lower for marker in inspection_markers):
             return False
         return bool(self.extract_mutation_target_path(command) or self.extract_inspection_target_path(command))
+
+    def is_source_read_command(self, command):
+        """Reconhece comandos que apenas imprimem um arquivo-fonte.
+
+        Chats web às vezes tentam ler código usando ``python -c`` em vez de
+        [READ]. Isso não é uma validação nem uma alteração: o resultado precisa
+        voltar ao modelo como contexto de arquivo. A regra é independente do
+        modo irrestrito para que a IDE não pare após um comando com código 0.
+        """
+        text = str(command or "")
+        lower = text.lower()
+        target = self.extract_inspection_target_path(text)
+        if not target:
+            return False
+
+        terminal_read = bool(re.search(
+            r"\b(?:get-content|cat|type|more)\b|\bhead\s+-n\s+\d+|\bsed\s+-n",
+            lower,
+        ))
+        python_read = (
+            ("open(" in lower or "read_text(" in lower or ".read()" in lower)
+            and any(marker in lower for marker in ("splitlines", "enumerate(", "print("))
+            and not any(marker in lower for marker in ("sys.exit", "compile(", "py_compile", "compileall"))
+        )
+        return terminal_read or python_read
+
+    def source_read_request_from_command(self, command):
+        """Converte a listagem textual do terminal em uma solicitação READ."""
+        text = str(command or "")
+        target = self.extract_inspection_target_path(text)
+        if not target:
+            return ""
+
+        start = None
+        end = None
+        slice_match = re.search(
+            r"splitlines\(\)\s*\[\s*(\d*)\s*:\s*(\d*)\s*\]",
+            text,
+            re.IGNORECASE,
+        )
+        if slice_match:
+            start = int(slice_match.group(1) or 0) + 1
+            end = int(slice_match.group(2)) if slice_match.group(2) else None
+        if start is None:
+            total_match = re.search(r"(?:-totalcount|head\s+-n)\s+(\d+)", text, re.IGNORECASE)
+            if total_match:
+                start, end = 1, int(total_match.group(1))
+        if start is None:
+            sed_match = re.search(r"sed\s+-n\s+['\"]?(\d+)\s*,\s*(\d+)p", text, re.IGNORECASE)
+            if sed_match:
+                start, end = int(sed_match.group(1)), int(sed_match.group(2))
+
+        if start and end and end >= start:
+            return f"{target} | linhas {start}-{end}"
+        return target
+
+    def redirect_source_read_command_to_read(self, command, task_objective=None, action_depth=0, task_id=None):
+        request = self.source_read_request_from_command(command)
+        if not request:
+            self._agent_execute(command, task_objective=task_objective, action_depth=action_depth, task_id=task_id)
+            return
+        self.add_chat_message(
+            "Sistema",
+            "A IA pediu leitura de código pelo terminal. A IDE converteu a ação em READ para devolver o conteúdo ao Chat Web e continuar a missão.",
+        )
+        self.log_agent(f"Comando de leitura convertido em READ: {command}")
+        self._agent_read_many(
+            [request],
+            task_objective=task_objective,
+            action_depth=action_depth,
+            task_id=task_id,
+        )
 
     def redirect_inspection_command_to_scan(self, command, task_objective=None, action_depth=0, task_id=None):
         target = self.extract_mutation_target_path(command) or self.extract_inspection_target_path(command)
@@ -2173,7 +3196,7 @@ class AgentActionsMixin:
                 "Use as linhas encontradas acima para decidir a proxima acao real.\n"
                 "- Se a missao pede alterar/corrigir/remover/adicionar, responda agora com [READ] de um intervalo exato ainda necessario, [REPLACE] ou [WRITE].\n"
                 "- Se ja souber o trecho a mudar, prefira [REPLACE].\n"
-                "- Se a missao pede executar/testar, responda com uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: python -m unittest].\n"
+                "- Se a missao pede executar/testar, responda com uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: comando de teste da stack detectada].\n"
                 "- Nao repita [SEARCH_TEXT] para o mesmo arquivo/padrao.\n"
             )
         else:
@@ -2367,7 +3390,10 @@ class AgentActionsMixin:
         original_score = self.mojibake_score(line)
         if not original_score:
             return line
-        candidates = [self.apply_mojibake_map(line)]
+        mapped = self.apply_mojibake_map(line)
+        if "\ufffd" in line and "\ufffd" not in mapped:
+            return mapped
+        candidates = [mapped]
         for encoding in ("cp1252", "latin1"):
             try:
                 candidates.append(line.encode(encoding, errors="ignore").decode("utf-8", errors="replace"))
@@ -2429,6 +3455,22 @@ class AgentActionsMixin:
             "\u00e2\u20ac\u201d": "-",
             "\u00e2\u20ac\u00a6": "...",
             "\u00ef\u00bb\u00bf": "",
+            "Diagn\ufffdstico": "Diagnostico",
+            "diagn\ufffdstico": "diagnostico",
+            "aplica\ufffd\ufffdo": "aplicacao",
+            "Aplica\ufffd\ufffdo": "Aplicacao",
+            "mem\ufffdria": "memoria",
+            "Mem\ufffdria": "Memoria",
+            "m\ufffddulos": "modulos",
+            "M\ufffddulos": "Modulos",
+            "orquestra\ufffd\ufffdo": "orquestracao",
+            "Orquestra\ufffd\ufffdo": "Orquestracao",
+            "implementa\ufffd\ufffdo": "implementacao",
+            "Implementa\ufffd\ufffdo": "Implementacao",
+            "resili\ufffdncia": "resiliencia",
+            "Resili\ufffdncia": "Resiliencia",
+            "pr\ufffdxima": "proxima",
+            "Pr\ufffdxima": "Proxima",
         }
         repaired = text
         for bad, good in replacements.items():
@@ -2444,7 +3486,10 @@ class AgentActionsMixin:
                 raise ValueError("WRITE veio sem conteudo.")
             path.parent.mkdir(parents=True, exist_ok=True)
 
-            cleaned = self._strip_markdown_code(content)
+            cleaned = self._extract_fenced_code_payload(content)
+            valid, validation_error = self.validate_write_content(path, cleaned)
+            if not valid:
+                raise ValueError(validation_error)
             if path.exists():
                 current = path.read_text(encoding="utf-8", errors="replace")
                 objective = task_objective or self.active_ai_objective or ""
@@ -2462,8 +3507,10 @@ class AgentActionsMixin:
             self.log_agent(f"Arquivo escrito pela IA: {path.relative_to(self.current_workspace).as_posix()}")
             self.add_chat_message("Merotec AI", f"Atualizei o arquivo: `{path.relative_to(self.current_workspace).as_posix()}`.")
             self.load_workspace_files()
+            return True
         except Exception as exc:
             self.add_chat_message("Erro", f"Falha ao escrever arquivo: {exc}")
+            return False
 
     def objective_allows_full_rewrite(self, objective):
         normalized = self.normalize_plain_text(objective or "")
@@ -2574,10 +3621,10 @@ class AgentActionsMixin:
                 rel = path.relative_to(self.current_workspace).as_posix()
                 self.add_chat_message(
                     "Erro",
-                    f"REPLACE nao encontrou o trecho exato em {rel}. A IDE precisa reler o intervalo exato antes de tentar trocar.",
+                    f"REPLACE nao encontrou o trecho exato em {rel}. A IDE vai devolver o arquivo atual ao mesmo chat e continuar a correção.",
                 )
                 self.log_agent(f"REPLACE falhou porque OLD nao foi encontrado: {rel}")
-                return
+                return False
 
             backup = path.with_suffix(path.suffix + ".bak")
             shutil.copy2(path, backup)
@@ -2587,8 +3634,10 @@ class AgentActionsMixin:
             self.log_agent(f"Trecho substituido pela IA: {rel}")
             self.add_chat_message("Merotec AI", f"Substitui o trecho em `{rel}`.")
             self.load_workspace_files()
+            return True
         except Exception as exc:
             self.add_chat_message("Erro", f"Falha ao substituir trecho: {exc}")
+            return False
 
     def is_risky_replace(self, path, current, old_text, new_text, objective):
         if self.objective_allows_full_rewrite(objective):
@@ -2640,6 +3689,13 @@ class AgentActionsMixin:
         self._agent_read_many([raw_path], task_objective=task_objective, action_depth=action_depth, task_id=task_id)
 
     def read_files_limit_for_objective(self, task_objective=None):
+        """Permite contexto suficiente no modo autonomo sem confundir arquivo grande com bloqueio.
+
+        O limite por lote continua protegendo a interface, mas o modo irrestrito nao reduz
+        uma tarefa de implementacao a duas leituras apenas porque o objetivo menciona projeto.
+        """
+        if self.autonomous_unrestricted_mode_enabled():
+            return max(1, int(getattr(self, "max_read_requests_per_batch", self.max_read_files_per_turn)))
         objective = self.normalize_plain_text(task_objective or self.active_ai_objective or "")
         words = set(re.findall(r"[a-z0-9_]+", objective))
         if "projeto" in objective and words & {
@@ -2693,7 +3749,11 @@ class AgentActionsMixin:
                     self.add_chat_message("Merotec AI", f"Mapeando pasta `{rel}`...")
                 else:
                     total_lines = self.count_text_file_lines(path)
-                    should_consolidate = info["full"] or len(ranges) > 1 or total_lines > 420
+                    # Um intervalo explicitamente solicitado deve voltar exatamente como foi pedido,
+                    # mesmo em arquivos com milhares de linhas. Antes, qualquer arquivo acima de
+                    # 420 linhas era convertido em mapa geral e o modelo acabava pedindo WRITE
+                    # completo por nao receber o trecho que precisava para um REPLACE/PATCH local.
+                    should_consolidate = info["full"] or len(ranges) > 1
                     if should_consolidate:
                         block = self.build_file_intelligence_context(
                             path,
@@ -3062,7 +4122,7 @@ class AgentActionsMixin:
             "ORIENTACAO PARA A IA:\n"
             "- Use o contexto ja lido para tomar uma decisao produtiva.\n"
             "- Se a tarefa for modificar, use [REPLACE] ou [WRITE].\n"
-            "- Se a tarefa for validar, use uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: python -m unittest], ou [HUMAN_TEST].\n"
+            "- Se a tarefa for validar, use uma tag EXECUTE ja preenchida, por exemplo [EXECUTE: comando de teste da stack detectada], ou [HUMAN_TEST].\n"
             "- Se realmente faltar informacao essencial, leia outro ponto especifico e siga trabalhando."
         )
 
@@ -3070,8 +4130,9 @@ class AgentActionsMixin:
         text = raw_path.strip().strip("\"'")
         line_range = None
         patterns = [
-            r"^(?P<path>.+?)\s*\|\s*linhas?\s+(?P<start>\d+)\s*[-:]\s*(?P<end>\d+)\s*$",
-            r"^(?P<path>.+?)\s*\|\s*lines?\s+(?P<start>\d+)\s*[-:]\s*(?P<end>\d+)\s*$",
+            r"^(?P<path>.+?)\s*\|\s*linhas?\s+(?P<start>\d+)\s*(?:[-:]|at[eé]|a)\s*(?P<end>\d+)\s*$",
+            r"^(?P<path>.+?)\s*\|\s*lines?\s+(?P<start>\d+)\s*(?:[-:]|to)\s*(?P<end>\d+)\s*$",
+            r"^(?P<path>.+?)\s*\|\s*(?P<start>\d+)\s*[-:]\s*(?P<end>\d+)\s*$",
             r"^(?P<path>.+?)#L(?P<start>\d+)(?:-L?(?P<end>\d+))?\s*$",
         ]
         for pattern in patterns:
@@ -3772,8 +4833,66 @@ class AgentActionsMixin:
                     self.append_to_term(f"[sem saida] codigo {process.returncode}\n")
                 self.append_to_term(f"\n[processo da IA finalizado com codigo {process.returncode}]\n")
                 diagnostic = ""
+                if process.returncode == 0:
+                    self.get_ai_task_metrics(task_id).pop("requires_error_correction", None)
+                    if self.advance_autonomous_delivery_after_validation(
+                        command,
+                        task_objective=task_objective,
+                        action_depth=action_depth,
+                        task_id=task_id,
+                    ):
+                        return
+                    # Um comando concluído com sucesso também é evidência para
+                    # a IA. Sem este retorno, EXECUTE finito terminava em
+                    # silêncio e a missão ficava parada mesmo sem correção.
+                    if self.should_continue_development_loop(action_depth, task_id):
+                        context = (
+                            f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or command}\n\n"
+                            f"Comando executado com sucesso: {command}\n"
+                            f"Codigo de saida: 0\n"
+                            f"Saida:\n```\n{(output or '')[:6000]}\n```\n\n"
+                            "ORDEM DA IDE:\n"
+                            "- O comando terminou; use a saída como evidência.\n"
+                            "- Não repita o mesmo EXECUTE sem uma mudança ou novo motivo.\n"
+                            "- Continue a missão: corrija com [REPLACE]/[WRITE], faça [HUMAN_TEST: auto] quando necessário, ou entregue conclusão objetiva somente se a missão estiver realmente concluída.\n"
+                        )
+                        self._run_ai_task(
+                            "O comando terminou com sucesso. Continue a missão original usando a evidência retornada.",
+                            extra_context=context,
+                            task_objective=task_objective or self.active_ai_objective or command,
+                            action_depth=action_depth + 1,
+                            task_id=task_id,
+                        )
+                    else:
+                        self.add_chat_message(
+                            "Erro",
+                            "O ciclo contínuo foi pausado pelo limite configurado. O último resultado foi mantido no Terminal Local.",
+                        )
+                        self.set_status("Limite configurado do ciclo atingido.", "warning")
+                    return
+
                 if process.returncode != 0:
                     diagnostic = self.build_command_failure_diagnostic(command, output, process.returncode)
+                    metrics = self.get_ai_task_metrics(task_id)
+                    metrics["requires_error_correction"] = {
+                        "kind": "execute",
+                        "command": command,
+                        "returncode": int(process.returncode),
+                        "output_tail": (output or "")[-12000:],
+                        "created_at": time.time(),
+                    }
+                    self.add_chat_message(
+                        "Sistema",
+                        "Comando falhou. A IDE vai devolver a saida real do terminal ao mesmo Chat Web antes da proxima acao.",
+                    )
+                    if not self.can_continue_autonomous_repair(
+                        command,
+                        output,
+                        process.returncode,
+                        task_objective=task_objective,
+                        task_id=task_id,
+                    ):
+                        return
                     if self.command_output_is_placeholder_error(command, output):
                         self.add_chat_message(
                             "Sistema",
@@ -3797,11 +4916,12 @@ class AgentActionsMixin:
                         )
                         return
                 context = (
+                    "DIAGNOSTICO DE FALHA GERADO PELA IDE — PRIORIDADE MAXIMA:\n"
                     f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or command}\n\n"
                     f"Comando executado: {command}\n"
                     f"Codigo de saida: {process.returncode}\n"
                     f"{diagnostic}\n"
-                    f"Saida:\n```\n{(output or '')[:6000]}\n```\n\n"
+                    f"SAIDA REAL DO TERMINAL (trecho final):\n```\n{(output or '')[-12000:]}\n```\n\n"
                     "ORDEM DA IDE:\n"
                     "- Se o comando falhou, nao repita o mesmo comando agora.\n"
                     "- Leia ou altere os arquivos suspeitos primeiro.\n"
@@ -3945,3 +5065,1062 @@ class AgentActionsMixin:
                 last_error = str(exc)
                 time.sleep(delay)
         return False, last_error or "sem resposta do servidor"
+
+
+# MEROTEC_VISUAL_AUTONOMY_V3
+def _merotec_workspace_has_visual_target(instance):
+    try:
+        workspace = Path(instance.current_workspace).resolve()
+    except Exception:
+        return False
+    if (workspace / "index.html").exists() or any(workspace.glob("*.html")):
+        return True
+    if (workspace / "package.json").exists():
+        return True
+    for candidate in (workspace / "main.py", workspace / "app.py"):
+        if not candidate.exists():
+            continue
+        try:
+            source = candidate.read_text(encoding="utf-8", errors="replace").lower()
+        except OSError:
+            continue
+        if any(token in source for token in ("tkinter", "customtkinter", "pygame", "pyqt", "pyside", "kivy", "flet", "flask", "fastapi", "streamlit")):
+            return True
+    return False
+
+
+def _merotec_autonomous_visual_test_required(self, task_objective=None):
+    if not self.bool_setting_enabled("autonomous_visual_validation_enabled", env_name="MEROTEC_AUTONOMOUS_VISUAL_VALIDATION", default=True):
+        return False
+    return _merotec_workspace_has_visual_target(self)
+
+
+def _merotec_is_local_visual_url(raw_url):
+    value = str(raw_url or "").strip().strip("\"'")
+    if not value:
+        return False
+    if value.startswith("file:"):
+        return True
+    if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", value):
+        value = "http://" + value
+    try:
+        host = (urllib.parse.urlparse(value).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+
+
+_original_merotec_agent_open_url = AgentActionsMixin._agent_open_url
+_original_merotec_grab_human_test_image = AgentActionsMixin.grab_human_test_image
+_original_merotec_human_test_ready = AgentActionsMixin.human_test_window_is_ready
+_original_merotec_should_route_execute = AgentActionsMixin.should_route_execute_to_human_test
+
+
+def _merotec_agent_open_url(self, raw_url):
+    if _merotec_is_local_visual_url(raw_url):
+        self._merotec_visual_test_open_error = ""
+        opener = getattr(self, "open_visual_test_browser", None)
+        if callable(opener):
+            result = opener(raw_url)
+            if result.get("opened"):
+                self.add_chat_message(
+                    "Merotec AI",
+                    f"Teste visual aberto no navegador dedicado: {result.get('url', raw_url)}",
+                )
+                self.log_agent(f"Navegador visual dedicado abriu: {result.get('url', raw_url)}")
+                return result.get("url", raw_url)
+            detail = result.get('error') or 'sem confirmação do WebView2'
+            self._merotec_visual_test_open_error = detail
+            self.add_chat_message(
+                "Erro",
+                "A página local respondeu, mas o navegador visual não abriu. "
+                f"Detalhe: {detail}",
+            )
+            return ""
+    return _original_merotec_agent_open_url(self, raw_url)
+
+
+def _merotec_grab_human_test_image(self, plan):
+    open_error = str(getattr(self, "_merotec_visual_test_open_error", "") or "")
+    if open_error:
+        self._merotec_visual_test_open_error = ""
+        raise RuntimeError(f"Teste visual bloqueado porque o navegador dedicado não abriu: {open_error}")
+    info_getter = getattr(self, "get_visual_test_browser_info", None)
+    info = info_getter() if callable(info_getter) else {}
+    if info and info.get("title") and _merotec_is_local_visual_url(info.get("url")):
+        image = self.grab_window_image_by_title(info["title"], timeout=12.0)
+        if image is not None:
+            return image
+        raise RuntimeError("O navegador de teste abriu, mas a janela visual não pôde ser capturada.")
+    return _original_merotec_grab_human_test_image(self, plan)
+
+
+def _merotec_human_test_window_is_ready(self, plan):
+    info_getter = getattr(self, "get_visual_test_browser_info", None)
+    info = info_getter() if callable(info_getter) else {}
+    if info and info.get("ready"):
+        return True
+    return _original_merotec_human_test_ready(self, plan)
+
+
+def _merotec_should_route_execute_to_human_test(self, command, task_objective=None):
+    if _original_merotec_should_route_execute(self, command, task_objective):
+        return True
+    normalized = self.normalize_plain_text(command or "")
+    if "http.server" in normalized and self.autonomous_visual_test_required(task_objective):
+        return True
+    if any(marker in normalized for marker in ("npm run dev", "npm start", "flutter run")) and self.autonomous_visual_test_required(task_objective):
+        return True
+    return False
+
+
+AgentActionsMixin.autonomous_visual_test_required = _merotec_autonomous_visual_test_required
+AgentActionsMixin._agent_open_url = _merotec_agent_open_url
+AgentActionsMixin.grab_human_test_image = _merotec_grab_human_test_image
+AgentActionsMixin.human_test_window_is_ready = _merotec_human_test_window_is_ready
+AgentActionsMixin.should_route_execute_to_human_test = _merotec_should_route_execute_to_human_test
+
+
+# MEROTEC_CODE_PIPELINE_V5
+# Camada única: sem wrappers recursivos e sem rejeitar alteração simples só
+# porque o Chat Web não usou cerca Markdown.
+
+from modules.code_integrity import (
+    unwrap_outer_fence as _merotec_v5_unwrap,
+    validate_source as _merotec_v5_validate,
+)
+
+_merotec_v5_base_write = AgentActionsMixin._agent_write
+_merotec_v5_base_replace = AgentActionsMixin._agent_replace
+_merotec_v5_base_patch = AgentActionsMixin._agent_apply_patch
+_merotec_v5_base_validation = AgentActionsMixin.infer_default_validation_command
+
+
+def _merotec_v5_report_rejection(self, path, issue, task_id=None):
+    try:
+        relative = Path(path).resolve().relative_to(Path(self.current_workspace).resolve()).as_posix()
+    except Exception:
+        relative = Path(path).name or str(path)
+
+    line = int(issue.get("line") or 0)
+    location = f" (linha {line})" if line else ""
+    self.add_chat_message(
+        "Erro",
+        f"Alteração recusada antes de salvar em `{relative}`{location}: "
+        f"{issue.get('kind')}: {issue.get('message')}. O arquivo válido foi preservado.",
+    )
+    self.log_agent(
+        f"Validação de código recusou {relative}{location}: "
+        f"{issue.get('kind')}: {issue.get('message')}"
+    )
+    metrics = self.get_ai_task_metrics(task_id)
+    metrics["code_pipeline_last_rejection"] = {
+        "path": relative,
+        "kind": issue.get("kind"),
+        "line": line,
+        "message": issue.get("message"),
+    }
+
+
+def _merotec_v5_write(self, raw_path, content, task_id=None, task_objective=None):
+    try:
+        path = self.resolve_workspace_path(raw_path)
+        candidate = _merotec_v5_unwrap(content)
+        issue = _merotec_v5_validate(path, candidate)
+        if issue:
+            _merotec_v5_report_rejection(self, path, issue, task_id)
+            return False
+    except Exception as exc:
+        self.log_agent(f"Pré-validação WRITE indisponível: {exc}")
+    return _merotec_v5_base_write(
+        self,
+        raw_path,
+        content,
+        task_id=task_id,
+        task_objective=task_objective,
+    )
+
+
+def _merotec_v5_replace(self, raw_path, old_content, new_content, task_id=None, task_objective=None):
+    try:
+        path = self.resolve_workspace_path(raw_path)
+        if path.exists() and path.is_file():
+            current = path.read_text(encoding="utf-8", errors="replace")
+            old_text = _merotec_v5_unwrap(old_content)
+            new_text = _merotec_v5_unwrap(new_content)
+            proposed = self.replace_exact_or_line_ending_variant(current, old_text, new_text)
+            if proposed is not None:
+                issue = _merotec_v5_validate(path, proposed)
+                if issue:
+                    _merotec_v5_report_rejection(self, path, issue, task_id)
+                    return False
+    except Exception as exc:
+        self.log_agent(f"Pré-validação REPLACE indisponível: {exc}")
+    return _merotec_v5_base_replace(
+        self,
+        raw_path,
+        old_content,
+        new_content,
+        task_id=task_id,
+        task_objective=task_objective,
+    )
+
+
+def _merotec_v5_snapshots(self, patch_text):
+    snapshots = {}
+    for raw_path in re.findall(
+        r"^\*\*\* (?:Update File|Add File|Delete File):\s*(.+?)\s*$",
+        str(patch_text or ""),
+        re.MULTILINE,
+    ):
+        try:
+            path = self.resolve_workspace_path(raw_path.strip())
+            if path not in snapshots:
+                snapshots[path] = (
+                    path.exists(),
+                    path.read_bytes() if path.exists() and path.is_file() else b"",
+                )
+        except Exception:
+            pass
+    return snapshots
+
+
+def _merotec_v5_restore(self, snapshots):
+    for path, state in snapshots.items():
+        existed, payload = state
+        try:
+            if existed:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(payload)
+            elif path.exists():
+                path.unlink()
+        except Exception as exc:
+            self.log_agent(f"Falha ao restaurar PATCH inválido: {exc}")
+
+
+def _merotec_v5_patch(self, patch_text, task_id=None, task_objective=None):
+    snapshots = _merotec_v5_snapshots(self, patch_text)
+    changed = _merotec_v5_base_patch(
+        self,
+        patch_text,
+        task_id=task_id,
+        task_objective=task_objective,
+    )
+    if not changed:
+        return changed
+
+    invalid_path = None
+    invalid_issue = None
+    for raw_path in changed:
+        try:
+            path = self.resolve_workspace_path(raw_path)
+            if path.exists() and path.is_file():
+                issue = _merotec_v5_validate(
+                    path,
+                    path.read_text(encoding="utf-8", errors="replace"),
+                )
+                if issue:
+                    invalid_path = path
+                    invalid_issue = issue
+                    break
+        except Exception:
+            pass
+
+    if invalid_issue:
+        _merotec_v5_restore(self, snapshots)
+        self.load_workspace_files()
+        _merotec_v5_report_rejection(self, invalid_path, invalid_issue, task_id)
+        return []
+    return changed
+
+
+def _merotec_v5_validation_command(self, objective):
+    """Usa a barreira multilinguagem para qualquer workspace, não só Python."""
+    from modules.language_guard import validation_command, detect_workspace_language
+    workspace = Path(self.current_workspace).resolve()
+    language = detect_workspace_language(workspace)
+    self.log_agent(f"Validação automática selecionada para a stack: {language}.")
+    return validation_command(workspace)
+
+
+AgentActionsMixin._agent_write = _merotec_v5_write
+AgentActionsMixin._agent_replace = _merotec_v5_replace
+AgentActionsMixin._agent_apply_patch = _merotec_v5_patch
+AgentActionsMixin.infer_default_validation_command = _merotec_v5_validation_command
+
+
+# MEROTEC_WEB_CHAT_EDIT_PROTOCOL_V6
+# The web chat protocol must use a single, deterministic grammar.  Older
+# versions advertised "[PATCH: file]" but discarded the file name before the
+# patch parser ran, producing the recurring "nenhum arquivo identificado"
+# loop.  Keep compatibility with those replies, while guiding new replies to
+# the safer WRITE/REPLACE envelopes.
+
+import hashlib as _merotec_v6_hashlib
+
+_merotec_v6_base_parse_actions = AgentActionsMixin.parse_and_execute_agent_actions
+_merotec_v6_base_continue_after_mutation_failure = AgentActionsMixin.continue_after_mutation_failure
+
+
+def _merotec_v6_safe_patch_path(value):
+    """Return a plain relative path from a [PATCH: path] header, or empty."""
+    raw = str(value or "").strip().strip("`").replace("\\", "/")
+    raw = raw.splitlines()[0].strip() if raw else ""
+    if not raw or raw in {".", "/"} or raw.startswith("/") or re.match(r"^[A-Za-z]:/", raw):
+        return ""
+    if any(part in {"", ".", ".."} for part in raw.split("/")):
+        return ""
+    return raw
+
+
+def _merotec_v6_patch_body_is_hunk(body):
+    return bool(re.search(r"(?m)^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@", body or ""))
+
+
+def _merotec_v6_normalize_patch_envelopes(response_text):
+    """Attach a declared [PATCH: path] to a hunk without touching code bytes.
+
+    Only marker lines are added/repaired.  Hunk lines, including their leading
+    spaces and the one-character unified-diff prefix, remain verbatim.
+    """
+    text = str(response_text or "")
+    block_pattern = re.compile(
+        r"(\[PATCH\s*:\s*([^\]\r\n]+)\]\s*)(.*?)(\[/PATCH\])",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def normalize(match):
+        prefix, declared_raw, body, closing = match.groups()
+        declared = _merotec_v6_safe_patch_path(declared_raw)
+        if not declared:
+            return match.group(0)
+
+        normalized = body.replace("\r\n", "\n").replace("\r", "\n")
+        # A chat occasionally returns just a unified hunk after [PATCH:path].
+        # The declared header is enough to build the safe OpenAI patch envelope.
+        if "*** Begin Patch" not in normalized and _merotec_v6_patch_body_is_hunk(normalized):
+            normalized = (
+                "\n*** Begin Patch\n"
+                f"*** Update File: {declared}\n"
+                + normalized.strip("\n")
+                + "\n*** End Patch\n"
+            )
+        elif "*** Begin Patch" in normalized:
+            has_file_marker = bool(
+                re.search(
+                    r"(?m)^\*\*\* (?:Update File|Add File|Delete File):\s*\S+",
+                    normalized,
+                )
+            )
+            if not has_file_marker:
+                normalized = re.sub(
+                    r"(?m)^(\*\*\* Begin Patch[^\n]*\n)",
+                    lambda marker: marker.group(1) + f"*** Update File: {declared}\n",
+                    normalized,
+                    count=1,
+                )
+            # Gemini sometimes literalizes the documentation placeholder
+            # "Update File /".  A real header path is authoritative.
+            normalized = re.sub(
+                r"(?m)^(\*\*\* (?:Update File|Add File|Delete File):)\s*/\s*$",
+                lambda marker: marker.group(1) + f" {declared}",
+                normalized,
+            )
+            # If the streamed answer was complete enough to contain a hunk but
+            # omitted the final marker, finish the envelope.  It still goes
+            # through exact-context matching and language validation.
+            if "*** End Patch" not in normalized and _merotec_v6_patch_body_is_hunk(normalized):
+                normalized = normalized.rstrip("\n") + "\n*** End Patch\n"
+
+        return prefix + normalized + closing
+
+    return block_pattern.sub(normalize, text)
+
+
+def _merotec_v6_parse_actions(
+    self,
+    response_text,
+    task_objective=None,
+    action_depth=0,
+    task_id=None,
+    direct_action_happened=False,
+):
+    # The normalizer is deliberately limited to PATCH metadata.  It never calls
+    # strip() on a source line, so Python indentation and diff prefixes survive.
+    normalized = _merotec_v6_normalize_patch_envelopes(response_text)
+    return _merotec_v6_base_parse_actions(
+        self,
+        normalized,
+        task_objective=task_objective,
+        action_depth=action_depth,
+        task_id=task_id,
+        direct_action_happened=direct_action_happened,
+    )
+
+
+def _merotec_v6_continue_after_mutation_failure(
+    self,
+    response_text,
+    target_paths,
+    task_objective=None,
+    action_depth=0,
+    task_id=None,
+):
+    """Keep the mission alive, but break repeated malformed PATCH cycles."""
+    raw = str(response_text or "")
+    upper = raw.upper()
+    if "[PATCH" in upper:
+        metrics = self.get_ai_task_metrics(task_id)
+        fingerprints = metrics.setdefault("web_chat_patch_failures", {})
+        fingerprint = _merotec_v6_hashlib.sha256(
+            re.sub(r"\s+", " ", raw).strip().encode("utf-8", errors="replace")
+        ).hexdigest()[:16]
+        repeats = int(fingerprints.get(fingerprint, 0)) + 1
+        fingerprints[fingerprint] = repeats
+
+        targets = [str(item).strip() for item in (target_paths or []) if str(item).strip()]
+        declared = ""
+        header = re.search(r"\[PATCH\s*:\s*([^\]\r\n]+)\]", raw, re.IGNORECASE)
+        if header:
+            declared = _merotec_v6_safe_patch_path(header.group(1))
+        if declared and declared not in targets:
+            targets.append(declared)
+
+        repair = (
+            "\n\nPROTOCOLO DE RECUPERAÇÃO DO CHAT WEB:\n"
+            "O formato PATCH/unified diff não é confiável nesta conversa e não deve ser repetido. "
+            "Não use [PATCH], `*** Begin Patch`, `@@` nem diff.\n"
+            "Escolha somente uma das formas abaixo, sem texto fora dos marcadores:\n"
+            "1) [READ: caminho] para obter novamente o trecho atual; ou\n"
+            "2) [REPLACE: caminho]\\n[OLD]\\n```linguagem\\nTRECHO EXATO ATUAL\\n```\\n[/OLD]\\n"
+            "[NEW]\\n```linguagem\\nTRECHO NOVO COM INDENTAÇÃO PRESERVADA\\n```\\n[/NEW]\\n[/REPLACE]; ou\n"
+            "3) [WRITE: caminho]\\n```linguagem\\nARQUIVO COMPLETO VÁLIDO\\n```\\n[/WRITE].\n"
+            "Para Python use somente quatro espaços por nível e não use tab. "
+            "Não declare conclusão antes de uma edição aplicada e validação real."
+        )
+        if repeats >= 2:
+            repair += (
+                "\nA mesma tentativa PATCH já falhou mais de uma vez. A próxima resposta deve ser [READ: caminho] "
+                "ou um bloco [WRITE]/[REPLACE] no formato acima; PATCH será ignorado para evitar loop."
+            )
+        raw += repair
+        target_paths = targets
+
+    return _merotec_v6_base_continue_after_mutation_failure(
+        self,
+        raw,
+        target_paths,
+        task_objective=task_objective,
+        action_depth=action_depth,
+        task_id=task_id,
+    )
+
+
+AgentActionsMixin.parse_and_execute_agent_actions = _merotec_v6_parse_actions
+AgentActionsMixin.continue_after_mutation_failure = _merotec_v6_continue_after_mutation_failure
+
+
+# MEROTEC_WEB_CHAT_PATCH_COMPATIBILITY_V6
+# When a provider renders a unified diff outside a <pre>, a context-only blank
+# line can arrive as an empty string instead of the normal single-space diff
+# line.  Treat it as a blank context line; never trim source indentation.
+
+_merotec_v6_base_apply_hunks = AgentActionsMixin._apply_openai_style_patch_hunks
+
+
+def _merotec_v6_apply_hunks(self, source, lines, raw_path):
+    source_lines = source.splitlines()
+    has_final_newline = source.endswith("\n")
+    hunks = []
+    current = None
+    for line in lines:
+        if line.startswith("@@"):
+            if current is not None:
+                hunks.append(current)
+            current = []
+            continue
+        if current is not None:
+            current.append(line)
+    if current is not None:
+        hunks.append(current)
+    if not hunks:
+        raise ValueError(f"PATCH de {raw_path} não contém @@ com trecho de troca.")
+
+    for hunk in hunks:
+        old_lines = []
+        new_lines = []
+        for line in hunk:
+            if line.startswith(" "):
+                # The first character is the unified-diff context marker.  All
+                # remaining spaces are actual source indentation and are kept.
+                old_lines.append(line[1:])
+                new_lines.append(line[1:])
+            elif line.startswith("-"):
+                old_lines.append(line[1:])
+            elif line.startswith("+"):
+                new_lines.append(line[1:])
+            elif line == "":
+                # Some web-chat DOMs drop the single context-marker space on a
+                # blank line.  A blank is unambiguous source context here.
+                old_lines.append("")
+                new_lines.append("")
+            elif line.startswith(r"\ No newline at end of file"):
+                continue
+            else:
+                # Do not silently reinterpret non-diff text as code.  It would
+                # risk altering indentation or applying a prose explanation.
+                raise ValueError(
+                    f"PATCH de {raw_path} contém linha sem prefixo diff: {line[:120]!r}. "
+                    "Use WRITE/REPLACE em bloco Markdown; PATCH não é seguro nessa resposta."
+                )
+
+        if not old_lines:
+            raise ValueError(f"PATCH de {raw_path} não possui contexto para inserir com segurança.")
+        found_at = -1
+        for index in range(0, len(source_lines) - len(old_lines) + 1):
+            if source_lines[index:index + len(old_lines)] == old_lines:
+                found_at = index
+                break
+        if found_at < 0:
+            preview = "\n".join(old_lines[:5])
+            raise ValueError(
+                f"Contexto do PATCH não encontrado em {raw_path}: {preview[:220]}. "
+                "Use READ e depois REPLACE com [OLD] exato."
+            )
+        source_lines[found_at:found_at + len(old_lines)] = new_lines
+
+    result = "\n".join(source_lines)
+    return result + "\n" if has_final_newline else result
+
+
+AgentActionsMixin._apply_openai_style_patch_hunks = _merotec_v6_apply_hunks
+
+# MEROTEC_EXECUTION_STATE_MACHINE_V7
+# A continuous development loop must be driven by verified progress.  Earlier
+# versions treated any successful shell exit code as progress, including
+# `[EXECUTE: echo "Missão concluída"]`.  That let a chat create a self-confirming
+# loop: print a conclusion -> return code 0 -> ask the chat again -> print a
+# conclusion.  V7 blocks output-only commands, records workspace state, accepts
+# an explicit final state only after evidence, and pauses repeated failed edits
+# that do not change the workspace.
+
+import hashlib as _merotec_v7_hashlib
+
+_merotec_v7_base_execute = AgentActionsMixin._agent_execute
+_merotec_v7_base_parse_actions = AgentActionsMixin.parse_and_execute_agent_actions
+_merotec_v7_base_continue_mutation_failure = AgentActionsMixin.continue_after_mutation_failure
+_merotec_v7_base_action_names = AgentActionsMixin.extract_agent_action_names
+_merotec_v7_base_advance_delivery = AgentActionsMixin.advance_autonomous_delivery_after_validation
+
+
+def _merotec_v7_workspace_signature(instance):
+    """Return a lightweight deterministic signature of the current workspace.
+
+    It is intentionally based on relative path, size and mtime.  It is used
+    only to detect repeated agent actions without any intervening filesystem
+    progress; it is not a security hash.
+    """
+    try:
+        root = Path(instance.current_workspace).resolve()
+    except Exception:
+        return "workspace-indisponivel"
+    digest = _merotec_v7_hashlib.sha256()
+    count = 0
+    ignored_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules"}
+    try:
+        for path in sorted(root.rglob("*")):
+            try:
+                if not path.is_file() or any(part in ignored_dirs for part in path.parts):
+                    continue
+                relative = path.relative_to(root).as_posix()
+                # Backups and databases change as a side effect of valid edits;
+                # they must not reset the no-progress guard by themselves.
+                if relative.endswith((".bak", ".pyc")) or relative in {"tasks.db", "tasks.db-journal"}:
+                    continue
+                stat = path.stat()
+                digest.update(f"{relative}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode("utf-8", "replace"))
+                count += 1
+                if count >= 2500:
+                    break
+            except OSError:
+                continue
+    except OSError:
+        return "workspace-indisponivel"
+    return digest.hexdigest()[:24]
+
+
+def _merotec_v7_normalize_shell(command):
+    value = str(command or "").strip().lower()
+    value = re.sub(r"\s+", " ", value)
+    return value
+
+
+def _merotec_v7_is_output_only_command(command):
+    """Recognize commands that only narrate a conclusion and do no validation.
+
+    The IDE never needs an AI-generated `echo`, `Write-Host`, `printf`, `true`
+    or `exit 0` to develop a project.  User-entered Terminal Local commands do
+    not pass through `_agent_execute`, so this affects only model actions.
+    """
+    value = _merotec_v7_normalize_shell(command)
+    if not value:
+        return True
+    # Redirects, pipes and chained commands could have real effects.  Do not
+    # classify those automatically; dedicated mutation guards handle them.
+    if any(token in value for token in (">", "|", "&&", ";")):
+        return False
+    value = re.sub(r"^(?:cmd(?:\.exe)?\s+/c\s+)", "", value)
+    value = re.sub(r"^(?:powershell(?:\.exe)?\s+(?:-noprofile\s+)?(?:-command\s+)?)", "", value)
+    value = value.strip().strip('"\'')
+    if re.match(r"^(?:echo(?:\.|\s)|write-host\b|write-output\b|printf\b)", value):
+        return True
+    if value in {"true", "ver", "exit 0", "exit /b 0", "exit /b"}:
+        return True
+    return False
+
+
+def _merotec_v7_metric(instance, task_id):
+    metrics = instance.get_ai_task_metrics(task_id)
+    metrics.setdefault("v7_workspace_signature", _merotec_v7_workspace_signature(instance))
+    return metrics
+
+
+def _merotec_v7_decrement_rejected_execute(metrics):
+    # The legacy parser marks EXECUTE before calling _agent_execute.  Undo that
+    # accounting for a command we refuse before it reaches the shell, so a
+    # rejected echo cannot become proof of a real task action.
+    for key in ("real_actions", "execute_actions"):
+        try:
+            metrics[key] = max(0, int(metrics.get(key, 0) or 0) - 1)
+        except (TypeError, ValueError):
+            metrics[key] = 0
+
+
+def _merotec_v7_resume_after_rejected_execute(self, command, reason, task_objective, action_depth, task_id):
+    metrics = _merotec_v7_metric(self, task_id)
+    signature = _merotec_v7_workspace_signature(self)
+    if metrics.get("v7_workspace_signature") != signature:
+        metrics["v7_workspace_signature"] = signature
+        metrics["v7_rejected_execute_count"] = 0
+    metrics["v7_rejected_execute_count"] = int(metrics.get("v7_rejected_execute_count", 0) or 0) + 1
+    count = metrics["v7_rejected_execute_count"]
+
+    try:
+        rejected_limit = max(1, min(8, int(getattr(self, "settings", {}).get("web_chat_nonproductive_execute_limit", 2))))
+    except (TypeError, ValueError):
+        rejected_limit = 2
+    if count > rejected_limit:
+        self.add_chat_message(
+            "Erro",
+            "A missão foi pausada para evitar ciclo sem progresso: o Chat Web repetiu comandos de terminal "
+            "que não alteram nem validam o projeto. Nenhum arquivo foi modificado.",
+        )
+        self.log_agent("Ciclo bloqueado por EXECUTE não produtivo repetido.")
+        self.set_status("Pausado: Chat Web repetiu comando sem progresso.", "warning")
+        return
+
+    self.add_chat_message(
+        "Sistema",
+        "A IDE recusou um EXECUTE que apenas imprime/declara resultado. A mesma missão continuará uma única vez "
+        "com uma ação de desenvolvimento real.",
+    )
+    recovery = (
+        f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or ''}\n\n"
+        "RECUPERAÇÃO DO LOOP:\n"
+        f"A IDE recusou o comando `{command}` porque {reason}.\n"
+        "Não use echo, Write-Host, printf, true, exit 0 ou comandos que apenas dizem que a missão terminou. "
+        "Escolha agora UMA ação que gere progresso verificável: [READ: arquivo], [SEARCH_TEXT: padrão | arquivo], "
+        "[WRITE: arquivo] com código em cerca Markdown, [REPLACE: arquivo] com OLD/NEW exatos, "
+        "[EXECUTE: teste real] ou [HUMAN_TEST: auto]. "
+        "Use [FINAL: resumo] somente depois de uma alteração/teste real já aprovado pela IDE."
+    )
+
+    def resume():
+        if self.is_task_cancelled(task_id):
+            return
+        self._run_ai_task(
+            "Retome a missão com uma única ação real; não use comando de eco ou auto-conclusão.",
+            extra_context=recovery,
+            task_objective=task_objective or self.active_ai_objective,
+            action_depth=action_depth + 1,
+            task_id=task_id,
+        )
+
+    timer = threading.Timer(0.35, resume)
+    timer.daemon = True
+    timer.start()
+
+
+def _merotec_v7_execute(self, command, task_objective=None, action_depth=0, task_id=None):
+    normalized = _merotec_v7_normalize_shell(command)
+    metrics = _merotec_v7_metric(self, task_id)
+    if _merotec_v7_is_output_only_command(command):
+        _merotec_v7_decrement_rejected_execute(metrics)
+        self.add_chat_message(
+            "Erro",
+            "EXECUTE recusado: o comando só imprime ou declara uma conclusão; ele não testa nem modifica o projeto.",
+        )
+        self.log_agent(f"EXECUTE não produtivo recusado: {command}")
+        _merotec_v7_resume_after_rejected_execute(
+            self, command, "é apenas saída de texto/auto-conclusão", task_objective, action_depth, task_id
+        )
+        return
+
+    signature = _merotec_v7_workspace_signature(self)
+    command_key = _merotec_v7_hashlib.sha256(normalized.encode("utf-8", "replace")).hexdigest()[:20]
+    executed = metrics.setdefault("v7_executed_commands", {})
+    if executed.get(command_key) == signature:
+        _merotec_v7_decrement_rejected_execute(metrics)
+        self.add_chat_message(
+            "Erro",
+            "EXECUTE recusado: o mesmo comando já foi executado neste mesmo estado do workspace. "
+            "Faça uma leitura, alteração ou use outro teste antes de repetir.",
+        )
+        self.log_agent(f"EXECUTE repetido sem mudança recusado: {command}")
+        _merotec_v7_resume_after_rejected_execute(
+            self, command, "repete o mesmo comando sem alteração de arquivos", task_objective, action_depth, task_id
+        )
+        return
+
+    executed[command_key] = signature
+    metrics["v7_workspace_signature"] = signature
+    return _merotec_v7_base_execute(
+        self,
+        command,
+        task_objective=task_objective,
+        action_depth=action_depth,
+        task_id=task_id,
+    )
+
+
+def _merotec_v7_final_summary(response_text):
+    text = str(response_text or "").strip()
+    match = re.fullmatch(r"\[FINAL\s*:\s*(.+?)\]", text, re.DOTALL | re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def _merotec_v7_has_final_evidence(self, task_objective, task_id):
+    objective = str(task_objective or self.active_ai_objective or "")
+    if not self.objective_requires_concrete_change(objective):
+        return True
+    metrics = self.get_ai_task_metrics(task_id)
+    changed = sum(int(metrics.get(key, 0) or 0) for key in ("write_actions", "replace_actions", "direct_actions"))
+    verified = sum(int(metrics.get(key, 0) or 0) for key in (
+        "execute_actions", "human_test_actions", "screenshot_actions", "auto_validation_actions"
+    ))
+    return changed > 0 and verified > 0
+
+
+def _merotec_v7_parse_actions(
+    self,
+    response_text,
+    task_objective=None,
+    action_depth=0,
+    task_id=None,
+    direct_action_happened=False,
+):
+    final = _merotec_v7_final_summary(response_text)
+    if final:
+        if _merotec_v7_has_final_evidence(self, task_objective, task_id):
+            metrics = self.get_ai_task_metrics(task_id)
+            metrics["mission_finalized"] = True
+            metrics["mission_final_summary"] = final
+            self.add_chat_message("Merotec IA", final)
+            self.log_agent("Missão encerrada por [FINAL] após evidência verificável.")
+            self.set_status("Missão concluída com evidências verificáveis.", "ready")
+            return
+        self.add_chat_message(
+            "Erro",
+            "FINAL recusado: ainda não há uma alteração e validação reais para concluir esta missão.",
+        )
+        _merotec_v7_resume_after_rejected_execute(
+            self,
+            "[FINAL]",
+            "tentou concluir sem alteração e validação verificáveis",
+            task_objective,
+            action_depth,
+            task_id,
+        )
+        return
+    return _merotec_v7_base_parse_actions(
+        self,
+        response_text,
+        task_objective=task_objective,
+        action_depth=action_depth,
+        task_id=task_id,
+        direct_action_happened=direct_action_happened,
+    )
+
+
+def _merotec_v7_action_names(self, response_text):
+    names = _merotec_v7_base_action_names(self, response_text)
+    if _merotec_v7_final_summary(response_text):
+        names.add("FINAL")
+    return names
+
+
+def _merotec_v7_advance_delivery(self, command, task_objective=None, action_depth=0, task_id=None):
+    advanced = _merotec_v7_base_advance_delivery(
+        self,
+        command,
+        task_objective=task_objective,
+        action_depth=action_depth,
+        task_id=task_id,
+    )
+    if advanced:
+        metrics = self.get_ai_task_metrics(task_id)
+        metrics["v7_last_validation_signature"] = _merotec_v7_workspace_signature(self)
+        metrics["v7_rejected_execute_count"] = 0
+    return advanced
+
+
+def _merotec_v7_continue_mutation_failure(
+    self,
+    response_text,
+    target_paths,
+    task_objective=None,
+    action_depth=0,
+    task_id=None,
+):
+    """Permit recovery only while the workspace or error is making progress.
+
+    Continuous means the IDE keeps trying valid next steps, not that it sends
+    malformed edits to a provider forever.  A repeated failed mutation against
+    an unchanged workspace is paused after three attempts with the file intact.
+    """
+    metrics = _merotec_v7_metric(self, task_id)
+    signature = _merotec_v7_workspace_signature(self)
+    previous_signature = metrics.get("v7_mutation_failure_signature")
+    if previous_signature != signature:
+        metrics["v7_mutation_failure_signature"] = signature
+        metrics["v7_mutation_failures_without_progress"] = 0
+        metrics["v7_mutation_failure_fingerprints"] = {}
+
+    normalized = re.sub(r"\s+", " ", str(response_text or "")).strip()
+    fingerprint = _merotec_v7_hashlib.sha256(normalized.encode("utf-8", "replace")).hexdigest()[:20]
+    fingerprints = metrics.setdefault("v7_mutation_failure_fingerprints", {})
+    fingerprints[fingerprint] = int(fingerprints.get(fingerprint, 0) or 0) + 1
+    metrics["v7_mutation_failures_without_progress"] = int(
+        metrics.get("v7_mutation_failures_without_progress", 0) or 0
+    ) + 1
+    repeats = fingerprints[fingerprint]
+    total = metrics["v7_mutation_failures_without_progress"]
+
+    try:
+        no_progress_limit = max(2, min(12, int(getattr(self, "settings", {}).get("web_chat_no_progress_failure_limit", 3))))
+    except (TypeError, ValueError):
+        no_progress_limit = 3
+    if repeats >= 2 or total >= no_progress_limit:
+        targets = ", ".join(dict.fromkeys(str(item) for item in (target_paths or []) if str(item).strip())) or "arquivo alvo"
+        self.add_chat_message(
+            "Erro",
+            "Ciclo pausado sem perder arquivos: a mesma edição falhou repetidamente no mesmo estado do workspace. "
+            f"Arquivos preservados: {targets}. A próxima tentativa deve começar por [READ: arquivo] e usar "
+            "[WRITE]/[REPLACE] com bloco Markdown; PATCH/diff não será aceito nesta conversa.",
+        )
+        self.log_agent("Loop de mutação bloqueado por falta de progresso verificável.")
+        self.set_status("Pausado: edição repetida sem progresso.", "warning")
+        return False
+
+    return _merotec_v7_base_continue_mutation_failure(
+        self,
+        response_text,
+        target_paths,
+        task_objective=task_objective,
+        action_depth=action_depth,
+        task_id=task_id,
+    )
+
+
+AgentActionsMixin._agent_execute = _merotec_v7_execute
+AgentActionsMixin.parse_and_execute_agent_actions = _merotec_v7_parse_actions
+AgentActionsMixin.extract_agent_action_names = _merotec_v7_action_names
+AgentActionsMixin.advance_autonomous_delivery_after_validation = _merotec_v7_advance_delivery
+AgentActionsMixin.continue_after_mutation_failure = _merotec_v7_continue_mutation_failure
+
+
+# MEROTEC_FILE_APPLICATION_RECOVERY_V8
+# O Chat Web pode colocar explicações antes/depois do bloco de código, omitir a
+# cerca final Markdown ou devolver uma versão incompleta.  A V5 validava a
+# resposta crua antes de a rotina de escrita extrair o código, fazendo uma
+# edição válida ser recusada por `````python```` na linha 1.  Esta camada
+# normaliza o payload primeiro e, quando o código realmente é inválido, volta
+# ao mesmo chat com o arquivo atual e o diagnóstico — sem tentar salvar nada
+# quebrado e sem pausar a missão na terceira tentativa.
+
+_merotec_v8_base_write = AgentActionsMixin._agent_write
+_merotec_v8_base_continue_mutation_failure = AgentActionsMixin.continue_after_mutation_failure
+
+
+def _merotec_v8_clean_write_payload(self, content):
+    """Extrai somente o fonte de um WRITE, preservando a indentação.
+
+    Aceita explicação fora da cerca, cerca sem fechamento e a forma que alguns
+    chats copiam como ``main.py`` antes do bloco.  O resultado continua sendo
+    validado pela barreira multilinguagem antes de qualquer escrita.
+    """
+    raw = str(content or "").replace("\r\n", "\n").replace("\r", "\n")
+    # Remova apenas marcadores de transporte; nunca use strip() por linha,
+    # pois a indentação de Python é parte do código.
+    raw = re.sub(r"(?im)^\s*\[/WRITE\]\s*$", "", raw)
+    raw = re.sub(r"(?im)^\s*\[WRITE\s*:\s*[^\]\r\n]+\]\s*$", "", raw)
+
+    fence = re.search(r"```[^\n`]*\n(.*?)(?:\n```|\Z)", raw, re.DOTALL)
+    if fence:
+        candidate = fence.group(1)
+    else:
+        # Quando só a abertura da cerca chegou pelo WebView, descarte a linha
+        # de linguagem e mantenha todo o restante exatamente como foi emitido.
+        lines = raw.split("\n")
+        if lines and lines[0].lstrip().startswith("```"):
+            candidate = "\n".join(lines[1:])
+        else:
+            candidate = raw
+
+    candidate = candidate.strip("\n")
+    return candidate + ("\n" if candidate else "")
+
+
+def _merotec_v8_write(self, raw_path, content, task_id=None, task_objective=None):
+    cleaned = _merotec_v8_clean_write_payload(self, content)
+    # Passe o mesmo conteúdo normalizado à V5 e à implementação original.
+    # Assim a pré-validação e a gravação usam bytes equivalentes.
+    result = _merotec_v8_base_write(
+        self,
+        raw_path,
+        cleaned,
+        task_id=task_id,
+        task_objective=task_objective,
+    )
+    if result:
+        metrics = self.get_ai_task_metrics(task_id)
+        metrics["v8_invalid_write_recoveries"] = 0
+        metrics.pop("v8_last_invalid_write_key", None)
+    return result
+
+
+def _merotec_v8_compact_invalid_write_context(self, path, relative, issue, objective):
+    try:
+        source = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"Não foi possível reler `{relative}`: {exc}"
+
+    error_kind = str((issue or {}).get("kind") or "ValidationError")
+    error_message = str((issue or {}).get("message") or "A validação recusou o conteúdo.")
+    line = int((issue or {}).get("line") or 0)
+    location = f" na linha {line}" if line else ""
+    excerpt = str((issue or {}).get("excerpt") or "").strip()
+    if len(source) <= 24000:
+        source_block = f"ARQUIVO ATUAL VÁLIDO — {relative}:\n```\n{source}\n```"
+    else:
+        source_block = (
+            f"O arquivo `{relative}` é grande. Antes de editar, responda somente "
+            f"[READ: {relative}] para a IDE entregar o trecho atual correto."
+        )
+
+    diagnosis = (
+        f"MISSÃO ORIGINAL:\n{objective or self.active_ai_objective or ''}\n\n"
+        "RECUPERAÇÃO DE ESCRITA DA IDE:\n"
+        f"A última proposta para `{relative}` foi recusada antes de salvar por {error_kind}{location}: "
+        f"{error_message}\n"
+    )
+    if excerpt:
+        diagnosis += f"Trecho do diagnóstico:\n```\n{excerpt}\n```\n"
+    diagnosis += (
+        "O arquivo no disco NÃO foi alterado. Ignore totalmente a proposta inválida anterior. "
+        "Use o arquivo atual abaixo como fonte de verdade. Responda com UMA ação aplicável: "
+        f"prefira [REPLACE: {relative}] com [OLD] idêntico ao conteúdo atual e [NEW] válido; "
+        "use [WRITE] somente se for intencionalmente reescrever o arquivo completo. "
+        "Não envie código solto, não use PATCH/diff e não explique antes da tag.\n\n"
+        + source_block
+    )
+    return diagnosis
+
+
+def _merotec_v8_continue_mutation_failure(
+    self,
+    response_text,
+    target_paths,
+    task_objective=None,
+    action_depth=0,
+    task_id=None,
+):
+    """Recupera falhas de sintaxe com contexto correto, sem bloquear o agente.
+
+    A V7 pausava após poucas tentativas no mesmo estado. Isso é adequado para
+    comandos vazios, mas não para fonte inválido: a ação útil seguinte é reler
+    o arquivo preservado e fazer uma substituição pequena. Esta rotina entrega
+    esse contexto diretamente ao mesmo ciclo automático.
+    """
+    if self.is_task_cancelled(task_id) or not self.should_continue_development_loop(action_depth, task_id):
+        return False
+
+    metrics = self.get_ai_task_metrics(task_id)
+    issue = metrics.get("code_pipeline_last_rejection")
+    candidate_path = ""
+    for raw in target_paths or ():
+        raw = str(raw or "").strip()
+        if raw:
+            candidate_path = raw
+            break
+    if not candidate_path and isinstance(issue, dict):
+        candidate_path = str(issue.get("path") or "").strip()
+
+    if isinstance(issue, dict) and candidate_path:
+        try:
+            path = self.resolve_workspace_path(candidate_path)
+            if path.exists() and path.is_file():
+                relative = path.relative_to(Path(self.current_workspace).resolve()).as_posix()
+                signature = _merotec_v7_workspace_signature(self)
+                response_key = _merotec_v7_hashlib.sha256(
+                    (signature + "\0" + re.sub(r"\s+", " ", str(response_text or "")).strip()).encode(
+                        "utf-8", "replace"
+                    )
+                ).hexdigest()[:20]
+                previous = metrics.get("v8_last_invalid_write_key")
+                if previous != response_key:
+                    metrics["v8_invalid_write_recoveries"] = int(metrics.get("v8_invalid_write_recoveries", 0) or 0) + 1
+                    metrics["v8_last_invalid_write_key"] = response_key
+                recovery_count = int(metrics.get("v8_invalid_write_recoveries", 0) or 0)
+                metrics["autonomous_repair_cycles"] = int(metrics.get("autonomous_repair_cycles", 0) or 0) + 1
+
+                self.add_chat_message(
+                    "Sistema",
+                    "A alteração não foi salva porque o código proposto é inválido. "
+                    "A IDE preservou o arquivo e continuará a mesma missão com o conteúdo atual e o diagnóstico "
+                    f"({recovery_count}/contínuo).",
+                )
+                self.log_agent(
+                    f"Recuperação V8 de escrita inválida: {relative}; tentativa {recovery_count}/contínuo."
+                )
+                self.set_ai_activity("IA corrigindo escrita inválida")
+                context = _merotec_v8_compact_invalid_write_context(
+                    self,
+                    path,
+                    relative,
+                    issue,
+                    task_objective or self.active_ai_objective or "",
+                )
+                self._run_ai_task(
+                    "Corrija a edição rejeitada usando o arquivo atual e emita uma única ação válida da IDE.",
+                    extra_context=context,
+                    task_objective=task_objective or self.active_ai_objective,
+                    action_depth=action_depth + 1,
+                    task_id=task_id,
+                )
+                return True
+        except Exception as exc:
+            self.log_agent(f"Recuperação V8 não conseguiu preparar o arquivo rejeitado: {exc}")
+
+    return _merotec_v8_base_continue_mutation_failure(
+        self,
+        response_text,
+        target_paths,
+        task_objective=task_objective,
+        action_depth=action_depth,
+        task_id=task_id,
+    )
+
+
+AgentActionsMixin._agent_write = _merotec_v8_write
+AgentActionsMixin.continue_after_mutation_failure = _merotec_v8_continue_mutation_failure
