@@ -14,6 +14,10 @@ try:
 except ModuleNotFoundError:
     pyttsx3 = None
 try:
+    import edge_tts
+except ModuleNotFoundError:
+    edge_tts = None
+try:
     import sounddevice as sd
 except ModuleNotFoundError:
     sd = None
@@ -31,12 +35,222 @@ import time
 import unicodedata
 import re
 import difflib
+import asyncio
+import ctypes
 from queue import Empty, Queue
+
+
+TTS_RATE = 155
+TTS_VOLUME = 1.0
+TTS_MAX_CHARS_PER_PART = 420
+TTS_ENGINE_EDGE = "edge"
+TTS_ENGINE_SAPI = "sapi"
+TTS_ENGINE_AUTO = "auto"
+TTS_AUTO_VOICE_ID = "auto"
+DEFAULT_EDGE_VOICE_ID = "pt-BR-AntonioNeural"
+KNOWN_EDGE_TTS_VOICES = (
+    {
+        "id": "pt-BR-AntonioNeural",
+        "name": "Microsoft Antonio Neural - Portugues Brasil",
+        "engine": TTS_ENGINE_EDGE,
+        "gender": "Male",
+        "languages": ["pt-BR"],
+    },
+    {
+        "id": "pt-BR-FranciscaNeural",
+        "name": "Microsoft Francisca Neural - Portugues Brasil",
+        "engine": TTS_ENGINE_EDGE,
+        "gender": "Female",
+        "languages": ["pt-BR"],
+    },
+)
+
+
+def _texto_sem_acentos(text):
+    normalized = unicodedata.normalize("NFD", str(text or ""))
+    return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn").lower()
+
+
+def _voice_field_text(voice):
+    if isinstance(voice, dict):
+        values = [
+            voice.get("id", ""),
+            voice.get("name", ""),
+            voice.get("gender", ""),
+            voice.get("engine", ""),
+        ]
+        values.extend(voice.get("languages") or [])
+        return _texto_sem_acentos(" ".join(str(value) for value in values if value))
+
+    values = [
+        getattr(voice, "id", ""),
+        getattr(voice, "name", ""),
+        getattr(voice, "gender", ""),
+    ]
+    for language in getattr(voice, "languages", []) or []:
+        if isinstance(language, bytes):
+            language = language.decode("utf-8", errors="ignore")
+        values.append(language)
+    return _texto_sem_acentos(" ".join(str(value) for value in values if value))
+
+
+def _has_voice_term(text, terms):
+    return any(re.search(r"(?<![a-z0-9])" + re.escape(term) + r"(?![a-z0-9])", text) for term in terms)
+
+
+def _voice_preference_score(voice):
+    text = _voice_field_text(voice)
+    score = 0
+
+    if "edge" in text:
+        score += 40
+    if any(term in text for term in ("pt-br", "pt_br", "portuguese", "portugues", "brasil", "brazil")):
+        score += 80
+    elif "pt" in text:
+        score += 35
+
+    male_terms = (
+        "male",
+        "masculino",
+        "homem",
+        "man",
+        "antonio",
+        "daniel",
+        "david",
+        "felipe",
+        "francisco",
+        "humberto",
+        "ricardo",
+        "thiago",
+    )
+    female_terms = (
+        "female",
+        "feminino",
+        "mulher",
+        "woman",
+        "maria",
+        "helena",
+        "heloisa",
+        "francisca",
+        "lucia",
+        "zira",
+    )
+    if _has_voice_term(text, male_terms):
+        score += 100
+    if _has_voice_term(text, female_terms):
+        score -= 120
+    if "natural" in text or "neural" in text:
+        score += 15
+    if "desktop" in text:
+        score += 5
+    return score
+
+
+def _voice_id(voice):
+    return str(voice.get("id", "") if isinstance(voice, dict) else getattr(voice, "id", "") or "")
+
+
+def _voice_name(voice):
+    return str(voice.get("name", "") if isinstance(voice, dict) else getattr(voice, "name", "") or "")
+
+
+def _voice_engine(voice):
+    return str(voice.get("engine", "") if isinstance(voice, dict) else "sapi")
+
+
+def _voice_label(voice):
+    engine = _voice_engine(voice).upper()
+    name = _voice_name(voice) or _voice_id(voice)
+    return f"{name} ({engine})"
+
+
+def list_tts_voices(include_sapi=True):
+    voices = [dict(voice, label=_voice_label(voice)) for voice in KNOWN_EDGE_TTS_VOICES]
+    if include_sapi and pyttsx3 is not None:
+        engine = None
+        try:
+            engine = pyttsx3.init()
+            for voice in list(engine.getProperty("voices") or []):
+                voice_info = {
+                    "id": _voice_id(voice),
+                    "name": _voice_name(voice),
+                    "engine": TTS_ENGINE_SAPI,
+                    "gender": str(getattr(voice, "gender", "") or ""),
+                    "languages": [
+                        language.decode("utf-8", errors="ignore") if isinstance(language, bytes) else str(language)
+                        for language in (getattr(voice, "languages", []) or [])
+                    ],
+                }
+                voice_info["label"] = _voice_label(voice_info)
+                voices.append(voice_info)
+        except Exception:
+            pass
+        finally:
+            if engine is not None:
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+    return voices
+
+
+def _configured_voice(voices, voice_id):
+    requested = str(voice_id or "").strip()
+    if not requested or requested == TTS_AUTO_VOICE_ID:
+        return None
+    requested_text = _texto_sem_acentos(requested)
+    for voice in voices:
+        if requested == _voice_id(voice) or requested_text in {
+            _texto_sem_acentos(_voice_id(voice)),
+            _texto_sem_acentos(_voice_name(voice)),
+            _texto_sem_acentos(_voice_label(voice)),
+        }:
+            return voice
+    return None
+
+
+def _select_tts_voice(voices, voice_id=None, engine_name=None):
+    filtered = list(voices or [])
+    if engine_name and engine_name != TTS_ENGINE_AUTO:
+        filtered = [voice for voice in filtered if _voice_engine(voice) == engine_name]
+    configured = _configured_voice(filtered, voice_id)
+    if configured is not None:
+        return configured
+    if not filtered:
+        return None
+    best_voice = max(filtered, key=_voice_preference_score)
+    if _voice_preference_score(best_voice) <= 0:
+        return None
+    return best_voice
+
+
+def _configure_tts_engine(engine, voice_id=None):
+    engine.setProperty("rate", TTS_RATE)
+    engine.setProperty("volume", TTS_VOLUME)
+
+    try:
+        voices = list(engine.getProperty("voices") or [])
+    except Exception:
+        voices = []
+    if not voices:
+        return None
+
+    best_voice = _select_tts_voice(voices, voice_id, engine_name=TTS_ENGINE_SAPI)
+    if best_voice is None:
+        return None
+
+    try:
+        engine.setProperty("voice", _voice_id(best_voice))
+        return best_voice
+    except Exception:
+        return None
 
 
 def _normalizar_texto_para_fala(text):
     texto = str(text or "")
     texto = re.sub(r"```.*?```", " ", texto, flags=re.DOTALL)
+    texto = re.sub(r"https?://\S+", " link ", texto)
+    texto = re.sub(r"\b[\w.-]+\\[\w .\\/-]+", " caminho de arquivo ", texto)
     texto = re.sub(
         r"\[(?:READ|WRITE|REPLACE|SEARCH_TEXT|SCAN_TEXT|FIX_MOJIBAKE|EXECUTE|EXECUTE_ADMIN|OPEN_URL|BROWSER_INSPECT|BROWSER_CLICK|BROWSER_TYPE|BROWSER_SCROLL|SCREENSHOT|HUMAN_TEST|UNDO):[^\]]+\]",
         " ",
@@ -44,11 +258,55 @@ def _normalizar_texto_para_fala(text):
     )
     texto = texto.replace("```", " ")
     texto = re.sub(r"[*_`>#|\[\]{}]", " ", texto)
+    texto = re.sub(r"\s*[-=]{3,}\s*", ". ", texto)
+    texto = re.sub(r"\s*([.!?;:])\s*", r"\1 ", texto)
     texto = re.sub(r"\s+", " ", texto)
     return texto.strip()
 
+
+def _partes_para_fala(text):
+    texto = _normalizar_texto_para_fala(text)
+    if not texto:
+        return []
+
+    sentences = re.split(r"(?<=[.!?])\s+", texto)
+    parts = []
+    current = ""
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if len(sentence) > TTS_MAX_CHARS_PER_PART:
+            if current:
+                parts.append(current)
+                current = ""
+            while sentence:
+                if len(sentence) <= TTS_MAX_CHARS_PER_PART:
+                    chunk = sentence
+                    sentence = ""
+                else:
+                    split_at = sentence.rfind(" ", 0, TTS_MAX_CHARS_PER_PART + 1)
+                    if split_at <= 0:
+                        split_at = TTS_MAX_CHARS_PER_PART
+                    chunk = sentence[:split_at]
+                    sentence = sentence[split_at:].lstrip()
+                if chunk.strip():
+                    parts.append(chunk.strip())
+            continue
+        candidate = f"{current} {sentence}".strip()
+        if len(candidate) > TTS_MAX_CHARS_PER_PART and current:
+            parts.append(current)
+            current = sentence
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
+    return parts
+
+
 class VoiceModule:
-    def __init__(self):
+    def __init__(self, settings=None):
+        self.settings = settings if isinstance(settings, dict) else {}
         self.recognizer = sr.Recognizer() if SPEECH_RECOGNITION_AVAILABLE else None
         if self.recognizer is not None:
             self.recognizer.dynamic_energy_threshold = True
@@ -69,6 +327,7 @@ class VoiceModule:
         self.stop_requested = False
         self.speech_lock = threading.Lock()
         self.current_speech_engine = None
+        self.current_mci_alias = None
         self.keyword_listener_active = False
         self.keyword_listener_thread = None
         self.keyword_stop_event = threading.Event()
@@ -120,11 +379,11 @@ class VoiceModule:
             # Criamos uma instância nova e única para esta leitura específica
             # Isso garante que ele leia o texto do início ao fim sem travar
             engine_local = pyttsx3.init()
-            engine_local.setProperty('rate', 180)
+            _configure_tts_engine(engine_local, self._tts_voice_id())
 
             try:
                 # Divide em parágrafos para maior estabilidade
-                paragrafos = texto_completo.split('\n')
+                paragrafos = _partes_para_fala(texto_completo)
                 for p in paragrafos:
                     if self.stop_requested: break
 
@@ -142,7 +401,7 @@ class VoiceModule:
                 del engine_local
                 self.queue.task_done()
 
-    def speak(self, text):
+    def _legacy_sapi_speak(self, text):
         if pyttsx3 is None:
             return
         """Lê o texto completo reconstruindo o motor para evitar travamentos"""
@@ -153,15 +412,13 @@ class VoiceModule:
             try:
                 # Criamos o motor dentro da thread de forma isolada
                 engine = pyttsx3.init()
-                engine.setProperty('rate', 180)
+                _configure_tts_engine(engine)
                 with self.speech_lock:
                     self.current_speech_engine = engine
 
                 # Limpamos o texto de caracteres que fazem o motor parar cedo
-                texto_limpo = _normalizar_texto_para_fala(text)
-
                 # Dividimos apenas em partes grandes (parágrafos)
-                partes = [texto_limpo] if texto_limpo else []
+                partes = _partes_para_fala(text)
 
                 for parte in partes:
                     if self.stop_requested:
@@ -173,7 +430,8 @@ class VoiceModule:
 
                     if parte.strip():
                         engine.say(parte.strip())
-                        engine.runAndWait()  # Força a leitura desta parte
+                        engine.runAndWait()
+                        time.sleep(0.08)
 
             except Exception as e:
                 print(f"Erro na fala: {e}")
@@ -191,6 +449,146 @@ class VoiceModule:
         # Inicia a thread de fala
         threading.Thread(target=run_speech, daemon=True).start()
 
+    def _tts_engine_name(self):
+        engine_name = str(self.settings.get("tts_engine") or TTS_ENGINE_EDGE).strip().lower()
+        if engine_name not in {TTS_ENGINE_AUTO, TTS_ENGINE_EDGE, TTS_ENGINE_SAPI}:
+            return TTS_ENGINE_EDGE
+        return engine_name
+
+    def _tts_voice_id(self):
+        voice_id = str(self.settings.get("tts_voice_id") or DEFAULT_EDGE_VOICE_ID).strip()
+        return voice_id or DEFAULT_EDGE_VOICE_ID
+
+    def _edge_voice_id(self):
+        voice_id = self._tts_voice_id()
+        if voice_id == TTS_AUTO_VOICE_ID or _configured_voice(KNOWN_EDGE_TTS_VOICES, voice_id) is None:
+            selected = _select_tts_voice(KNOWN_EDGE_TTS_VOICES, voice_id, engine_name=TTS_ENGINE_EDGE)
+            return _voice_id(selected) if selected else DEFAULT_EDGE_VOICE_ID
+        return voice_id
+
+    def _mci_command(self, command, buffer_size=255):
+        if os.name != "nt":
+            return ""
+        buffer = ctypes.create_unicode_buffer(buffer_size)
+        result = ctypes.windll.winmm.mciSendStringW(command, buffer, buffer_size, None)
+        if result != 0:
+            error = ctypes.create_unicode_buffer(255)
+            ctypes.windll.winmm.mciGetErrorStringW(result, error, 255)
+            raise RuntimeError(error.value or f"Erro MCI {result}")
+        return buffer.value
+
+    def _play_mp3_with_mci(self, filename):
+        alias = f"merotec_tts_{int(time.time() * 1000)}"
+        with self.speech_lock:
+            self.current_mci_alias = alias
+        try:
+            self._mci_command(f'open "{filename}" type mpegvideo alias {alias}')
+            self._mci_command(f"play {alias}")
+            while not self.stop_requested:
+                mode = self._mci_command(f"status {alias} mode", buffer_size=64).strip().lower()
+                if mode not in {"playing", "seeking"}:
+                    break
+                time.sleep(0.08)
+            if self.stop_requested:
+                try:
+                    self._mci_command(f"stop {alias}")
+                except Exception:
+                    pass
+        finally:
+            try:
+                self._mci_command(f"close {alias}")
+            except Exception:
+                pass
+            with self.speech_lock:
+                if self.current_mci_alias == alias:
+                    self.current_mci_alias = None
+
+    def _speak_with_edge_tts(self, text):
+        if edge_tts is None:
+            return False
+        parts = _partes_para_fala(text)
+        if not parts:
+            return True
+
+        async def save_part(part, filename):
+            communicate = edge_tts.Communicate(part, self._edge_voice_id(), rate="+0%", volume="+0%")
+            await communicate.save(filename)
+
+        for part in parts:
+            if self.stop_requested:
+                break
+            while self.is_paused and not self.stop_requested:
+                time.sleep(0.1)
+            if self.stop_requested:
+                break
+            temp_filename = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
+                    temp_filename = temp_audio.name
+                asyncio.run(save_part(part, temp_filename))
+                self._play_mp3_with_mci(temp_filename)
+            finally:
+                if temp_filename and os.path.exists(temp_filename):
+                    try:
+                        os.remove(temp_filename)
+                    except OSError:
+                        pass
+        return True
+
+    def _speak_with_sapi(self, text):
+        if pyttsx3 is None:
+            return False
+        engine = None
+        try:
+            engine = pyttsx3.init()
+            _configure_tts_engine(engine, self._tts_voice_id())
+            with self.speech_lock:
+                self.current_speech_engine = engine
+
+            for parte in _partes_para_fala(text):
+                if self.stop_requested:
+                    break
+                while self.is_paused and not self.stop_requested:
+                    time.sleep(0.1)
+                if parte.strip():
+                    engine.say(parte.strip())
+                    engine.runAndWait()
+                    time.sleep(0.08)
+            return True
+        finally:
+            if engine is not None:
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+            with self.speech_lock:
+                if self.current_speech_engine is engine:
+                    self.current_speech_engine = None
+
+    def _speak_text_once(self, text):
+        engine_name = self._tts_engine_name()
+        if engine_name in {TTS_ENGINE_AUTO, TTS_ENGINE_EDGE}:
+            try:
+                if self._speak_with_edge_tts(text):
+                    return True
+            except Exception as exc:
+                print(f"Falha no Edge TTS; tentando SAPI: {exc}")
+        try:
+            return self._speak_with_sapi(text)
+        except Exception as exc:
+            print(f"Erro na fala: {exc}")
+            return False
+
+    def speak(self, text):
+        if edge_tts is None and pyttsx3 is None:
+            return
+
+        def run_speech():
+            self.stop_requested = False
+            self._speak_text_once(text)
+
+        threading.Thread(target=run_speech, daemon=True).start()
+
     def stop(self):
         """Interrompe a fala atual imediatamente"""
         self.is_paused = False
@@ -200,6 +598,12 @@ class VoiceModule:
             self.queue.queue.clear()
         with self.speech_lock:
             engine = self.current_speech_engine
+            alias = self.current_mci_alias
+        if alias:
+            try:
+                self._mci_command(f"stop {alias}")
+            except Exception:
+                pass
         if engine is not None:
             try:
                 engine.stop()

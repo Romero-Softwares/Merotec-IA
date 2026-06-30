@@ -39,6 +39,54 @@ def _js_arg(value: object) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _page_info(window, fallback_url: str = "") -> dict:
+    info = {"url": str(fallback_url or ""), "title": "", "http_error": ""}
+    try:
+        info["url"] = str(window.get_current_url() or fallback_url or "")
+    except Exception:
+        pass
+    try:
+        info["title"] = str(window.evaluate_js("document.title || ''") or "")
+    except Exception:
+        pass
+    try:
+        body_text = str(window.evaluate_js("(document.body && document.body.innerText || '').slice(0, 500)") or "")
+    except Exception:
+        body_text = ""
+    combined = f"{info.get('title', '')}\n{body_text}".upper()
+    if "HTTP ERROR 431" in combined or "REQUEST HEADER FIELDS TOO LARGE" in combined:
+        info["http_error"] = "431"
+    return info
+
+
+def _recover_http_431(window, entry_url: str) -> dict:
+    """Limpa dados do perfil WebView quando cookies/cabecalhos quebram o provedor."""
+    recovered = False
+    try:
+        clear_cookies = getattr(window, "clear_cookies", None)
+        if callable(clear_cookies):
+            clear_cookies()
+            recovered = True
+    except Exception:
+        pass
+    try:
+        window.evaluate_js(
+            "try { localStorage.clear(); sessionStorage.clear(); } catch (e) {}"
+        )
+        recovered = True
+    except Exception:
+        pass
+    try:
+        window.load_url(entry_url)
+        time.sleep(0.2)
+        recovered = True
+    except Exception:
+        pass
+    info = _page_info(window, entry_url)
+    info["recovered_from_http_431"] = recovered
+    return info
+
+
 def _set_windows_clipboard_image(data_base64: str) -> tuple[bool, str]:
     """Coloca uma imagem PNG/JPEG no clipboard do Windows como CF_DIB.
 
@@ -205,7 +253,10 @@ def run(
 
     def command_loop() -> None:
         page_loaded.wait(timeout=20)
-        _emit("ready", url=initial_url)
+        initial_info = _page_info(window, initial_url)
+        if initial_info.get("http_error") == "431":
+            initial_info = _recover_http_431(window, initial_url)
+        _emit("ready", **initial_info)
         for raw_line in sys.stdin:
             try:
                 command = json.loads(raw_line)
@@ -219,13 +270,20 @@ def run(
                         page_loaded.wait(timeout=20)
                         window.show()
                         window.restore()
-                        _emit("navigated", url=url)
+                        info = _page_info(window, url)
+                        if info.get("http_error") == "431":
+                            entry_url = str(command.get("entry_url") or initial_url or url)
+                            info = _recover_http_431(window, entry_url)
+                        _emit("navigated", request_id=request_id, action=action, **info)
                 elif action == "reload":
                     current = window.get_current_url() or initial_url
                     page_loaded.clear()
                     window.load_url(current)
                     page_loaded.wait(timeout=20)
-                    _emit("navigated", url=current)
+                    info = _page_info(window, current)
+                    if info.get("http_error") == "431":
+                        info = _recover_http_431(window, initial_url)
+                    _emit("navigated", request_id=request_id, action=action, **info)
                 elif action == "back":
                     window.evaluate_js("history.back()")
                 elif action == "forward":
@@ -290,12 +348,17 @@ def run(
                     attachment_error = ""
                     if isinstance(raw_attachments, list):
                         total_data_size = 0
+                        seen_attachments = set()
                         for item in raw_attachments[:6]:
                             if not isinstance(item, dict):
                                 continue
                             data_base64 = str(item.get("data_base64") or "").strip()
                             if not data_base64:
                                 continue
+                            fingerprint = str(item.get("sha256") or data_base64[:256]).strip()
+                            if fingerprint in seen_attachments:
+                                continue
+                            seen_attachments.add(fingerprint)
                             # Limite defensivo: o motor principal já limita o
                             # arquivo, mas o processo isolado também precisa se
                             # proteger contra mensagens JSON grandes demais.
@@ -402,8 +465,8 @@ def run(
 
                         // Alguns chats não expõem input[type=file] até o usuário abrir
                         // o menu. Eles aceitam o arquivo por drop/paste diretamente no
-                        // compositor. Esse caminho é tentado mesmo sem input visível.
-                        if (transfer.files.length) {{
+                        // compositor. Esse caminho é usado só quando o input não recebeu tudo.
+                        if (transfer.files.length && attachmentCount < transfer.files.length) {{
                           for (const target of dropTargets) {{
                             try {{ emit(target, new DragEvent('dragenter', {{bubbles:true, cancelable:true, dataTransfer:transfer}})); }} catch (_) {{}}
                             try {{ emit(target, new DragEvent('dragover', {{bubbles:true, cancelable:true, dataTransfer:transfer}})); }} catch (_) {{}}

@@ -1159,7 +1159,8 @@ class WorkspaceIntelligenceMixin:
     def autonomous_discovery_validation_command(self):
         workspace = Path(self.current_workspace)
         if (workspace / "pubspec.yaml").exists():
-            return "flutter analyze"
+            pubspec = (workspace / "pubspec.yaml").read_text(encoding="utf-8", errors="replace").lower()
+            return "flutter analyze" if "flutter:" in pubspec or "sdk: flutter" in pubspec else "dart analyze"
         package_json = workspace / "package.json"
         if package_json.exists():
             text = package_json.read_text(encoding="utf-8", errors="replace")
@@ -1169,7 +1170,15 @@ class WorkspaceIntelligenceMixin:
                 return "npm run build"
             return "npm install --dry-run"
         if (workspace / "pyproject.toml").exists() or (workspace / "requirements.txt").exists() or any(workspace.glob("*.py")):
-            return f'"{sys.executable}" -m compileall .'
+            targets = [
+                name
+                for name in ("main.py", "app.py", "modules", "tests")
+                if (workspace / name).exists()
+            ]
+            if targets:
+                return f'"{sys.executable}" -m compileall -q ' + " ".join(targets)
+            excluded = r"(^|[\\/])(\.git|\.venv|venv|env|node_modules|__pycache__)([\\/]|$)"
+            return f'"{sys.executable}" -m compileall -q -x "{excluded}" .'
         if (workspace / "index.html").exists() or any(workspace.glob("*.html")):
             return "python -m http.server 8000"
         return ""
@@ -1205,6 +1214,7 @@ class WorkspaceIntelligenceMixin:
         zoom_hits = []
         mobile_hits = []
         touch_hits = []
+        render_hits = []
 
         for path in files[:8]:
             rel = path.relative_to(self.current_workspace).as_posix()
@@ -1216,12 +1226,14 @@ class WorkspaceIntelligenceMixin:
             for number, line in matches:
                 lower = line.lower()
                 entry = f"{rel}:{number}: {line.strip()[:180]}"
-                if any(term in lower for term in ("zoom", "camerazoom", "scale", "fov")):
+                if any(term in lower for term in ("zoom", "camerazoom", "pinch")):
                     zoom_hits.append(entry)
                 if any(term in lower for term in ("mobile", "ismobile", "modo mobile")):
                     mobile_hits.append(entry)
                 if any(term in lower for term in ("pinch", "touchstart", "touchmove", "gesture", "wheel")):
                     touch_hits.append(entry)
+                if any(term in lower for term in ("scale", "fov")):
+                    render_hits.append(entry)
 
         if zoom_hits and (mobile_hits or touch_hits):
             verdict = "Sim, encontrei sinais de logica de zoom relacionada a mobile/toque."
@@ -1234,12 +1246,19 @@ class WorkspaceIntelligenceMixin:
 
         evidence = zoom_hits[:6] + mobile_hits[:4] + touch_hits[:4]
         evidence_text = "\n".join(f"- {item}" for item in evidence) if evidence else "- Sem linhas relevantes."
+        render_text = ""
+        if render_hits:
+            render_text = (
+                "\n\nObservacoes de renderizacao/camera que nao confirmam zoom mobile por si so:\n"
+                + "\n".join(f"- {item}" for item in render_hits[:4])
+            )
         return (
             f"{verdict}\n\n"
             "Arquivos verificados:\n"
             + "\n".join(summaries[:8])
             + "\n\nEvidencias:\n"
             + evidence_text
+            + render_text
         )
 
     def find_likely_search_targets(self, command, suffixes=None, limit=12):
@@ -1377,9 +1396,9 @@ class WorkspaceIntelligenceMixin:
         kind = self.detect_run_kind(workspace) or "generico"
 
         suffixes_by_intent = {
-            "corrigir": {".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".dart", ".json", ".cmd"},
-            "implementar": {".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".dart", ".json", ".md"},
-            "validar": {".py", ".js", ".ts", ".html", ".json", ".yaml", ".yml", ".cmd", ".md"},
+            "corrigir": {".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".dart", ".json", ".cmd", ".yaml", ".yml"},
+            "implementar": {".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".dart", ".json", ".md", ".yaml", ".yml"},
+            "validar": {".py", ".js", ".ts", ".html", ".json", ".yaml", ".yml", ".cmd", ".md", ".dart"},
             "analisar": {".py", ".js", ".ts", ".html", ".json", ".yaml", ".yml", ".md"},
             "configurar": {".py", ".json", ".env", ".cmd", ".md", ".yaml", ".yml"},
         }
@@ -1527,12 +1546,33 @@ class WorkspaceIntelligenceMixin:
         }
         return [token for token in text.split() if len(token) >= 3 and token not in stop_words]
 
+    def is_flet_workspace(self, workspace):
+        workspace = Path(workspace)
+        for relative in ("requirements.txt", "pyproject.toml"):
+            try:
+                text = (workspace / relative).read_text(encoding="utf-8", errors="replace").lower()
+            except OSError:
+                continue
+            if re.search(r"(^|\n)\s*flet(?:[<>=~! ]|$)", text) or " flet" in text:
+                return True
+        for relative in ("main.py", "app.py"):
+            try:
+                text = (workspace / relative).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if re.search(r"\b(import\s+flet|from\s+flet\s+import)\b", text):
+                return True
+        return False
+
     def detect_run_kind(self, workspace):
         workspace = Path(workspace)
         if (workspace / "pubspec.yaml").exists():
-            return "flutter"
+            pubspec = (workspace / "pubspec.yaml").read_text(encoding="utf-8", errors="replace").lower()
+            return "flutter" if "flutter:" in pubspec or "sdk: flutter" in pubspec else "dart"
         if (workspace / "package.json").exists():
             return "node"
+        if self.is_flet_workspace(workspace):
+            return "flet"
         if (workspace / "app.py").exists() or (workspace / "main.py").exists():
             return "python"
         if (workspace / "index.html").exists() or any(workspace.glob("*.html")):
@@ -1551,6 +1591,14 @@ class WorkspaceIntelligenceMixin:
                 score += 15
             if (workspace / "android").exists() or (workspace / "ios").exists():
                 score += 8
+        elif kind == "dart":
+            score += 58
+            if (workspace / "bin" / "main.dart").exists():
+                score += 25
+        elif kind == "flet":
+            score += 62
+            if (workspace / "main.py").exists():
+                score += 20
         elif kind == "node":
             score += 70
             if (workspace / "src").exists():
@@ -1655,12 +1703,17 @@ class WorkspaceIntelligenceMixin:
         rel_label = self.relative_workspace_label(workspace)
         kind = self.detect_run_kind(workspace)
         if (workspace / "pubspec.yaml").exists():
-            command = "flutter pub get && flutter run -d windows"
-            self.run_workspace_command(command, f"Executando app Flutter: {rel_label}", cwd=workspace)
-            return (
-                f"Execucao iniciada para `{rel_label}` como app Flutter pelo Terminal Local. "
-                "O `flutter run -d windows` ja faz o build antes de abrir o app."
-            )
+            if kind == "flutter":
+                has_platform = any((workspace / folder).exists() for folder in ("android", "ios", "windows", "macos", "linux", "web"))
+                command = "flutter pub get && flutter run -d windows" if has_platform else "flutter create . && flutter run -d windows"
+                self.run_workspace_command(command, f"Executando app Flutter: {rel_label}", cwd=workspace)
+                return (
+                    f"Execucao iniciada para `{rel_label}` como app Flutter pelo Terminal Local. "
+                    "O `flutter run -d windows` ja faz o build antes de abrir o app."
+                )
+            command = "dart pub get && dart run"
+            self.run_workspace_command(command, f"Executando app Dart: {rel_label}", cwd=workspace)
+            return f"Execucao iniciada para `{rel_label}` como projeto Dart pelo Terminal Local."
 
         app_py = workspace / "app.py"
         main_py = workspace / "main.py"
@@ -1815,7 +1868,10 @@ class WorkspaceIntelligenceMixin:
 
         notes = []
         if (workspace / "pubspec.yaml").exists():
-            notes.append("Parece ser um app Flutter/Dart.")
+            stack = "Flutter" if self.detect_run_kind(workspace) == "flutter" else "Dart"
+            notes.append(f"Parece ser um projeto {stack}.")
+        if self.is_flet_workspace(workspace):
+            notes.append("Parece ser um app Flet/Python.")
         if (workspace / "build").exists():
             notes.append("A pasta build existe, mas fica ignorada pela IDE para nao poluir o contexto.")
         if any(rel.as_posix().endswith(".bak") for _path, rel in files):
@@ -1997,9 +2053,11 @@ class WorkspaceIntelligenceMixin:
 
     def detect_project_type(self, workspace, suffix_counts):
         if (workspace / "pubspec.yaml").exists():
-            return "Flutter/Dart"
+            return "Flutter" if self.detect_run_kind(workspace) == "flutter" else "Dart"
         if (workspace / "package.json").exists():
             return "JavaScript/Node"
+        if self.is_flet_workspace(workspace):
+            return "Flet/Python"
         if (workspace / "pyproject.toml").exists() or (workspace / "requirements.txt").exists():
             return "Python"
         if suffix_counts.get(".py", 0) >= 2:

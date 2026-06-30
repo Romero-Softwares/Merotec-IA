@@ -1,5 +1,6 @@
 import base64
 import atexit
+import hashlib
 import importlib.util
 import json
 import mimetypes
@@ -827,7 +828,8 @@ Regras:
 - Explique o resultado em portugues direto, sem enrolar.
 - Quando executar algo, analise a saida e continue somente se necessario.
 - Quando o usuario pedir para construir, reconstruir, corrigir ou alterar, nao pergunte "qual o proximo passo"; execute a acao.
-- Quando receber contexto com "MISSAO ATIVA DA IA" ou "MISSAO ORIGINAL", trate essa missao como o objetivo principal ate concluir.
+- Quando receber contexto com "MISSAO ATIVA DA IA" ou "MISSAO ORIGINAL", trate essa missao como o objetivo principal ate concluir, exceto se a instrucao/pedido mais recente do usuario pedir algo diferente.
+- Se o usuario pedir algo diferente da missao anterior, obedeca ao pedido mais recente e nao continue ciclos antigos.
 - Quando receber "DIAGNOSTICO DE FALHA GERADO PELA IDE", siga a camada provavel, leia/altere os arquivos suspeitos e nao repita o mesmo comando antes de corrigir a causa indicada.
 - Em erros de build, identifique a camada antes de agir: Dart, Flutter dependencias, Android/Gradle, Windows CMake, C++ compile ou linker.
 - Se a falha for Windows CMake/C++/linker, nao altere `lib/main.dart` nem `pubspec.yaml` sem evidencia direta.
@@ -879,6 +881,8 @@ Quando precisar agir no projeto, emita uma unica acao real por vez usando uma de
 [WEB_SEARCH: consulta]
 
 Regras essenciais:
+- A mensagem mais recente do usuario tem prioridade sobre historico, conversa recente, MISSAO ORIGINAL e MISSAO ATIVA quando ela pedir algo diferente.
+- Continue uma missao anterior somente quando o pedido atual for claramente de continuidade, como "continue", "termine" ou "faca isso".
 - Use somente caminhos relativos ao workspace.
 - Nao invente resultado de leitura, edicao ou teste.
 - Se faltar conteudo de arquivo, use READ ou SEARCH_TEXT.
@@ -1124,10 +1128,12 @@ Regras essenciais:
             if size > 10 * 1024 * 1024:
                 return []
             mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            raw = path.read_bytes()
             return [{
                 "name": path.name,
                 "mime_type": mime_type,
-                "data_base64": base64.b64encode(path.read_bytes()).decode("ascii"),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "data_base64": base64.b64encode(raw).decode("ascii"),
             }]
         except OSError:
             return []
@@ -2112,6 +2118,8 @@ except Exception as exc:
             "Nunca chame terminal, ferramenta de shell ou app-server com comando `...`, `comando`, `como administrador`, `--admin` ou outro placeholder; se nao houver comando real, entregue uma conclusao final.\n"
             "Nunca diga que corrigiu, aplicou, alterou, rodou, testou ou validou sem uma acao real: "
             "[REPLACE]/[WRITE] para mudar arquivo, EXECUTE com comando real para rodar, EXECUTE_ADMIN com comando real para pedir permissao de administrador, [HUMAN_TEST] quando precisar testar visualmente como usuario, [OPEN_URL]/[SCREENSHOT] quando a tela ja estiver aberta.\n\n"
+            "PRIORIDADE DO PEDIDO ATUAL: se a instrucao do usuario/sistema pedir algo diferente da missao anterior, obedeca ao pedido mais recente. "
+            "Historico, MISSAO ORIGINAL e MISSAO ATIVA sao contexto, nao autorizacao para ignorar uma nova ordem do usuario.\n\n"
             f"{self._message_payload(prompt, code_context)}"
         )
 
@@ -3522,7 +3530,9 @@ def _merotec_locked_should_try_external_ai_fallback(self, response):
         "sem cota",
         "cota disponivel",
         "insufficient_quota",
-        "quota",
+        "quota exceeded",
+        "quota_exceeded",
+        "quota limit",
         "rate limit",
         "limite atingido",
         "modelo local gguf nao",
@@ -3673,8 +3683,11 @@ UniversalEngine._web_chat_conversation_instruction = _merotec_v6_chat_instructio
 
 def _merotec_v8_chat_instruction(self):
     return (
-        "PROTOCOLO ATIVO DA MEROTEC IA IDE V8 — esta instrução substitui formatos anteriores.\n"
+        "PROTOCOLO ATIVO DA MEROTEC IA IDE V9 / CHAT WEB AGENTE — esta instrução substitui formatos anteriores.\n"
+        "Você está operando dentro da Merotec IA IDE como agente de engenharia, não como chat comum.\n"
         "A missão continua até uma mudança aplicada e uma validação real, bloqueio externo explícito, cancelamento ou [FINAL] aceito.\n"
+        "A TAREFA ATUAL tem prioridade sobre historico e missoes anteriores. Se o usuario pediu algo diferente agora, pare o ciclo antigo e obedeca ao pedido atual.\n"
+        "Continue uma missao anterior somente quando o pedido atual for claramente de continuidade.\n"
         "Responda com EXATAMENTE UMA ação da IDE, sem texto antes ou depois.\n"
         "Ações curtas: [READ: caminho], [SEARCH_TEXT: padrão | caminho], [EXECUTE: comando de teste real], "
         "[HUMAN_TEST: auto], [OPEN_URL: url], [SCREENSHOT: tela], [FINAL: resumo].\n"
@@ -3690,6 +3703,9 @@ def _merotec_v8_chat_instruction(self):
         "[/WRITE]\n"
         "Antes de alterar um arquivo existente, use [READ: caminho] quando o conteúdo atual não estiver no contexto. "
         "Para Python, use quatro espaços por nível, nunca tab. Preserve todos os espaços dentro da cerca Markdown.\n"
+        "Quando houver print/imagem anexada, analise a evidência visual como parte obrigatória da tarefa. "
+        "Se a tela mostrar bug visual, sobreposição, tela em branco, duplicidade ou erro, responda com a próxima ação executável para corrigir ou validar. "
+        "Não peça outro print se o print atual já estiver visível.\n"
         "Nunca use EXECUTE para echo, Write-Host, printf, true, exit 0 ou para declarar conclusão. "
         "Use [FINAL: resumo] somente depois de uma alteração aplicada e validação real aprovada pela IDE.\n"
         "Se a IDE recusar uma edição, use o arquivo canônico devolvido e envie um novo [WRITE] completo; não repita a resposta inválida."
@@ -3698,3 +3714,60 @@ def _merotec_v8_chat_instruction(self):
 
 _merotec_chat_instruction = _merotec_v8_chat_instruction
 UniversalEngine._web_chat_conversation_instruction = _merotec_v8_chat_instruction
+
+
+# MEROTEC_INCREMENTAL_WEB_CHAT_CONTRACT_V10
+# The browser chat must behave like the in-app engineering agent: inspect the
+# current workspace, apply the smallest reliable mutation, then validate. Full
+# file WRITE is still supported, but it is no longer the default for existing
+# files because large rewrites made chat-based repair less capable than Codex.
+
+def _merotec_v10_chat_instruction(self):
+    return (
+        "PROTOCOLO ATIVO DA MEROTEC IA IDE V10 / CHAT WEB AGENTE - esta instrucao substitui formatos anteriores.\n"
+        "Voce esta operando dentro da Merotec IA IDE como agente de engenharia, nao como chat comum.\n"
+        "A missao continua ate uma mudanca aplicada e uma validacao real, bloqueio externo explicito, cancelamento ou [FINAL] aceito.\n"
+        "A TAREFA ATUAL tem prioridade sobre historico e missoes anteriores. Se o usuario pediu algo diferente agora, pare o ciclo antigo e obedeca ao pedido atual.\n"
+        "Continue uma missao anterior somente quando o pedido atual for claramente de continuidade.\n"
+        "Responda com EXATAMENTE UMA acao da IDE, sem texto antes ou depois.\n"
+        "Acoes curtas: [READ: caminho], [SEARCH_TEXT: padrao | caminho], [EXECUTE: comando de teste real], "
+        "[HUMAN_TEST: auto], [OPEN_URL: url], [SCREENSHOT: tela], [FINAL: resumo].\n"
+        "Exemplos canonicos: [READ: main.py], [SEARCH_TEXT: def main | main.py], [EXECUTE: python -m unittest]. "
+        "Nao use [READ] arquivo; use sempre [READ: arquivo]. Compatibilidade: Não use [READ] arquivo.\n"
+        "Fluxo de engenharia obrigatorio: entenda a tarefa atual, leia ou busque apenas o contexto necessario, aplique uma edicao pequena, "
+        "rode um teste real e corrija novamente se a IDE devolver erro. Nao peca o objetivo de novo enquanto houver missao ativa.\n"
+        "Para alterar arquivo existente, prefira REPLACE pequeno com trecho OLD exato copiado do arquivo atual. Use WRITE completo apenas para arquivo novo "
+        "ou quando uma reescrita inteira for realmente necessaria. PATCH tambem e aceito quando for o formato mais seguro para varias mudancas pequenas.\n"
+        "Formato de edicao local preferencial:\n"
+        "[REPLACE: caminho/arquivo.ext]\n"
+        "[OLD]\n"
+        "```linguagem\n"
+        "trecho EXATO do arquivo atual\n"
+        "```\n"
+        "[/OLD]\n"
+        "[NEW]\n"
+        "```linguagem\n"
+        "trecho novo completo para o mesmo local\n"
+        "```\n"
+        "[/NEW]\n"
+        "[/REPLACE]\n"
+        "Formato para criar arquivo ou reescrever de proposito:\n"
+        "[WRITE: caminho/arquivo.ext]\n"
+        "```linguagem\n"
+        "conteudo COMPLETO, valido e sem reticencias\n"
+        "```\n"
+        "[/WRITE]\n"
+        "Antes de alterar um arquivo existente, use [READ: caminho] ou [SEARCH_TEXT: padrao | caminho] quando o conteudo atual nao estiver no contexto. "
+        "Para arquivo grande, use [READ: caminho | linhas inicio-fim] ou SEARCH_TEXT e edite somente o intervalo necessario. "
+        "Para Python, use quatro espacos por nivel, nunca tab. Preserve todos os espacos dentro da cerca Markdown.\n"
+        "Quando houver print/imagem anexada, analise a evidencia visual como parte obrigatoria da tarefa. "
+        "Se a tela mostrar bug visual, sobreposicao, tela em branco, duplicidade ou erro, responda com a proxima acao executavel para corrigir ou validar. "
+        "Nao peca outro print se o print atual ja estiver visivel.\n"
+        "Nunca use EXECUTE para echo, Write-Host, printf, true, exit 0 ou para declarar conclusao. "
+        "Use [FINAL: resumo] somente depois de uma alteracao aplicada e validacao real aprovada pela IDE.\n"
+        "Se a IDE recusar uma edicao, use o arquivo canonico devolvido e envie uma nova edicao compativel; nao repita a resposta invalida."
+    )
+
+
+_merotec_chat_instruction = _merotec_v10_chat_instruction
+UniversalEngine._web_chat_conversation_instruction = _merotec_v10_chat_instruction

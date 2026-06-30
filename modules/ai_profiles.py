@@ -69,7 +69,7 @@ PROFILE_DEFAULTS = {
     "codex": {
         "codex_model_name": "",
         "codex_reasoning_effort": "high",
-        "browser_ai_fallback_enabled": True,
+        "browser_ai_fallback_enabled": False,
         "browser_ai_fallback_url": "https://chatgpt.com/",
         "browser_ai_fallback_timeout_seconds": 300,
         "browser_ai_fallback_max_context_chars": 60000,
@@ -267,6 +267,36 @@ def _same_web_chat_origin(left: object, right: object) -> bool:
     return bool(first and second and first == second)
 
 
+def is_restorable_web_chat_url(url: object, entry_url: object = "") -> bool:
+    """Aceita apenas URLs de conversa plausiveis para restaurar automaticamente."""
+    try:
+        normalized = normalize_web_url(url)
+    except ValueError:
+        return False
+    if len(normalized) > 2048:
+        return False
+    if entry_url and not _same_web_chat_origin(normalized, entry_url):
+        return False
+
+    parsed = urlparse(normalized)
+    path = parsed.path or "/"
+    query = parsed.query or ""
+    if len(query) > 512:
+        return False
+    lower_path = path.lower()
+    blocked_prefixes = (
+        "/api/",
+        "/backend-api/",
+        "/auth/",
+        "/cdn-cgi/",
+        "/_next/",
+        "/public-api/",
+    )
+    if lower_path.startswith(blocked_prefixes):
+        return False
+    return True
+
+
 def get_web_chat_session(
     settings: dict,
     workspace: str | Path,
@@ -316,6 +346,8 @@ def remember_web_chat_session(
         normalized_url = normalize_web_url(url)
         normalized_entry = normalize_web_url(entry_url or normalized_url)
     except ValueError:
+        return settings
+    if not is_restorable_web_chat_url(normalized_url, normalized_entry):
         return settings
     selected = normalize_provider(provider, "web_chat")
     key = workspace_session_key(workspace, selected, normalized_entry)
@@ -371,6 +403,10 @@ def web_chat_url_for_workspace(
     profile = profile_for(settings, provider)
     entry_url = normalize_web_url(profile.get("web_chat_url"), "https://chatgpt.com/")
     saved = get_web_chat_session(settings, workspace, provider, entry_url=entry_url)
-    if saved.get("url") and _same_web_chat_origin(saved.get("url"), entry_url):
+    if (
+        saved.get("url")
+        and _same_web_chat_origin(saved.get("url"), entry_url)
+        and is_restorable_web_chat_url(saved.get("url"), entry_url)
+    ):
         return str(saved["url"])
     return entry_url

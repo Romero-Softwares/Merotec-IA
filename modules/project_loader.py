@@ -4,6 +4,27 @@ from modules.app_constants import DEFAULT_WORKSPACE
 
 class ProjectLoader:
     @staticmethod
+    def detect_project_type(project):
+        if (project / "pubspec.yaml").exists():
+            try:
+                pubspec = (project / "pubspec.yaml").read_text(encoding="utf-8", errors="replace").lower()
+            except OSError:
+                pubspec = ""
+            return "flutter" if "flutter:" in pubspec or "sdk: flutter" in pubspec else "dart"
+        if (project / "requirements.txt").exists():
+            try:
+                requirements = (project / "requirements.txt").read_text(encoding="utf-8", errors="replace").lower()
+            except OSError:
+                requirements = ""
+            if "flet" in requirements:
+                return "flet"
+        if (project / "main.py").exists() or (project / "app.py").exists():
+            return "python"
+        if (project / "package.json").exists():
+            return "node"
+        return "web"
+
+    @staticmethod
     def preload_projects():
         """Preload project metadata in background."""
         projects_dir = DEFAULT_WORKSPACE
@@ -14,7 +35,7 @@ class ProjectLoader:
                     metadata = {
                         'name': project.name,
                         'path': str(project),
-                        'type': 'python' if (project/'main.py').exists() else 'web'
+                        'type': ProjectLoader.detect_project_type(project)
                     }
                     ProjectCache.add(project.name, metadata)
 

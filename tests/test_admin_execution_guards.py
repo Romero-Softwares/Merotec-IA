@@ -52,8 +52,17 @@ class DummyApp(AgentActionsMixin, WorkspaceIntelligenceMixin):
     def log_agent(self, message):
         self.logs.append(message)
 
+    def record_file_change_snapshot(self, path, action, summary):
+        self.logs.append(f"{action}: {Path(path).name}: {summary}")
+
+    def load_workspace_files(self):
+        self.workspace_reloaded = True
+
     def set_status(self, message, kind=None):
         self.status = (message, kind)
+
+    def set_ai_activity(self, message):
+        self.ai_activity = message
 
     def _agent_execute(self, command, **kwargs):
         self.executed_commands.append(("EXECUTE", command))
@@ -309,6 +318,233 @@ class AdminExecutionGuardsTest(unittest.TestCase):
         self.assertEqual([("EXECUTE", "python app.py")], self.app.executed_commands)
         self.assertEqual([], self.app.queued_ai_tasks)
 
+    def test_missing_python_dependency_is_converted_to_pip_install(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.app.current_workspace = tmp
+            output = "ModuleNotFoundError: No module named 'customtkinter'"
+
+            handled = self.app.maybe_install_missing_python_dependency(
+                "python main.py",
+                output,
+                task_objective="abrir a IDE",
+                task_id="missing-lib",
+            )
+
+            self.assertTrue(handled)
+            self.assertEqual(1, len(self.app.executed_commands))
+            action, command = self.app.executed_commands[0]
+            self.assertEqual("EXECUTE", action)
+            self.assertIn("-m pip install customtkinter", command)
+            self.assertTrue(any("Biblioteca Python ausente" in message for _sender, message in self.app.messages))
+
+    def test_missing_python_dependency_from_non_python_command_is_ignored(self):
+        handled = self.app.maybe_install_missing_python_dependency(
+            "npm test",
+            "ModuleNotFoundError: No module named 'customtkinter'",
+            task_id="missing-lib-from-node",
+        )
+
+        self.assertFalse(handled)
+        self.assertEqual([], self.app.executed_commands)
+
+    def test_missing_python_dependency_accepts_venv_python_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            self.app.current_workspace = str(workspace)
+            command = str(workspace / "venv" / "Scripts" / "python.exe") + " main.py"
+
+            handled = self.app.maybe_install_missing_python_dependency(
+                command,
+                "ModuleNotFoundError: No module named 'customtkinter'",
+                task_id="missing-lib-from-venv",
+            )
+
+            self.assertTrue(handled)
+            self.assertEqual(1, len(self.app.executed_commands))
+            self.assertIn("-m pip install customtkinter", self.app.executed_commands[0][1])
+
+    def test_missing_python_dependency_install_is_not_repeated_forever(self):
+        output = "ImportError: No module named 'PIL'"
+
+        first = self.app.maybe_install_missing_python_dependency(
+            "python app.py",
+            output,
+            task_id="missing-pillow",
+        )
+        second = self.app.maybe_install_missing_python_dependency(
+            "python app.py",
+            output,
+            task_id="missing-pillow",
+        )
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertEqual(1, len(self.app.executed_commands))
+        self.assertIn("-m pip install Pillow", self.app.executed_commands[0][1])
+
+    def test_missing_pytest_redirects_to_unittest_when_suite_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            tests_dir = workspace / "tests"
+            tests_dir.mkdir()
+            (tests_dir / "test_sample.py").write_text(
+                "import unittest\n\nclass SampleTest(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            self.app.current_workspace = str(workspace)
+
+            handled = self.app.maybe_install_missing_python_dependency(
+                "python -m pytest -q",
+                "No module named pytest",
+                task_id="missing-pytest",
+            )
+
+            self.assertTrue(handled)
+            self.assertEqual(1, len(self.app.executed_commands))
+            action, command = self.app.executed_commands[0]
+            self.assertEqual("EXECUTE", action)
+            self.assertIn("-m unittest discover -s tests -q", command)
+            self.assertNotIn("pip install pytest", command)
+            self.assertTrue(any("redirecionou a validacao para unittest" in message for _sender, message in self.app.messages))
+
+    def test_risky_full_write_to_large_existing_file_is_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.app.current_workspace = tmp
+            path = Path(tmp) / "main.py"
+            original = "\n".join(
+                f"value_{index} = {index}  # linha suficientemente longa para simular main.py grande"
+                for index in range(650)
+            ) + "\n"
+            path.write_text(original, encoding="utf-8")
+
+            self.app.parse_and_execute_agent_actions(
+                "[WRITE: main.py]\n```python\nprint('nova versao curta')\n```\n[/WRITE]",
+                task_objective="corrija main.py preservando o sistema",
+                action_depth=1,
+                task_id="risky-write",
+            )
+
+            self.assertEqual(original, path.read_text(encoding="utf-8"))
+            self.assertTrue(any("WRITE completo recusado" in message for _sender, message in self.app.messages))
+            self.assertEqual(1, len(self.app.queued_ai_tasks))
+            _command, kwargs = self.app.queued_ai_tasks[0]
+            self.assertIn("RiskyFullRewrite", kwargs["extra_context"])
+            self.assertIn("[REPLACE] pequeno", kwargs["extra_context"])
+
+    def test_risky_broad_replace_to_large_existing_file_is_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.app.current_workspace = tmp
+            path = Path(tmp) / "main.py"
+            lines = [f"value_{index} = {index}" for index in range(650)]
+            original = "\n".join(lines) + "\n"
+            path.write_text(original, encoding="utf-8")
+            old = "\n".join(lines[:260])
+            new = "\n".join(f"changed_{index} = {index}" for index in range(260))
+
+            self.app.parse_and_execute_agent_actions(
+                f"[REPLACE: main.py]\n[OLD]\n```python\n{old}\n```\n[/OLD]\n[NEW]\n```python\n{new}\n```\n[/NEW]\n[/REPLACE]",
+                task_objective="altere apenas o trecho necessario de main.py",
+                action_depth=1,
+                task_id="risky-replace",
+            )
+
+            self.assertEqual(original, path.read_text(encoding="utf-8"))
+            self.assertTrue(any("REPLACE amplo recusado" in message for _sender, message in self.app.messages))
+            self.assertEqual(1, len(self.app.queued_ai_tasks))
+            _command, kwargs = self.app.queued_ai_tasks[0]
+            self.assertIn("RiskyBroadReplace", kwargs["extra_context"])
+            self.assertIn("[REPLACE] pequeno", kwargs["extra_context"])
+
+    def test_incomplete_replace_requeues_agent_instead_of_stopping_at_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.app.current_workspace = tmp
+            path = Path(tmp) / "main.py"
+            original = "print('ok')\n"
+            path.write_text(original, encoding="utf-8")
+
+            self.app.parse_and_execute_agent_actions(
+                "[REPLACE: main.py] [OLD]print('ok')[/OLD] [NEW]print('novo')",
+                task_objective="corrigir main.py por trecho",
+                action_depth=1,
+                task_id="malformed-replace",
+            )
+
+            self.assertEqual(original, path.read_text(encoding="utf-8"))
+            self.assertTrue(any("REPLACE incompleto" in message for _sender, message in self.app.messages))
+            self.assertEqual(1, len(self.app.queued_ai_tasks))
+            _command, kwargs = self.app.queued_ai_tasks[0]
+            self.assertIn("main.py", kwargs["extra_context"])
+            self.assertIn("[REPLACE: caminho]", kwargs["extra_context"])
+            self.assertIn("[/REPLACE] completo", kwargs["extra_context"])
+
+    def test_invalid_python_write_indentation_is_blocked_and_requeued(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.app.current_workspace = tmp
+            path = Path(tmp) / "app.py"
+            original = "def main():\n    return 1\n"
+            path.write_text(original, encoding="utf-8")
+
+            self.app.parse_and_execute_agent_actions(
+                "[WRITE: app.py]\n```python\ndef main():\nreturn 2\n```\n[/WRITE]",
+                task_objective="corrigir app.py sem quebrar indentacao",
+                action_depth=1,
+                task_id="invalid-write-indent",
+            )
+
+            self.assertEqual(original, path.read_text(encoding="utf-8"))
+            self.assertTrue(any("IndentationError" in message for _sender, message in self.app.messages))
+            self.assertEqual(1, len(self.app.queued_ai_tasks))
+            _command, kwargs = self.app.queued_ai_tasks[0]
+            self.assertIn("IndentationError", kwargs["extra_context"])
+            self.assertIn("4 espacos", kwargs["extra_context"])
+            self.assertIn("nunca use tabs", kwargs["extra_context"])
+
+    def test_indented_markdown_write_fence_preserves_python_indentation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.app.current_workspace = tmp
+            path = Path(tmp) / "app.py"
+            path.write_text("def main():\n    return 1\n", encoding="utf-8")
+
+            self.app.parse_and_execute_agent_actions(
+                "[WRITE: app.py]\n"
+                "    ```python\n"
+                "    def main():\n"
+                "        return 2\n"
+                "    ```\n"
+                "[/WRITE]",
+                task_objective="corrigir app.py sem quebrar indentacao",
+                action_depth=1,
+                task_id="indented-write-fence",
+            )
+
+            self.assertEqual("def main():\n    return 2\n", path.read_text(encoding="utf-8"))
+            self.assertFalse(any("IndentationError" in message for _sender, message in self.app.messages))
+
+    def test_invalid_python_replace_indentation_is_blocked_and_requeued(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.app.current_workspace = tmp
+            path = Path(tmp) / "app.py"
+            original = "def main():\n    return 1\n"
+            path.write_text(original, encoding="utf-8")
+
+            self.app.parse_and_execute_agent_actions(
+                "[REPLACE: app.py]\n"
+                "[OLD]\n```python\n    return 1\n```\n[/OLD]\n"
+                "[NEW]\n```python\n\treturn 2\n```\n[/NEW]\n"
+                "[/REPLACE]",
+                task_objective="corrigir app.py preservando indentacao",
+                action_depth=1,
+                task_id="invalid-replace-indent",
+            )
+
+            self.assertEqual(original, path.read_text(encoding="utf-8"))
+            self.assertTrue(any("TabIndentationRejected" in message for _sender, message in self.app.messages))
+            self.assertEqual(1, len(self.app.queued_ai_tasks))
+            _command, kwargs = self.app.queued_ai_tasks[0]
+            self.assertIn("TabIndentationRejected", kwargs["extra_context"])
+            self.assertIn("4 espacos", kwargs["extra_context"])
+            self.assertIn("nunca use tabs", kwargs["extra_context"])
+
     def test_adjacent_human_test_tags_execute_visual_validation_once(self):
         self.app.parse_and_execute_agent_actions(
             "[HUMAN_TEST: auto][HUMAN_TEST: auto]",
@@ -460,6 +696,13 @@ class AdminExecutionGuardsTest(unittest.TestCase):
             [("EXECUTE_ADMIN", "net stop spooler")],
             self.app.executed_commands,
         )
+
+    def test_mark_ai_active_action_updates_visible_phase(self):
+        self.app.mark_ai_active_action("replace", task_id="phase")
+
+        self.assertEqual("IA alterando arquivos", self.app.ai_activity)
+        self.assertEqual(1, self.app.ai_task_metrics["phase"]["real_actions"])
+        self.assertEqual(1, self.app.ai_task_metrics["phase"]["replace_actions"])
 
     def test_human_test_plan_finds_nested_html_target(self):
         temp_root = os.environ.get("MEROTEC_TEST_TMP")
@@ -689,6 +932,31 @@ class AdminExecutionGuardsTest(unittest.TestCase):
 
         self.assertTrue(approved)
         self.assertTrue(any("autoaprovada" in message.lower() for message in app.logs))
+
+    def test_verification_objective_wrapped_by_protocol_does_not_require_edit(self):
+        objective = (
+            "Instrucao do usuario/sistema: agora verifique isso no projeto da propria IDE\n\n"
+            "Continue essa missao de forma autonoma. Diagnostique, implemente, valide e corrija ate resolver."
+        )
+
+        self.assertFalse(self.app.objective_requires_concrete_change(objective))
+
+    def test_final_is_accepted_after_verification_only_objective(self):
+        objective = (
+            "Instrucao do usuario/sistema: agora verifique isso no projeto da propria IDE\n\n"
+            "Continue essa missao de forma autonoma. Diagnostique, implemente, valide e corrija ate resolver."
+        )
+        metrics = self.app.get_ai_task_metrics(42)
+        metrics["execute_actions"] = 1
+
+        self.app.parse_and_execute_agent_actions(
+            "[FINAL: Verifiquei o projeto da propria IDE e a validacao passou.]",
+            task_objective=objective,
+            task_id=42,
+        )
+
+        self.assertTrue(metrics.get("mission_finalized"))
+        self.assertFalse(any("FINAL recusado" in message for _sender, message in self.app.messages))
 
     def test_codex_app_server_extracts_common_command_shapes(self):
         app = DummyCodexApprovalApp()

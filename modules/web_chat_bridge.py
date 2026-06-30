@@ -196,8 +196,13 @@ class WebChatBridge:
         if session_key == self.current_session_key:
             return self.current_url or entry_url
 
+        restore_session = bool(self.profile.get("web_chat_restore_project_session", True))
         settings = self._settings()
-        saved = get_web_chat_session(settings, workspace, "web_chat", entry_url=entry_url)
+        saved = (
+            get_web_chat_session(settings, workspace, "web_chat", entry_url=entry_url)
+            if restore_session
+            else {}
+        )
         target_url = str(saved.get("url") or entry_url)
         result = self.request(
             "navigate",
@@ -205,7 +210,7 @@ class WebChatBridge:
                 "url": target_url,
                 "session_key": session_key,
                 "entry_url": entry_url,
-                "restore_session": bool(saved.get("url")),
+                "restore_session": bool(restore_session and saved.get("url")),
                 # Nunca solicita que o site clique em “nova conversa”.
                 "new_conversation": False,
             },

@@ -113,6 +113,40 @@ class AiQuotaStatusTest(unittest.TestCase):
         self.assertIn("Cota atual:", app.ai_status_label.text)
         self.assertIn("janela 17%", app.ai_status_label.text)
 
+    def test_ai_sidebar_status_includes_fallback_policy(self):
+        engine = bare_engine()
+        engine.external_ai_fallback_enabled = True
+        engine.configured_external_ai_fallback_providers = lambda: ["web_chat", "openai"]
+
+        class DummyApp(AiConfigMixin):
+            def __init__(self, engine):
+                self.engine = engine
+
+        text = DummyApp(engine).ai_status_text()
+
+        self.assertIn("Fallback externo: WEB_CHAT, OPENAI", text)
+        self.assertIn("Fallback local: RAG offline extrativo", text)
+        self.assertIn("limitado ao corpus da sub-rede", text)
+
+    def test_local_provider_status_reports_external_fallback_disabled(self):
+        engine = bare_engine()
+        engine.provider = "local_gguf"
+        engine.model_id = "modelo.gguf"
+        engine.local_gguf_allow_external_fallback = False
+        engine.external_ai_fallback_enabled = True
+        engine.configured_external_ai_fallback_providers = lambda: ["codex"]
+        engine.status_text = lambda: "LOCAL_GGUF | modelo.gguf | modelo pronto"
+        engine.quota_status_text = lambda: ""
+
+        class DummyApp(AiConfigMixin):
+            def __init__(self, engine):
+                self.engine = engine
+
+        text = DummyApp(engine).ai_status_text()
+
+        self.assertIn("Fallback externo: desligado", text)
+        self.assertIn("Fallback local: RAG offline extrativo", text)
+
     def test_codex_progress_timeout_is_recoverable(self):
         engine = bare_engine()
 

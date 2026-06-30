@@ -11,6 +11,7 @@ env/
 .env
 .env.*
 ide_settings.json
+PyPI-Recovery-Codes-*.txt
 
 # Historico/local da IDE
 history.json
@@ -23,6 +24,7 @@ change_history.json
 .merotec_attachments/
 .merotec_backups/
 .merotec_local_ai/
+.merotec_patch_backups/
 .merotec_system_ai/
 codex_schema_probe/
 

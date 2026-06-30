@@ -7,7 +7,7 @@ from tkinter import StringVar, filedialog
 
 import customtkinter as ctk
 
-from modules.app_constants import DEFAULT_APP_SETTINGS, IGNORED_DIRS, IGNORED_SUFFIXES, PROJECT_ROOT
+from modules.app_constants import DEFAULT_APP_SETTINGS, IGNORED_SUFFIXES, PROJECT_ROOT, is_ignored_dir_name
 from modules.ai_profiles import (
     PROVIDER_LABELS,
     PROVIDER_ORDER,
@@ -22,6 +22,7 @@ from modules.ai_profiles import (
 )
 from modules.engine import UniversalEngine
 from modules.ui_theme import THEME
+from modules.voice import DEFAULT_EDGE_VOICE_ID, TTS_ENGINE_EDGE, list_tts_voices
 
 
 # MEROTEC_CONFIG_CONTRAST_V2
@@ -45,9 +46,39 @@ class AiConfigMixin:
     def ai_status_text(self):
         status = self.engine.status_text()
         quota = self.engine.quota_status_text()
+        fallback = self.ai_fallback_status_text()
+        if fallback:
+            status = f"{status}\n{fallback}"
         if not quota or quota == status:
             return status
         return f"{status}\nCota atual: {quota}"
+
+    def ai_fallback_status_text(self):
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return ""
+        local_status = "Fallback local: RAG offline extrativo, limitado ao corpus da sub-rede"
+        provider = str(getattr(engine, "provider", "") or "").strip().lower()
+        if provider in {"local_gguf", "lm_studio"}:
+            local_enabled = bool(
+                getattr(engine, f"{provider}_allow_external_fallback", False)
+            )
+            if not local_enabled:
+                return f"Fallback externo: desligado\n{local_status}"
+
+        enabled = bool(getattr(engine, "external_ai_fallback_enabled", False))
+        providers_fn = getattr(engine, "configured_external_ai_fallback_providers", None)
+        providers = []
+        if enabled and callable(providers_fn):
+            try:
+                providers = providers_fn()
+            except Exception:
+                providers = []
+
+        if not enabled or not providers:
+            return f"Fallback externo: indisponivel\n{local_status}"
+        external_status = "Fallback externo: " + ", ".join(str(item).upper() for item in providers)
+        return f"{external_status}\n{local_status}"
 
     def refresh_ai_status(self):
         if hasattr(self, "ai_status_label"):
@@ -302,14 +333,14 @@ class AiConfigMixin:
         dialog.grab_set()
         dialog.configure(fg_color=CONFIG_UI["bg"])
         dialog.grid_columnconfigure(0, weight=1)
-        dialog.grid_rowconfigure(2, weight=1)
+        dialog.grid_rowconfigure(3, weight=1)
 
         ctk.CTkLabel(
             dialog,
             text="Configurações",
             text_color=CONFIG_UI["text"],
             font=("Segoe UI", 18, "bold"),
-        ).grid(row=0, column=0, sticky="w", padx=20, pady=(20, 2))
+        ).grid(row=0, column=0, sticky="w", padx=20, pady=(14, 2))
 
         description = ctk.CTkLabel(
             dialog,
@@ -322,7 +353,7 @@ class AiConfigMixin:
             wraplength=650,
             justify="left",
         )
-        description.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 10))
+        description.grid(row=1, column=0, sticky="ew", padx=20, pady=(0, 8))
 
         selected_label = StringVar(value=provider_label(selected))
         selector = ctk.CTkOptionMenu(
@@ -338,7 +369,7 @@ class AiConfigMixin:
             dropdown_text_color=CONFIG_UI["text"],
             height=38,
         )
-        selector.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 10))
+        selector.grid(row=2, column=0, sticky="ew", padx=20, pady=(0, 8))
 
         body = ctk.CTkScrollableFrame(
             dialog,
@@ -347,7 +378,7 @@ class AiConfigMixin:
             border_width=1,
             corner_radius=10,
         )
-        body.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 10))
+        body.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 8))
         body.grid_columnconfigure(1, weight=1)
         current = {"provider": selected, "widgets": {}, "types": {}}
         system_options = {}
@@ -441,6 +472,49 @@ class AiConfigMixin:
             else:
                 voice_switch.deselect()
             voice_switch.grid(row=1, column=1, sticky="w", padx=4, pady=(6, 10))
+            tts_voices = list_tts_voices()
+            default_label = "Microsoft Antonio Neural - Portugues Brasil (EDGE)"
+            voice_label_to_config = {
+                default_label: {
+                    "id": DEFAULT_EDGE_VOICE_ID,
+                    "engine": TTS_ENGINE_EDGE,
+                }
+            }
+            for voice in tts_voices:
+                label = str(voice.get("label") or voice.get("name") or voice.get("id"))
+                voice_label_to_config[label] = {
+                    "id": str(voice.get("id") or DEFAULT_EDGE_VOICE_ID),
+                    "engine": str(voice.get("engine") or TTS_ENGINE_EDGE),
+                }
+            current_voice_id = str(self.settings.get("tts_voice_id") or DEFAULT_APP_SETTINGS["tts_voice_id"])
+            selected_voice_label = default_label
+            for label, config in voice_label_to_config.items():
+                if config["id"] == current_voice_id:
+                    selected_voice_label = label
+                    break
+            ctk.CTkLabel(
+                system_frame,
+                text="Voz da leitura",
+                text_color=CONFIG_UI["label"],
+                font=("Segoe UI", 12),
+                wraplength=240,
+                justify="left",
+            ).grid(row=2, column=0, sticky="w", padx=(12, 10), pady=(4, 10))
+            voice_choice = StringVar(value=selected_voice_label)
+            voice_menu = ctk.CTkOptionMenu(
+                system_frame,
+                variable=voice_choice,
+                values=list(voice_label_to_config.keys()),
+                fg_color=CONFIG_UI["field"],
+                button_color=CONFIG_UI["accent"],
+                button_hover_color=CONFIG_UI["accent_hover"],
+                text_color=CONFIG_UI["text"],
+                dropdown_fg_color=CONFIG_UI["surface"],
+                dropdown_hover_color=CONFIG_UI["field_hover"],
+                dropdown_text_color=CONFIG_UI["text"],
+                height=34,
+            )
+            voice_menu.grid(row=2, column=1, sticky="ew", padx=4, pady=(4, 10))
             ctk.CTkLabel(
                 system_frame,
                 text=(
@@ -451,8 +525,10 @@ class AiConfigMixin:
                 font=("Segoe UI", 11),
                 wraplength=600,
                 justify="left",
-            ).grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
+            ).grid(row=3, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
             system_options["voice_keyword_listener_enabled"] = voice_switch
+            system_options["tts_voice_choice"] = voice_choice
+            system_options["tts_voice_configs"] = voice_label_to_config
 
             row = 2
             for key, label, kind in self._ai_profile_fields(provider):
@@ -534,7 +610,7 @@ class AiConfigMixin:
         render(selected)
 
         buttons = ctk.CTkFrame(dialog, fg_color="transparent")
-        buttons.grid(row=4, column=0, sticky="e", padx=18, pady=(2, 18))
+        buttons.grid(row=4, column=0, sticky="e", padx=18, pady=(0, 12))
 
         def normalize_values(provider, values, *, validate_active=False):
             """Normaliza perfis sem deixar configuração inativa bloquear o salvamento.
@@ -581,6 +657,10 @@ class AiConfigMixin:
                 self.settings["voice_keyword_listener_enabled"] = bool(
                     system_options["voice_keyword_listener_enabled"].get()
                 )
+                selected_voice = system_options["tts_voice_choice"].get()
+                selected_voice_config = system_options["tts_voice_configs"].get(selected_voice, {})
+                self.settings["tts_engine"] = selected_voice_config.get("engine", TTS_ENGINE_EDGE)
+                self.settings["tts_voice_id"] = selected_voice_config.get("id", DEFAULT_EDGE_VOICE_ID)
                 for provider in PROVIDER_ORDER:
                     update_profile(
                         self.settings,
@@ -902,7 +982,7 @@ class AiConfigMixin:
         workspace = Path(self.current_workspace)
         count = 0
         for root, dirs, files in os.walk(workspace):
-            dirs[:] = [d for d in sorted(dirs) if d not in IGNORED_DIRS and not d.startswith(".")]
+            dirs[:] = [d for d in sorted(dirs) if not is_ignored_dir_name(d) and not d.startswith(".")]
             root_path = Path(root)
             for filename in sorted(files):
                 path = root_path / filename

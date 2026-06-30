@@ -431,6 +431,18 @@ class EngineConfigTest(unittest.TestCase):
         self.assertEqual(["openai"], calls)
         self.assertEqual("Resposta direta e suficiente.", response)
 
+    def test_valid_answer_that_mentions_quota_does_not_trigger_fallback(self):
+        engine = UniversalEngine.__new__(UniversalEngine)
+        engine.provider = "openai"
+        engine.external_ai_fallback_enabled = True
+
+        response = (
+            "A quota mensal do plano pode ser modelada como uma regra de negocio "
+            "e exibida no painel financeiro."
+        )
+
+        self.assertFalse(engine.should_try_external_ai_fallback(response))
+
 
 if __name__ == "__main__":
     unittest.main()

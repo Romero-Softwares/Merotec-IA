@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 APP_NAME = "Merotec IA IDE"
@@ -67,6 +68,8 @@ DEFAULT_APP_SETTINGS = {
     "web_chat_auto_apply_imported_actions": True,
     "web_chat_fallback_enabled": False,
     "voice_keyword_listener_enabled": False,
+    "tts_engine": "edge",
+    "tts_voice_id": "pt-BR-AntonioNeural",
 }
 
 SCRATCHPAD_DEFAULT_TEXT = """# Como configurar um modelo de IA nesta IDE
@@ -130,6 +133,14 @@ IGNORED_DIRS = {
     "tcl_runtime",
     "venv",
 }
+
+
+def is_ignored_dir_name(name):
+    normalized = str(name or "").strip()
+    lower = normalized.lower()
+    if lower in IGNORED_DIRS or lower.startswith(".merotec_"):
+        return True
+    return bool(re.fullmatch(r"tmp[a-z0-9_]{6,}", lower))
 
 IGNORED_SUFFIXES = {
     ".bin",

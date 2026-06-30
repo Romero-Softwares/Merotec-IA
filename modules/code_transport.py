@@ -1,4 +1,4 @@
-"""Transporte seguro de código e validação sintática inicial."""
+"""Transporte seguro de codigo e validacao sintatica inicial."""
 
 from __future__ import annotations
 
@@ -8,12 +8,27 @@ import re
 from pathlib import Path
 
 SOURCE_SUFFIXES = {
-    ".py", ".json", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx",
-    ".dart", ".html", ".htm", ".css", ".ps1", ".sh",
+    ".py",
+    ".pyw",
+    ".json",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".dart",
+    ".html",
+    ".htm",
+    ".css",
+    ".scss",
+    ".ps1",
+    ".sh",
 }
 
 LANGUAGE_BY_SUFFIX = {
     ".py": "python",
+    ".pyw": "python",
     ".json": "json",
     ".js": "javascript",
     ".mjs": "javascript",
@@ -25,9 +40,12 @@ LANGUAGE_BY_SUFFIX = {
     ".html": "html",
     ".htm": "html",
     ".css": "css",
+    ".scss": "css",
     ".ps1": "powershell",
     ".sh": "shell",
 }
+
+VOID_HTML_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 
 
 def source_language(path):
@@ -35,7 +53,7 @@ def source_language(path):
 
 
 def unwrap_transport_code(content):
-    """Remove somente as cercas externas, preservando cada espaço do código."""
+    """Remove somente as cercas externas, preservando cada espaco do codigo."""
     text = str(content or "").replace("\r\n", "\n").replace("\r", "\n")
     text = text.strip("\n")
     lines = text.split("\n")
@@ -89,7 +107,7 @@ def _balanced_delimiters(path, language, text):
                     path,
                     language,
                     "DelimiterError",
-                    f"Delimitador incompatível: {opened} aberto na linha {opened_line}.",
+                    f"Delimitador incompativel: {opened} aberto na linha {opened_line}.",
                     line,
                 )
 
@@ -102,7 +120,7 @@ def _balanced_delimiters(path, language, text):
 
 
 def validate_source_text(path, content):
-    """Retorna None quando o texto pode ser gravado; caso contrário um diagnóstico."""
+    """Retorna None quando o texto pode ser gravado; caso contrario um diagnostico."""
     path = Path(path)
     language = source_language(path)
     text = str(content or "")
@@ -118,7 +136,7 @@ def validate_source_text(path, content):
                     path,
                     language,
                     "TabIndentationRejected",
-                    "Tabs não são permitidos em código Python. Use quatro espaços por nível.",
+                    "Tabs nao sao permitidos em codigo Python. Use quatro espacos por nivel.",
                     number,
                     f"{number:>4}: {line}",
                 )
@@ -149,7 +167,8 @@ def validate_source_text(path, content):
             return None
         except json.JSONDecodeError as exc:
             line = int(getattr(exc, "lineno", 0) or 0)
-            excerpt = text.splitlines()[line - 1] if 0 < line <= len(text.splitlines()) else ""
+            lines = text.splitlines()
+            excerpt = lines[line - 1] if 0 < line <= len(lines) else ""
             return _issue(path, language, "JSONDecodeError", exc.msg, line, excerpt)
 
     if language in {"javascript", "typescript", "dart", "css"}:
@@ -163,13 +182,18 @@ def validate_source_text(path, content):
             if token.startswith("</"):
                 if open_tags and open_tags[-1] == tag:
                     open_tags.pop()
-                elif tag not in {"br", "hr", "img", "meta", "link", "input"}:
-                    return _issue(path, language, "HTMLStructureError", f"Fechamento HTML incompatível: </{tag}>.")
-            elif not token.endswith("/>") and tag not in {"br", "hr", "img", "meta", "link", "input"}:
+                elif tag not in VOID_HTML_TAGS:
+                    return _issue(path, language, "HTMLStructureError", f"Fechamento HTML incompativel: </{tag}>.")
+            elif not token.endswith("/>") and tag not in VOID_HTML_TAGS:
                 open_tags.append(tag)
         if open_tags:
             return _issue(path, language, "HTMLStructureError", f"Tag HTML sem fechamento: <{open_tags[-1]}>.")
     return None
+
+
+def validate_source(path, content):
+    """Alias de compatibilidade para validadores antigos."""
+    return validate_source_text(path, content)
 
 
 def fenced_transport_instruction(path, issue=None):
@@ -178,14 +202,14 @@ def fenced_transport_instruction(path, issue=None):
     issue_text = ""
     if issue:
         issue_text = (
-            f"\nA última tentativa foi recusada: {issue.get('kind')}: "
-            f"{issue.get('message')} (linha {issue.get('line') or 'não informada'}).\n"
+            f"\nA ultima tentativa foi recusada: {issue.get('kind')}: "
+            f"{issue.get('message')} (linha {issue.get('line') or 'nao informada'}).\n"
         )
     return f"""
 PROTOCOLO INCREMENTAL V9:
-Para editar `{Path(path).as_posix()}`, não é obrigatório reescrever o arquivo inteiro.
+Para editar `{Path(path).as_posix()}`, nao e obrigatorio reescrever o arquivo inteiro.
 
-Mudança local preferida:
+Mudanca local preferida:
 [REPLACE: caminho/arquivo]
 [OLD]
 ```{language}
@@ -199,7 +223,7 @@ trecho novo
 [/NEW]
 [/REPLACE]
 
-Patch incremental também é aceito:
+Patch incremental tambem e aceito:
 [PATCH]
 *** Begin Patch
 *** Update File: caminho/arquivo
@@ -209,10 +233,9 @@ Patch incremental também é aceito:
 *** End Patch
 [/PATCH]
 
-Use [WRITE] somente para criar arquivo ou reescrever o conteúdo completo de propósito.
+Use [WRITE] somente para criar arquivo ou reescrever o conteudo completo de proposito.
 Quando faltar contexto em arquivo grande, solicite [READ: caminho | linhas inicio-fim] ou [SEARCH_TEXT: padrao | caminho].
-Nunca escreva código-fonte multiline fora de uma cerca Markdown.
-Python exige quatro espaços por nível, nunca tab.
+Nunca escreva codigo-fonte multiline fora de uma cerca Markdown.
+Python exige quatro espacos por nivel, nunca tab.
 {issue_text}
 """.strip()
-

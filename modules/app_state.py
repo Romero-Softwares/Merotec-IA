@@ -16,6 +16,7 @@ from modules.ai_profiles import (
     active_profile,
     ensure_ai_profiles,
     get_web_chat_session,
+    is_restorable_web_chat_url,
     normalize_web_url,
     profile_for,
     remember_web_chat_session,
@@ -191,22 +192,32 @@ class AppStateMixin:
         """Persiste a conversa real exibida pelo WebView para o projeto atual."""
         if not url or not getattr(self, "current_workspace", ""):
             return
+        if "HTTP ERROR 431" in str(title or "").upper():
+            return
+        entry_url = str(
+            self.settings.get("ai_profiles", {}).get("web_chat", {}).get(
+                "web_chat_url", self.settings.get("web_chat_url", "")
+            )
+        )
+        if not is_restorable_web_chat_url(url, entry_url):
+            return
         remember_web_chat_session(
             self.settings,
             self.current_workspace,
             "web_chat",
             str(url),
-            entry_url=str(
-                self.settings.get("ai_profiles", {}).get("web_chat", {}).get(
-                    "web_chat_url", self.settings.get("web_chat_url", "")
-                )
-            ),
+            entry_url=entry_url,
             title=title,
         )
         self._save_settings()
 
     def activate_workspace_web_chat_session(self):
-        """Prepara/restaura uma conversa pelo projeto sem abrir uma conversa nova."""
+        """Prepara/restaura uma conversa pelo projeto apenas no perfil Chat Web."""
+        provider, _profile = self.active_ai_profile()
+        if provider != "web_chat":
+            self.web_chat_restore_url = ""
+            self.web_chat_workspace_key = ""
+            return ""
         if not getattr(self, "current_workspace", ""):
             return ""
         target = self.web_chat_target_for_workspace(self.current_workspace)
@@ -282,7 +293,7 @@ class AppStateMixin:
             return
         project_type = simpledialog.askstring(
             "Tipo do projeto",
-            "Tipo: vazio, python ou web",
+            "Tipo: vazio, python, web, flet, dart ou flutter",
             initialvalue="python",
             parent=self,
         )

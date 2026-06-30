@@ -122,11 +122,38 @@ def _has_any(root: Path, patterns):
     return False
 
 
+def _file_contains(root: Path, relative_path: str, patterns):
+    try:
+        text = (root / relative_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return any(re.search(pattern, text, re.IGNORECASE | re.MULTILINE) for pattern in patterns)
+
+
+def _is_flutter_project(root: Path):
+    if not (root / "pubspec.yaml").exists():
+        return False
+    if any((root / folder).exists() for folder in ("android", "ios", "windows", "macos", "linux", "web")):
+        return True
+    return _file_contains(root, "pubspec.yaml", (r"^\s*flutter\s*:", r"sdk\s*:\s*flutter"))
+
+
+def _is_flet_project(root: Path):
+    if _file_contains(root, "requirements.txt", (r"(^|\n)\s*flet(?:[<>=~! ]|$)",)):
+        return True
+    if _file_contains(root, "pyproject.toml", (r"flet(?:[<>=~! ]|$)",)):
+        return True
+    for candidate in ("main.py", "app.py"):
+        if _file_contains(root, candidate, (r"\bimport\s+flet\b", r"\bfrom\s+flet\s+import\b")):
+            return True
+    return False
+
+
 def detect_workspace_language(workspace):
     """Escolhe a stack predominante a partir de arquivos de projeto reais."""
     root = Path(workspace).resolve()
     if (root / "pubspec.yaml").exists():
-        return "flutter_dart"
+        return "flutter_dart" if _is_flutter_project(root) else "dart"
     if (root / "Cargo.toml").exists():
         return "rust"
     if (root / "go.mod").exists():
@@ -150,6 +177,8 @@ def detect_workspace_language(workspace):
             return "typescript"
         return "javascript"
     if (root / "pyproject.toml").exists() or (root / "requirements.txt").exists() or _has_any(root, ("*.py", "*.pyw")):
+        if _is_flet_project(root):
+            return "flet_python"
         return "python"
     if _has_any(root, ("*.java",)):
         return "java"
@@ -473,6 +502,7 @@ def _workspace_validation_command(root, language):
         if "test" in scripts: return ["npm", "test", "--", "--runInBand"]
         if "build" in scripts: return ["npm", "run", "build"]
     if language == "flutter_dart": return ["flutter", "analyze"]
+    if language == "dart": return ["dart", "analyze"]
     if language == "php":
         # O lint por arquivo já foi aplicado; composer test é opcional e não deve ser inventado.
         return None
@@ -510,9 +540,10 @@ def workspace_contract(workspace):
     root = Path(workspace).resolve()
     language = detect_workspace_language(root)
     profile = {
+        "flet_python": "Flet detectado: preserve a arvore de controles, handlers e imports; valide sintaxe Python e rode o app quando houver tela.",
         "python": "Python detectado: preserve indentação e valide sintaxe/testes Python.",
         "flutter_dart": "Flutter/Dart detectado: preserve null-safety e valide com flutter analyze.",
-        "dart": "Dart detectado: preserve null-safety, imports e widgets/classes.",
+        "dart": "Dart detectado: preserve null-safety, imports, packages e valide com dart analyze.",
         "typescript": "TypeScript detectado: preserve tipos, imports e contratos; valide com tsc quando disponível.",
         "javascript": "JavaScript detectado: preserve módulos e valide com Node/npm quando disponível.",
         "rust": "Rust detectado: preserve ownership/tipos e valide com cargo check.",

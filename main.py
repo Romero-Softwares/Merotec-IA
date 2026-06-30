@@ -96,11 +96,11 @@ from modules.app_constants import (
     DEFAULT_APP_SETTINGS,
     DEFAULT_WORKSPACE,
     FILE_ICON_COLORS,
-    IGNORED_DIRS,
     IGNORED_SUFFIXES,
     PROJECTS_DIR,
     PROJECT_ROOT,
     SCRATCHPAD_DEFAULT_TEXT,
+    is_ignored_dir_name,
 )
 from modules.ai_config import AiConfigMixin
 from modules.agent_actions import AgentActionsMixin
@@ -109,6 +109,7 @@ from modules.engine import UniversalEngine
 from modules.executor import CodeExecutor
 from modules.editor_intelligence import completion_items, extract_symbols, word_prefix
 from modules.memory import MemorySubnet
+from modules.plugin_manager import build_plugin_report_messages, initialize_plugins
 from modules.project_manager import ProjectManager
 from modules.ui_theme import THEME
 from modules.workspace_intelligence import WorkspaceIntelligenceMixin
@@ -270,9 +271,13 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
         self.engine = UniversalEngine()
         self.attach_internal_web_chat_bridge()
-        self.voice = VoiceModule()
+        self.voice = VoiceModule(self.settings)
         self.pm = ProjectManager(str(PROJECTS_DIR))
         self.executor = CodeExecutor()
+        self.plugin_manager = None
+        self.plugin_statuses = []
+        self.plugin_capabilities = {}
+        self.load_plugins()
 
         self.style = get_style_by_name("monokai")
 
@@ -281,9 +286,34 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self._bind_shortcuts()
         self.load_workspace_files()
         self.set_status("Pronto para trabalhar.", "ready")
+        self.report_plugin_status()
         self.after(450, self.show_local_subnet_status)
         self.after(900, self.ensure_codex_ready)
         self.after(1400, self.start_voice_keyword_listener)
+
+    def plugin_services(self):
+        return {
+            "app": self,
+            "settings": self.settings,
+            "workspace": self.current_workspace,
+            "engine": self.engine,
+            "voice": self.voice,
+            "project_manager": self.pm,
+            "executor": self.executor,
+        }
+
+    def load_plugins(self):
+        (
+            self.plugin_manager,
+            self.plugin_statuses,
+            self.plugin_capabilities,
+        ) = initialize_plugins(services=self.plugin_services())
+        return self.plugin_statuses
+
+    def report_plugin_status(self):
+        for sender, message in build_plugin_report_messages(getattr(self, "plugin_statuses", [])):
+            self.add_chat_message(sender, message)
+            self.log_agent(message)
 
     def attach_internal_web_chat_bridge(self):
         """Liga o motor Chat Web ao mesmo WebView2 da janela principal.
@@ -320,6 +350,8 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
     def _remember_web_chat_navigation_if_needed(self, url, title=""):
         if not self._is_configured_web_chat_url(url):
+            return
+        if "HTTP ERROR 431" in str(title or "").upper():
             return
         try:
             self.remember_internal_browser_chat_url(url, title)
@@ -1778,7 +1810,13 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         with self.internal_browser_lock:
             process = self.internal_browser_process
             if process is not None and process.poll() is None:
-                if self._write_internal_browser_command(process, "navigate", url=url):
+                entry_url = ""
+                try:
+                    profile = self.settings.get("ai_profiles", {}).get("web_chat", {})
+                    entry_url = str(profile.get("web_chat_url") or self.settings.get("web_chat_url") or "")
+                except Exception:
+                    entry_url = ""
+                if self._write_internal_browser_command(process, "navigate", url=url, entry_url=entry_url):
                     return True, "url enviada"
 
             helper = PROJECT_ROOT / "modules" / "browser_runtime.py"
@@ -1961,9 +1999,20 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     )
                 elif name == "navigated":
                     current = str(event.get("url") or self.internal_browser_url)
+                    title = str(event.get("title") or "")
                     self.internal_browser_url = current
-                    self.set_internal_browser_status(f"Pagina aberta: {current}", "ready")
-                    self.after(0, lambda url=current: self._remember_web_chat_navigation_if_needed(url))
+                    if event.get("recovered_from_http_431"):
+                        self.set_internal_browser_status(
+                            "Chat Web recuperado: cookies do WebView2 limpos apos HTTP 431.",
+                            "warning",
+                        )
+                    else:
+                        self.set_internal_browser_status(f"Pagina aberta: {current}", "ready")
+                    if not event.get("http_error"):
+                        self.after(
+                            0,
+                            lambda url=current, page_title=title: self._remember_web_chat_navigation_if_needed(url, page_title),
+                        )
                 elif name in {"error", "command_error"}:
                     message = str(event.get("message") or "Falha no navegador WebView2.")
                     self.set_internal_browser_status(message, "error")
@@ -2687,7 +2736,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 break
             if child.name.startswith("."):
                 continue
-            if child.is_dir() and child.name in IGNORED_DIRS:
+            if child.is_dir() and is_ignored_dir_name(child.name):
                 continue
 
             try:
@@ -5046,6 +5095,8 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     "- Use raciocinio altissimo: antes de responder, escolha o proximo passo que realmente muda, executa, valida ou conclui.\n"
                     "- Para perguntas simples ou perguntas de capacidade, responda direto antes de qualquer execucao.\n"
                     "- Se o usuario perguntar se voce consegue/pode fazer algo, explique a capacidade e o que falta; nao execute comandos nem edite arquivos nessa rodada.\n"
+                    "- A mensagem mais recente do usuario tem prioridade sobre historico, conversa recente, MISSAO ORIGINAL e MISSAO ATIVA quando ela pedir algo diferente.\n"
+                    "- Continue uma missao anterior somente quando o pedido atual for claramente de continuidade, como 'continue', 'termine' ou 'faca isso'.\n"
                     "- Para analise/planejamento, entregue diagnostico completo em texto e nao execute/edite sem pedido claro.\n"
                     "- Para implementacao/correcao, avance ate uma mudanca aplicada e uma verificacao plausivel.\n"
                     "- Trabalhe de forma produtiva: responda com conclusao util, diagnostico objetivo ou acao real quando precisar mexer no projeto.\n"
@@ -5077,7 +5128,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     "Entenda a estrutura antes de editar, mas nao fique repetindo leituras do mesmo arquivo. "
                     "Em tarefa grande, continue coletando apenas os intervalos e buscas que forem indispensaveis para uma alteracao segura; depois aja com [REPLACE], [PATCH], [WRITE], EXECUTE/EXECUTE_ADMIN, [OPEN_URL], [SCREENSHOT] ou [HUMAN_TEST]. "
                     "Evite narrar intencoes vazias; avance com leitura, alteracao, validacao ou uma conclusao clara. "
-                    "Nao peca o objetivo novamente enquanto houver uma missao ativa.\n\n"
+                    "Nao peca o objetivo novamente enquanto houver uma missao ativa, mas se o usuario acabou de pedir algo diferente, substitua a missao anterior pelo pedido atual.\n\n"
                     f"Alteracoes recentes feitas pela IDE neste projeto:\n{self.format_recent_changes_for_agent(limit=8)}\n\n"
                     f"Conversa recente que deve ser preservada:\n{self.build_recent_ai_context_memory(limit=18)}\n\n"
                     f"{self.build_smart_task_brief(command, objective=objective)}\n\n"

@@ -23,7 +23,7 @@ from tkinter import messagebox
 
 from PIL import ImageGrab
 
-from modules.app_constants import APP_NAME, IGNORED_DIRS, PROJECT_ROOT
+from modules.app_constants import APP_NAME, PROJECT_ROOT, is_ignored_dir_name
 
 
 class DuckDuckGoHtmlResultParser(HTMLParser):
@@ -92,7 +92,7 @@ class AgentActionsMixin:
             for dirpath, dirnames, filenames in os.walk(root):
                 dirnames[:] = [
                     name for name in dirnames
-                    if name not in IGNORED_DIRS and not name.startswith(".merotec_")
+                    if not is_ignored_dir_name(name)
                 ]
                 for filename in filenames:
                     path = Path(dirpath) / filename
@@ -402,7 +402,7 @@ class AgentActionsMixin:
         """
         payload = str(response_text or "")
         closed_pattern = re.compile(
-            r"\[WRITE\s*:\s*([^\]\r\n]+)\]\s*(.*?)\s*\[/WRITE\]",
+            r"\[WRITE\s*:\s*([^\]\r\n]+)\][ \t]*(?:\r?\n)?(.*?)(?:\r?\n)?[ \t]*\[/WRITE\]",
             re.DOTALL | re.IGNORECASE,
         )
         blocks = []
@@ -686,6 +686,18 @@ class AgentActionsMixin:
             return False
 
         contexts = []
+        issue = self.get_ai_task_metrics(task_id).get("code_pipeline_last_rejection")
+        if isinstance(issue, dict):
+            issue_path = str(issue.get("path") or "").strip()
+            issue_kind = str(issue.get("kind") or "MutationRejected")
+            issue_message = str(issue.get("message") or "Alteracao recusada para preservar o arquivo atual.")
+            contexts.append(
+                "DIAGNOSTICO DA BARREIRA DE INTEGRIDADE:\n"
+                f"{issue_kind} em `{issue_path or 'arquivo alvo'}`: {issue_message}\n"
+                "A proxima resposta deve usar [READ: arquivo | linhas inicio-fim], [SEARCH_TEXT] "
+                "ou [REPLACE] pequeno com OLD exato. Para Python, preserve o bloco indentado apos "
+                "def/class/if/for/while/try/with/match, use 4 espacos por nivel e nunca use tabs."
+            )
         seen = set()
         for raw_path in target_paths or []:
             raw_path = str(raw_path or "").strip()
@@ -722,6 +734,7 @@ class AgentActionsMixin:
             f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or ''}\n\n"
             "A ÚLTIMA EDIÇÃO NÃO FOI APLICADA. Não declare conclusão e não abra uma conversa nova. "
             "Use o conteúdo atual abaixo, corrija o contexto desatualizado e responda com a próxima ação necessária da IDE. "
+            "Se for substituir texto, responda com [REPLACE: caminho] [OLD] trecho atual exato [/OLD] [NEW] trecho novo [/NEW] [/REPLACE] completo. "
             "PROTOCOLO INCREMENTAL V9: para arquivo grande, nao exija reescrita completa; use [READ: caminho | linhas inicio-fim] ou [SEARCH_TEXT] e aplique [REPLACE] ou [PATCH] local. "
             "Para reescrever de propósito, use [WRITE: caminho] ... [/WRITE].\n\n"
             f"RESPOSTA ANTERIOR QUE FALHOU:\n{response_text[:6000]}\n\n"
@@ -897,9 +910,13 @@ class AgentActionsMixin:
         replace_blocks = re.findall(r"\[REPLACE:\s*(.+?)\](.*?)\[/REPLACE\]", response_text, re.DOTALL | re.IGNORECASE)
         has_action = has_action or bool(replace_blocks)
         if "[REPLACE:" in response_text.upper() and not replace_blocks:
+            mutation_attempted = True
+            malformed_target = re.search(r"\[REPLACE:\s*([^\]\r\n]+)", response_text, re.IGNORECASE)
+            if malformed_target:
+                mutation_targets.append(malformed_target.group(1).strip())
             self.add_chat_message(
                 "Erro",
-                "A IA enviou um REPLACE incompleto. Ela precisa mandar [REPLACE: arquivo] [OLD]...[/OLD] [NEW]...[/NEW] [/REPLACE].",
+                "A IA enviou um REPLACE incompleto. O arquivo foi preservado; a IDE vai pedir um [REPLACE] pequeno e completo com [OLD], [NEW] e [/REPLACE].",
             )
         for raw_path, block in replace_blocks:
             mutation_attempted = True
@@ -1295,6 +1312,25 @@ class AgentActionsMixin:
         self.ai_passive_action_count = 0
         if not action_name:
             return
+        activity_labels = {
+            "read": "IA lendo contexto",
+            "search_text": "IA buscando no projeto",
+            "web_search": "IA pesquisando documentacao",
+            "scan_text": "IA verificando texto",
+            "fix_mojibake": "IA corrigindo texto",
+            "write": "IA alterando arquivos",
+            "replace": "IA alterando arquivos",
+            "patch": "IA aplicando patch",
+            "execute": "IA validando",
+            "open_url": "IA abrindo navegador",
+            "browser": "IA testando no navegador",
+            "screenshot": "IA capturando tela",
+            "human_test": "IA testando como usuario",
+            "redirect": "IA redirecionando acao",
+        }
+        set_activity = getattr(self, "set_ai_activity", None)
+        if callable(set_activity):
+            set_activity(activity_labels.get(str(action_name).lower(), "IA executando acao real"))
         metrics = self.get_ai_task_metrics(task_id)
         metrics["real_actions"] = metrics.get("real_actions", 0) + 1
         key = f"{action_name.lower()}_actions"
@@ -1393,12 +1429,178 @@ class AgentActionsMixin:
             return "npm install --dry-run"
 
         if (workspace / "pyproject.toml").exists() or (workspace / "requirements.txt").exists() or list(workspace.glob("*.py")):
-            return f'"{sys.executable}" -m compileall .'
+            targets = [
+                name
+                for name in ("main.py", "app.py", "modules", "tests")
+                if (workspace / name).exists()
+            ]
+            if targets:
+                return f'"{sys.executable}" -m compileall -q ' + " ".join(targets)
+            excluded = r"(^|[\\/])(\.git|\.venv|venv|env|node_modules|__pycache__)([\\/]|$)"
+            return f'"{sys.executable}" -m compileall -q -x "{excluded}" .'
 
         if (workspace / "index.html").exists():
             return "python -m http.server 8000"
 
         return ""
+
+    def detect_missing_python_dependency(self, output):
+        text = output or ""
+        patterns = (
+            r"ModuleNotFoundError:\s+No module named ['\"]([^'\"]+)['\"]",
+            r"ImportError:\s+No module named ['\"]([^'\"]+)['\"]",
+            r"No module named ['\"]([^'\"]+)['\"]",
+            r"No module named\s+([A-Za-z_][A-Za-z0-9_.]*)",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            module_name = (match.group(1) or "").strip()
+            package = self.python_import_to_pip_package(module_name)
+            if package:
+                return {"module": module_name, "package": package}
+        return None
+
+    def python_import_to_pip_package(self, module_name):
+        module = (module_name or "").strip().split(".")[0]
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", module or ""):
+            return ""
+
+        stdlib_names = set(getattr(sys, "stdlib_module_names", set()) or set())
+        if module in stdlib_names:
+            return ""
+
+        workspace = Path(self.current_workspace or ".").resolve()
+        local_candidates = (
+            workspace / f"{module}.py",
+            workspace / module / "__init__.py",
+        )
+        if any(path.exists() for path in local_candidates):
+            return ""
+
+        pip_package_map = {
+            "PIL": "Pillow",
+            "Image": "Pillow",
+            "cv2": "opencv-python",
+            "sklearn": "scikit-learn",
+            "yaml": "PyYAML",
+            "bs4": "beautifulsoup4",
+            "dotenv": "python-dotenv",
+            "Crypto": "pycryptodome",
+            "dateutil": "python-dateutil",
+            "serial": "pyserial",
+            "win32api": "pywin32",
+            "win32com": "pywin32",
+            "customtkinter": "customtkinter",
+        }
+        return pip_package_map.get(module, module.replace("_", "-"))
+
+    def build_python_dependency_install_command(self, package):
+        package = (package or "").strip()
+        if not package or not re.fullmatch(r"[A-Za-z0-9_.-]+(?:\[[A-Za-z0-9_,.-]+\])?", package):
+            return ""
+        python_executable = self.python_executable_for_workspace()
+        return f'"{python_executable}" -m pip install {package}'
+
+    def maybe_install_missing_python_dependency(
+        self,
+        command,
+        output,
+        task_objective=None,
+        action_depth=0,
+        task_id=None,
+    ):
+        missing = self.detect_missing_python_dependency(output)
+        if not missing:
+            return False
+        if not self.command_looks_like_python_execution(command):
+            return False
+
+        if self.maybe_redirect_missing_pytest_to_unittest(
+            command,
+            missing,
+            task_objective=task_objective,
+            action_depth=action_depth,
+            task_id=task_id,
+        ):
+            return True
+
+        metrics = self.get_ai_task_metrics(task_id)
+        package = missing["package"]
+        install_key = f"pip_install:{package.lower()}"
+        installed = metrics.setdefault("auto_dependency_installs", [])
+        if install_key in installed:
+            return False
+
+        install_command = self.build_python_dependency_install_command(package)
+        if not install_command:
+            return False
+
+        installed.append(install_key)
+        metrics["retry_command_after_dependency_install"] = command
+        self.add_chat_message(
+            "Sistema",
+            f"Biblioteca Python ausente detectada: {missing['module']}. A IDE vai instalar {package} e depois continuar a validacao.",
+        )
+        self.log_agent(f"Dependencia ausente detectada: {missing['module']} -> {package}")
+        self._agent_execute(
+            install_command,
+            task_objective=task_objective or self.active_ai_objective or command,
+            action_depth=action_depth + 1,
+            task_id=task_id,
+        )
+        return True
+
+    def maybe_redirect_missing_pytest_to_unittest(
+        self,
+        command,
+        missing,
+        task_objective=None,
+        action_depth=0,
+        task_id=None,
+    ):
+        if not missing or missing.get("module") != "pytest":
+            return False
+        normalized_command = self.normalize_plain_text(command or "")
+        if "-m pytest" not in normalized_command and " pytest" not in f" {normalized_command}":
+            return False
+
+        workspace = Path(self.current_workspace or ".").resolve()
+        tests_dir = workspace / "tests"
+        has_unittest_tests = tests_dir.exists() and any(tests_dir.glob("test*.py"))
+        if not has_unittest_tests:
+            return False
+
+        metrics = self.get_ai_task_metrics(task_id)
+        redirect_key = "pytest_to_unittest"
+        redirects = metrics.setdefault("auto_validation_redirects", [])
+        if redirect_key in redirects:
+            return False
+
+        redirects.append(redirect_key)
+        python_executable = self.python_executable_for_workspace()
+        unittest_command = f'"{python_executable}" -m unittest discover -s tests -q'
+        self.add_chat_message(
+            "Sistema",
+            "pytest nao esta instalado neste ambiente. A IDE redirecionou a validacao para unittest, que e a suite disponivel do projeto.",
+        )
+        self.log_agent("Validacao pytest redirecionada para unittest discover.")
+        self._agent_execute(
+            unittest_command,
+            task_objective=task_objective or self.active_ai_objective or command,
+            action_depth=action_depth + 1,
+            task_id=task_id,
+        )
+        return True
+
+    def python_executable_for_workspace(self):
+        workspace = Path(self.current_workspace or ".").resolve()
+        if os.name == "nt":
+            venv_python = workspace / "venv" / "Scripts" / "python.exe"
+        else:
+            venv_python = workspace / "venv" / "bin" / "python"
+        return str(venv_python if venv_python.exists() else Path(sys.executable))
 
     def objective_requests_visual_human_test(self, text):
         normalized = self.normalize_plain_text(text or "")
@@ -2168,7 +2370,6 @@ class AgentActionsMixin:
         normalized = self.normalize_plain_text(objective or self.active_ai_objective or "")
         if self.is_analysis_only_objective(normalized):
             return False
-        words = set(re.findall(r"[a-z0-9_]+", normalized))
         change_terms = {
             "adicione",
             "adicionar",
@@ -2201,6 +2402,49 @@ class AgentActionsMixin:
             "teste",
             "testar",
         }
+        verification_terms = {
+            "confira",
+            "conferir",
+            "investigue",
+            "investigar",
+            "valida",
+            "validacao",
+            "validar",
+            "ver",
+            "verifica",
+            "verificacao",
+            "verifique",
+            "verificar",
+        }
+        instruction_markers = (
+            "instrucao do usuario/sistema:",
+            "instrucao do usuario:",
+            "pedido atual:",
+            "missao ativa da ia:",
+            "missao original:",
+        )
+        instruction_delimiters = (
+            " continue essa missao",
+            " modo codex",
+            " contexto para analisar",
+            " workspace atual:",
+            " alteracoes recentes",
+            " conversa recente",
+        )
+        for marker in instruction_markers:
+            if marker in normalized:
+                segment = normalized.split(marker, 1)[1].split("\n", 1)[0]
+                for delimiter in instruction_delimiters:
+                    if delimiter in segment:
+                        segment = segment.split(delimiter, 1)[0]
+                segment_words = set(re.findall(r"[a-z0-9_]+", segment))
+                if segment_words & verification_terms and not (segment_words & change_terms):
+                    return False
+                if segment_words & change_terms:
+                    return True
+        words = set(re.findall(r"[a-z0-9_]+", normalized))
+        if words & verification_terms and not (words & change_terms):
+            return False
         return bool(words & change_terms)
 
     def is_analysis_only_objective(self, objective):
@@ -3494,8 +3738,14 @@ class AgentActionsMixin:
                 current = path.read_text(encoding="utf-8", errors="replace")
                 objective = task_objective or self.active_ai_objective or ""
                 if self.is_risky_full_rewrite(path, current, cleaned, objective):
-                    rel = path.relative_to(self.current_workspace).as_posix()
-                    self.log_agent(f"WRITE grande liberado com backup obrigatorio: {rel}")
+                    self.redirect_risky_write_to_patch(
+                        path,
+                        current,
+                        cleaned,
+                        objective,
+                        task_id=task_id,
+                    )
+                    return False
 
             if path.exists():
                 backup = path.with_suffix(path.suffix + ".bak")
@@ -3591,11 +3841,24 @@ class AgentActionsMixin:
 
     def redirect_risky_write_to_patch(self, path, current, proposed, objective, task_id=None):
         rel = path.relative_to(self.current_workspace).as_posix()
+        current_lines = max(1, current.count("\n") + 1)
+        proposed_lines = max(1, proposed.count("\n") + 1)
+        metrics = self.get_ai_task_metrics(task_id)
+        metrics["code_pipeline_last_rejection"] = {
+            "path": rel,
+            "kind": "RiskyFullRewrite",
+            "line": 0,
+            "message": (
+                f"WRITE completo recusado em arquivo grande ({current_lines} linhas atuais, "
+                f"{proposed_lines} linhas propostas). Use READ/REPLACE ou PATCH local."
+            ),
+        }
         self.add_chat_message(
-            "Merotec AI",
-            f"A reescrita grande de `{rel}` foi liberada com backup. Se o resultado nao agradar, use desfazer.",
+            "Erro",
+            f"WRITE completo recusado em `{rel}` para preservar o sistema. "
+            "Leia o trecho necessario e aplique REPLACE/PATCH incremental.",
         )
-        self.log_agent(f"WRITE grande nao bloqueado: {rel}")
+        self.log_agent(f"WRITE grande bloqueado para preservar arquivo existente: {rel}")
 
     def _agent_replace(self, raw_path, old_content, new_content, task_id=None, task_objective=None):
         try:
@@ -3613,8 +3876,15 @@ class AgentActionsMixin:
             current = path.read_text(encoding="utf-8", errors="replace")
             objective = task_objective or self.active_ai_objective or ""
             if self.is_risky_replace(path, current, old_text, new_text, objective):
-                rel = path.relative_to(self.current_workspace).as_posix()
-                self.log_agent(f"REPLACE grande liberado com backup obrigatorio: {rel}")
+                self.redirect_risky_replace_to_smaller_patch(
+                    path,
+                    current,
+                    old_text,
+                    new_text,
+                    objective,
+                    task_id=task_id,
+                )
+                return False
 
             updated = self.replace_exact_or_line_ending_variant(current, old_text, new_text)
             if updated is None:
@@ -3656,11 +3926,24 @@ class AgentActionsMixin:
 
     def redirect_risky_replace_to_smaller_patch(self, path, current, old_text, new_text, objective, task_id=None):
         rel = path.relative_to(self.current_workspace).as_posix()
+        old_lines = max(1, old_text.count("\n") + 1)
+        new_lines = max(1, new_text.count("\n") + 1)
+        metrics = self.get_ai_task_metrics(task_id)
+        metrics["code_pipeline_last_rejection"] = {
+            "path": rel,
+            "kind": "RiskyBroadReplace",
+            "line": 0,
+            "message": (
+                f"REPLACE amplo recusado ({old_lines} linhas OLD, {new_lines} linhas NEW). "
+                "Use uma substituicao menor baseada no trecho atual."
+            ),
+        }
         self.add_chat_message(
-            "Merotec AI",
-            f"A substituicao grande em `{rel}` foi liberada com backup. Se o resultado nao agradar, use desfazer.",
+            "Erro",
+            f"REPLACE amplo recusado em `{rel}` para preservar o sistema. "
+            "Leia somente o intervalo necessario e substitua um trecho menor.",
         )
-        self.log_agent(f"REPLACE grande nao bloqueado: {rel}")
+        self.log_agent(f"REPLACE grande bloqueado para preservar arquivo existente: {rel}")
 
     def replace_exact_or_line_ending_variant(self, current, old_text, new_text):
         if old_text in current:
@@ -3976,7 +4259,7 @@ class AgentActionsMixin:
             if index >= limit:
                 lines.append(f"... mais itens omitidos em {path.name}")
                 break
-            if any(part in IGNORED_DIRS for part in child.parts):
+            if any(is_ignored_dir_name(part) for part in child.parts):
                 continue
             try:
                 rel = child.relative_to(self.current_workspace).as_posix()
@@ -4834,7 +5117,21 @@ class AgentActionsMixin:
                 self.append_to_term(f"\n[processo da IA finalizado com codigo {process.returncode}]\n")
                 diagnostic = ""
                 if process.returncode == 0:
-                    self.get_ai_task_metrics(task_id).pop("requires_error_correction", None)
+                    metrics = self.get_ai_task_metrics(task_id)
+                    retry_command = metrics.pop("retry_command_after_dependency_install", None)
+                    if retry_command and self.command_looks_like_python_package_install(command):
+                        self.add_chat_message(
+                            "Sistema",
+                            "Dependencia instalada. A IDE vai repetir o comando que falhou para validar.",
+                        )
+                        self._agent_execute(
+                            retry_command,
+                            task_objective=task_objective or self.active_ai_objective or retry_command,
+                            action_depth=action_depth + 1,
+                            task_id=task_id,
+                        )
+                        return
+                    metrics.pop("requires_error_correction", None)
                     if self.advance_autonomous_delivery_after_validation(
                         command,
                         task_objective=task_objective,
@@ -4915,6 +5212,14 @@ class AgentActionsMixin:
                             task_id=task_id,
                         )
                         return
+                    if self.maybe_install_missing_python_dependency(
+                        command,
+                        output,
+                        task_objective=task_objective,
+                        action_depth=action_depth,
+                        task_id=task_id,
+                    ):
+                        return
                 context = (
                     "DIAGNOSTICO DE FALHA GERADO PELA IDE — PRIORIDADE MAXIMA:\n"
                     f"MISSAO ORIGINAL:\n{task_objective or self.active_ai_objective or command}\n\n"
@@ -4944,6 +5249,17 @@ class AgentActionsMixin:
                 self.set_ai_busy(False)
 
         threading.Thread(target=run, daemon=True).start()
+
+    def command_looks_like_python_package_install(self, command):
+        normalized = self.normalize_plain_text(command or "")
+        return bool(re.search(r"\bpython(?:\.exe)?\b.*\s-m\s+pip\s+install\b", normalized))
+
+    def command_looks_like_python_execution(self, command):
+        normalized = self.normalize_plain_text(command or "")
+        return bool(
+            re.search(r"(^|[\\/\s\"'])python(?:3)?(?:\.exe)?(\s|$)", normalized)
+            or re.search(r"(^|[\\/\s\"'])py(?:\.exe)?\s+", normalized)
+        )
 
     def is_http_server_command(self, command):
         normalized = self.normalize_plain_text(command or "")
@@ -5626,11 +5942,10 @@ def _merotec_v7_workspace_signature(instance):
         return "workspace-indisponivel"
     digest = _merotec_v7_hashlib.sha256()
     count = 0
-    ignored_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules"}
     try:
         for path in sorted(root.rglob("*")):
             try:
-                if not path.is_file() or any(part in ignored_dirs for part in path.parts):
+                if not path.is_file() or any(is_ignored_dir_name(part) for part in path.parts):
                     continue
                 relative = path.relative_to(root).as_posix()
                 # Backups and databases change as a side effect of valid edits;
@@ -5965,9 +6280,18 @@ def _merotec_v8_clean_write_payload(self, content):
     raw = re.sub(r"(?im)^\s*\[/WRITE\]\s*$", "", raw)
     raw = re.sub(r"(?im)^\s*\[WRITE\s*:\s*[^\]\r\n]+\]\s*$", "", raw)
 
-    fence = re.search(r"```[^\n`]*\n(.*?)(?:\n```|\Z)", raw, re.DOTALL)
+    fence = re.search(r"(?m)^([ \t]*)```[^\n`]*\n(.*?)(?:\n[ \t]*```|\Z)", raw, re.DOTALL)
     if fence:
-        candidate = fence.group(1)
+        candidate = fence.group(2)
+        fence_indent = fence.group(1)
+        if fence_indent:
+            normalized_lines = []
+            for line in candidate.split("\n"):
+                if line.startswith(fence_indent):
+                    normalized_lines.append(line[len(fence_indent):])
+                else:
+                    normalized_lines.append(line)
+            candidate = "\n".join(normalized_lines)
     else:
         # Quando só a abertura da cerca chegou pelo WebView, descarte a linha
         # de linguagem e mantenha todo o restante exatamente como foi emitido.
@@ -6030,7 +6354,10 @@ def _merotec_v8_compact_invalid_write_context(self, path, relative, issue, objec
         "O arquivo no disco NÃO foi alterado. Ignore totalmente a proposta inválida anterior. "
         "Use o arquivo atual abaixo como fonte de verdade. Responda com UMA ação aplicável: "
         f"prefira [REPLACE: {relative}] com [OLD] idêntico ao conteúdo atual e [NEW] válido; "
+        "em arquivo grande, use [REPLACE] pequeno e baseado no trecho real. "
         "use [WRITE] somente se for intencionalmente reescrever o arquivo completo. "
+        "Para Python, preserve a indentacao do bloco apos def/class/if/for/while/try/with/match, "
+        "use 4 espacos por nivel e nunca use tabs. "
         "Não envie código solto, não use PATCH/diff e não explique antes da tag.\n\n"
         + source_block
     )
@@ -6124,3 +6451,56 @@ def _merotec_v8_continue_mutation_failure(
 
 AgentActionsMixin._agent_write = _merotec_v8_write
 AgentActionsMixin.continue_after_mutation_failure = _merotec_v8_continue_mutation_failure
+
+
+# MEROTEC_WRITE_INDENT_TRANSPORT_V9
+# O Chat Web pode copiar um WRITE com a cerca Markdown inteira recuada. O parser
+# antigo consumia esse recuo no separador apos [WRITE: ...], impedindo o limpador
+# de distinguir transporte Markdown de indentacao real do arquivo.
+_merotec_v9_base_extract_write_blocks = AgentActionsMixin.extract_write_blocks
+
+
+def _merotec_v9_extract_write_blocks(self, response_text):
+    payload = str(response_text or "")
+    closed_pattern = re.compile(
+        r"\[WRITE\s*:\s*([^\]\r\n]+)\][ \t]*(?:\r?\n)?(.*?)(?:\r?\n)?[ \t]*\[/WRITE\]",
+        re.DOTALL | re.IGNORECASE,
+    )
+    blocks = []
+    closed_spans = []
+    for match in closed_pattern.finditer(payload):
+        raw_path = match.group(1).strip()
+        content = match.group(2)
+        if raw_path and content.strip():
+            blocks.append((raw_path, content, False))
+            closed_spans.append(match.span())
+
+    header_pattern = re.compile(
+        r"(?im)^[ \t]*\[WRITE\s*:\s*([^\]\r\n]+)\][ \t]*(?:\r?\n)?"
+    )
+    next_action_pattern = re.compile(
+        r"(?im)^\s*\[(?:PATCH|WRITE|REPLACE|READ|SEARCH_TEXT|WEB_SEARCH|SCAN_TEXT|"
+        r"FIX_MOJIBAKE|UNDO|EXECUTE(?:_ADMIN)?|OPEN_URL|BROWSER_INSPECT|BROWSER_CLICK|"
+        r"BROWSER_TYPE|BROWSER_SCROLL|BROWSER_CHAT|SCREENSHOT|HUMAN_TEST|FINAL)\s*:",
+    )
+    seen = {(item[0].strip().lower(), item[1].strip()) for item in blocks}
+    for header in header_pattern.finditer(payload):
+        if any(start <= header.start() < end for start, end in closed_spans):
+            continue
+        raw_path = header.group(1).strip()
+        body_start = header.end()
+        next_action = next_action_pattern.search(payload, body_start)
+        body_end = next_action.start() if next_action else len(payload)
+        content = payload[body_start:body_end].strip("\r\n")
+        if not raw_path or not self._looks_like_write_payload(raw_path, content):
+            continue
+        key = (raw_path.lower(), content.strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        blocks.append((raw_path, content, True))
+
+    return blocks
+
+
+AgentActionsMixin.extract_write_blocks = _merotec_v9_extract_write_blocks
