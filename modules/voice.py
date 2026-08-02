@@ -324,6 +324,7 @@ class VoiceModule:
         self.recording_has_microphone_lock = False
         self.is_recording = False
         self.is_paused = False
+        self.is_speaking = False
         self.stop_requested = False
         self.speech_lock = threading.Lock()
         self.current_speech_engine = None
@@ -581,18 +582,26 @@ class VoiceModule:
 
     def speak(self, text):
         if edge_tts is None and pyttsx3 is None:
-            return
+            return False
+
+        self.stop_requested = False
+        self.is_paused = False
+        self.is_speaking = True
 
         def run_speech():
-            self.stop_requested = False
-            self._speak_text_once(text)
+            try:
+                self._speak_text_once(text)
+            finally:
+                self.is_speaking = False
 
         threading.Thread(target=run_speech, daemon=True).start()
+        return True
 
     def stop(self):
         """Interrompe a fala atual imediatamente"""
         self.is_paused = False
         self.stop_requested = True
+        self.is_speaking = False
         # Força o esvaziamento da fila
         with self.queue.mutex:
             self.queue.queue.clear()

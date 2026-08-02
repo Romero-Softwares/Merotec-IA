@@ -76,6 +76,42 @@ class AiQuotaStatusTest(unittest.TestCase):
 
         self.assertIn("limite do membro atingido", engine.quota_status_text())
 
+    def test_quota_status_keeps_current_limits_when_credits_are_depleted(self):
+        engine = bare_engine()
+        engine._remember_rate_limits(
+            {
+                "rateLimits": {
+                    "planType": "plus",
+                    "limitId": "codex",
+                    "primary": {"usedPercent": 73},
+                    "secondary": {"usedPercent": 15},
+                    "credits": {"hasCredits": False, "unlimited": False},
+                }
+            }
+        )
+
+        text = engine.quota_status_text()
+
+        self.assertIn("janela 73%", text)
+        self.assertIn("extra 15%", text)
+        self.assertIn("creditos esgotados", text)
+        self.assertNotEqual("CODEX gpt-5.5/high | creditos esgotados", text)
+
+    def test_quota_status_hides_zero_balance_when_credits_are_depleted(self):
+        engine = bare_engine()
+        engine._remember_rate_limits(
+            {
+                "rateLimits": {
+                    "credits": {"balance": "0", "hasCredits": False, "unlimited": False},
+                }
+            }
+        )
+
+        text = engine.quota_status_text()
+
+        self.assertIn("creditos esgotados", text)
+        self.assertNotIn("creditos 0", text)
+
     def test_status_bar_appends_quota_once(self):
         engine = bare_engine()
         app = type("DummyApp", (), {"engine": engine})()

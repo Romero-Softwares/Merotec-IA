@@ -6,12 +6,18 @@ import subprocess
 import sys
 
 class CodeExecutor:
-    def run_python_code(self, file_path):
+    def run_python_code(self, file_path, on_start=None):
         try:
-            result = subprocess.run([sys.executable, file_path], capture_output=True, timeout=15)
-            if result.returncode == 0:
-                return True, self._decode_output(result.stdout)
-            return False, self._decode_output(result.stderr)
+            process = subprocess.Popen(
+                [sys.executable, file_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            if on_start:
+                on_start(process)
+            output, _ = process.communicate()
+            decoded = self._decode_output(output)
+            return process.returncode == 0, decoded
         except Exception as e:
             return False, str(e)
 

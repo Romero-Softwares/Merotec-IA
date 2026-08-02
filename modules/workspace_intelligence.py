@@ -336,6 +336,9 @@ class WorkspaceIntelligenceMixin:
         if self.is_zoom_mobile_verification_request(normalized):
             return self.verify_zoom_mobile_locally(command)
 
+        if self.is_development_quality_request(normalized):
+            return self.build_development_quality_report()
+
         return None
 
     def local_autonomous_discovery_reply(self, command, normalized=None):
@@ -1204,6 +1207,12 @@ class WorkspaceIntelligenceMixin:
         verify_terms = {"verificar", "verifique", "veja", "existe", "exista", "tem", "possui", "confira"}
         return bool(words & verify_terms) and "zoom" in normalized and "mobile" in normalized
 
+    def is_development_quality_request(self, normalized):
+        words = set(re.findall(r"[a-z0-9_]+", normalized or ""))
+        quality_terms = {"qualidade", "saude", "health", "diagnostico", "riscos", "inteligencia"}
+        development_terms = {"desenvolvimento", "dev", "codigo", "projeto", "sistema"}
+        return bool(words & quality_terms) and bool(words & development_terms)
+
     def verify_zoom_mobile_locally(self, command):
         files = self.find_likely_search_targets(command, suffixes={".html", ".js", ".ts", ".tsx", ".jsx", ".dart"})
         if not files:
@@ -1294,7 +1303,264 @@ class WorkspaceIntelligenceMixin:
             if len(targets) >= limit:
                 break
 
-        return [path for path in targets if str(path.resolve()).startswith(str(workspace))]
+        candidates = [path for path in targets if str(path.resolve()).startswith(str(workspace))]
+        if not candidates:
+            return []
+        ranked = self.rank_workspace_files_for_task(command, candidates)
+        return [item["path"] for item in ranked[:limit]]
+
+    def workspace_file_terms(self, path, rel, max_chars=5000):
+        terms = []
+        rel_text = rel.as_posix()
+        terms.extend(re.findall(r"[a-z0-9_]+", self.normalize_plain_text(rel_text)))
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")[:max_chars]
+        except OSError:
+            source = ""
+        if source:
+            terms.extend(re.findall(r"[a-z0-9_]+", self.normalize_plain_text(source)))
+        return Counter(term for term in terms if len(term) >= 3)
+
+    def build_workspace_development_index(self, max_files=500, max_chars_per_file=5000):
+        workspace = Path(self.current_workspace).resolve()
+        files = list(self.iter_workspace_files(limit=max_files))
+        index = []
+        for path, rel in files:
+            suffix = path.suffix.lower()
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            try:
+                sample = path.read_text(encoding="utf-8", errors="replace")[:max_chars_per_file]
+            except OSError:
+                sample = ""
+            symbols = []
+            if suffix in {".py", ".js", ".jsx", ".ts", ".tsx", ".md", ".html", ".css", ".scss", ".sass"}:
+                try:
+                    from modules.editor_intelligence import extract_symbols
+
+                    symbols = [symbol.name for symbol in extract_symbols(sample, rel.as_posix())[:24]]
+                except Exception:
+                    symbols = []
+            digest = hashlib.sha256(
+                f"{rel.as_posix()}:{stat.st_mtime_ns}:{stat.st_size}".encode("utf-8", errors="ignore")
+            ).hexdigest()[:16]
+            index.append(
+                {
+                    "path": path,
+                    "rel": rel,
+                    "rel_text": rel.as_posix(),
+                    "suffix": suffix,
+                    "size": stat.st_size,
+                    "hash": digest,
+                    "symbols": symbols,
+                    "terms": self.workspace_file_terms(path, rel, max_chars=max_chars_per_file),
+                    "is_test": rel.as_posix().startswith("tests/") or path.name.startswith("test_"),
+                    "is_entry": path.name in {"main.py", "app.py", "index.html", "package.json", "pubspec.yaml", "requirements.txt"},
+                }
+            )
+        return {
+            "workspace": workspace,
+            "file_count": len(index),
+            "files": index,
+            "hash": hashlib.sha256(
+                "\n".join(f"{item['rel_text']}:{item['hash']}" for item in index).encode("utf-8", errors="ignore")
+            ).hexdigest()[:16],
+        }
+
+    def score_workspace_file_for_task(self, command, file_info, terms=None):
+        normalized = self.normalize_plain_text(command or "")
+        terms = terms or self.local_training_query_terms(command)
+        rel_text = file_info.get("rel_text", "")
+        rel_key = self.normalize_plain_text(rel_text.replace("/", " "))
+        suffix = file_info.get("suffix", "")
+        score = 0
+        reasons = []
+
+        if rel_text.lower() in {path.lower().replace("\\", "/") for path in self.extract_mentioned_file_paths(command)}:
+            score += 120
+            reasons.append("mencionado explicitamente")
+        for term in terms:
+            if term in rel_key:
+                score += 18
+                reasons.append(f"nome contem {term}")
+            count = file_info.get("terms", Counter()).get(term, 0)
+            if count:
+                score += min(24, 4 + count)
+                reasons.append(f"conteudo contem {term}")
+            if any(term in self.normalize_plain_text(symbol) for symbol in file_info.get("symbols", [])):
+                score += 16
+                reasons.append(f"simbolo contem {term}")
+
+        if file_info.get("is_entry"):
+            score += 10
+            reasons.append("arquivo de entrada/configuracao")
+        if file_info.get("is_test") and any(term in normalized for term in ("teste", "test", "validar", "falha", "erro")):
+            score += 14
+            reasons.append("teste relacionado")
+        if suffix == ".py" and any(term in normalized for term in ("python", "classe", "funcao", "erro", "corrigir")):
+            score += 6
+        if suffix in {".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".dart"} and any(
+            term in normalized for term in ("tela", "layout", "visual", "interface", "mobile", "botao")
+        ):
+            score += 8
+        if file_info.get("size", 0) > 180000:
+            score -= 8
+            reasons.append("arquivo grande")
+
+        return score, reasons[:5]
+
+    def rank_workspace_files_for_task(self, command, paths=None, limit=12):
+        workspace = Path(self.current_workspace).resolve()
+        terms = self.local_training_query_terms(command)
+        if paths is None:
+            index = self.build_workspace_development_index(max_files=700)
+            items = index["files"]
+        else:
+            items = []
+            for path in paths:
+                path = Path(path)
+                try:
+                    rel = path.resolve().relative_to(workspace)
+                except ValueError:
+                    continue
+                items.append(
+                    {
+                        "path": path,
+                        "rel": rel,
+                        "rel_text": rel.as_posix(),
+                        "suffix": path.suffix.lower(),
+                        "size": path.stat().st_size if path.exists() else 0,
+                        "symbols": [],
+                        "terms": self.workspace_file_terms(path, rel),
+                        "is_test": rel.as_posix().startswith("tests/") or path.name.startswith("test_"),
+                        "is_entry": path.name in {"main.py", "app.py", "index.html", "package.json", "pubspec.yaml", "requirements.txt"},
+                    }
+                )
+        ranked = []
+        for item in items:
+            score, reasons = self.score_workspace_file_for_task(command, item, terms=terms)
+            if score > 0 or item.get("is_entry"):
+                enriched = dict(item)
+                enriched["score"] = score
+                enriched["reasons"] = reasons
+                ranked.append(enriched)
+        ranked.sort(key=lambda item: (-item.get("score", 0), item.get("rel_text", "")))
+        return ranked[:limit]
+
+    def format_ranked_workspace_files_for_agent(self, command, limit=8):
+        ranked = self.rank_workspace_files_for_task(command, limit=limit)
+        if not ranked:
+            return "- Nenhum arquivo ranqueado por sinais da tarefa."
+        lines = []
+        for item in ranked[:limit]:
+            reasons = ", ".join(item.get("reasons") or ["sinal estrutural"])
+            lines.append(f"- {item['rel_text']} (score {item['score']}; {reasons})")
+        return "\n".join(lines)
+
+    def validation_command_for_changed_paths(self, changed_paths=None, objective=None):
+        workspace = Path(self.current_workspace).resolve()
+        paths = []
+        for raw in changed_paths or []:
+            try:
+                path = self.resolve_workspace_path(raw) if hasattr(self, "resolve_workspace_path") else (workspace / raw).resolve()
+            except Exception:
+                continue
+            try:
+                path.relative_to(workspace)
+            except ValueError:
+                continue
+            paths.append(path)
+
+        suffixes = {path.suffix.lower() for path in paths}
+        if suffixes and suffixes <= {".md", ".txt"}:
+            return ""
+        if any(suffix in suffixes for suffix in {".py", ".json", ".toml", ".yaml", ".yml", ".cmd"}):
+            py_targets = []
+            for path in paths:
+                if path.suffix.lower() == ".py" and path.exists():
+                    try:
+                        py_targets.append(path.relative_to(workspace).as_posix())
+                    except ValueError:
+                        pass
+            if py_targets:
+                quoted = " ".join(f'"{target}"' for target in py_targets[:10])
+                return f'"{sys.executable}" -m compileall -q {quoted}'
+        if any(suffix in suffixes for suffix in {".js", ".jsx", ".ts", ".tsx", ".css", ".html"}):
+            package_json = workspace / "package.json"
+            if package_json.exists():
+                try:
+                    package = json.loads(package_json.read_text(encoding="utf-8", errors="replace"))
+                    scripts = package.get("scripts", {}) if isinstance(package, dict) else {}
+                    if "test" in scripts:
+                        return "npm test"
+                    if "build" in scripts:
+                        return "npm run build"
+                except (OSError, json.JSONDecodeError):
+                    pass
+            if (workspace / "index.html").exists():
+                return self.static_html_validation_command("index.html")
+        return self.validation_command_for_smart_intent(self.classify_smart_task_intent(objective or "validar"))
+
+    def static_html_validation_command(self, relative_path="index.html"):
+        safe_path = str(relative_path).replace('"', "")
+        check = (
+            "from pathlib import Path; import sys; "
+            f"s=Path({safe_path!r}).read_text(encoding='utf-8',errors='replace').lower(); "
+            "need=('html','body'); bad=[x for x in need if x not in s]; "
+            "print('HTML static validation OK' if not bad else 'HTML static validation FAILED: '+', '.join(bad)); "
+            "sys.exit(0 if not bad else 1)"
+        )
+        return f'"{sys.executable}" -c "{check}"'
+
+    def classify_validation_failure(self, output):
+        text = self.normalize_plain_text(output or "")
+        patterns = (
+            ("SyntaxError", ("syntaxerror", "invalid syntax", "codigo python invalido")),
+            ("IndentationError", ("indentationerror", "unexpected indent", "unindent", "tabs")),
+            ("ImportMissing", ("modulenotfounderror", "no module named", "cannot find module")),
+            ("DependencyMissing", ("npm err", "command not found", "nao e reconhecido", "is not recognized")),
+            ("TestFailure", ("failed", "failure", "assertionerror", "traceback")),
+            ("Timeout", ("timeout", "tempo esgotado")),
+            ("VisualFailure", ("screenshot", "visual", "canvas", "elemento", "viewport")),
+        )
+        for label, markers in patterns:
+            if any(marker in text for marker in markers):
+                return label
+        return "UnknownFailure" if text else "NoOutput"
+
+    def build_development_quality_report(self, max_files=700):
+        index = self.build_workspace_development_index(max_files=max_files)
+        files = index["files"]
+        suffix_counts = Counter(item["suffix"] or "[sem extensao]" for item in files)
+        large_files = [item for item in files if item["size"] > 180000]
+        todo_hits = []
+        secret_hits = []
+        for item in files:
+            try:
+                text = item["path"].read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if re.search(r"\b(TODO|FIXME|XXX)\b", text, re.IGNORECASE):
+                todo_hits.append(item["rel_text"])
+            if re.search(r"(api[_-]?key|secret|token|password)\s*[:=]", text, re.IGNORECASE):
+                secret_hits.append(item["rel_text"])
+        validation = self.autonomous_discovery_validation_command()
+        return (
+            "RELATORIO DE QUALIDADE DE DESENVOLVIMENTO:\n"
+            f"- Arquivos indexados: {index['file_count']}\n"
+            f"- Assinatura do indice: {index['hash']}\n"
+            f"- Extensoes principais: "
+            + ", ".join(f"{suffix}: {count}" for suffix, count in suffix_counts.most_common(8))
+            + f"\n- Validacao base sugerida: {validation or 'sem comando automatico'}\n"
+            f"- Arquivos grandes: {len(large_files)}"
+            + (f" ({', '.join(item['rel_text'] for item in large_files[:5])})" if large_files else "")
+            + f"\n- Pendencias TODO/FIXME: {len(todo_hits)}"
+            + (f" ({', '.join(todo_hits[:5])})" if todo_hits else "")
+            + f"\n- Possiveis segredos em texto: {len(secret_hits)}"
+            + (f" ({', '.join(secret_hits[:5])})" if secret_hits else "")
+        )
 
     def classify_smart_task_intent(self, command):
         normalized = self.normalize_plain_text(command or "")
@@ -1388,6 +1654,34 @@ class WorkspaceIntelligenceMixin:
             return "python -m http.server 8000"
         return ""
 
+    def smart_creation_blueprint(self, objective, kind):
+        """Retorna uma estrutura inicial pequena para pedidos de criação de sistemas.
+
+        O texto vai para o contexto do agente; não cria arquivos por conta própria.
+        Assim o modelo escolhe uma base coerente sem perder liberdade para adaptar a
+        arquitetura ao pedido real do usuário.
+        """
+        normalized = self.normalize_plain_text(objective or "")
+        if kind == "flutter" or any(term in normalized for term in ("flutter", "android", "ios")):
+            return (
+                "- Base sugerida: `lib/main.dart`, telas em `lib/features/`, componentes em `lib/widgets/` e testes em `test/`.\n"
+                "- Entregue primeiro um fluxo navegável com estado mínimo; depois integre APIs, autenticação ou persistência solicitadas."
+            )
+        if kind in {"html", "node"} or any(term in normalized for term in ("site", "landing", "dashboard", "web", "frontend")):
+            return (
+                "- Base sugerida: ponto de entrada da interface, estilos separados, scripts separados e `README.md` com como executar.\n"
+                "- Para Node, preserve/atualize `package.json`; para HTML estático, inclua uma página funcional antes de refinamentos visuais."
+            )
+        if kind == "python" or any(term in normalized for term in ("python", "api", "backend", "automacao", "desktop")):
+            return (
+                "- Base sugerida: `main.py` como entrada, módulos por responsabilidade, `requirements.txt` somente quando houver dependências e `tests/` para o fluxo central.\n"
+                "- Comece pelo caminho principal utilizável e isole integrações externas atrás de configuração."
+            )
+        return (
+            "- Identifique a stack mais simples compatível com o pedido e crie somente os arquivos iniciais necessários.\n"
+            "- Inclua um ponto de entrada, uma primeira funcionalidade utilizável, instruções de execução e validação adequada à stack."
+        )
+
     def build_smart_task_brief(self, command, objective=None, max_files=8):
         objective = objective or command or ""
         normalized = self.normalize_plain_text(objective)
@@ -1407,6 +1701,7 @@ class WorkspaceIntelligenceMixin:
             suffixes=suffixes_by_intent.get(intent, {".py", ".js", ".html", ".md", ".json"}),
             limit=max_files,
         )
+        ranked_context = self.format_ranked_workspace_files_for_agent(objective, limit=max_files)
         file_lines = []
         for path in candidate_files[:max_files]:
             try:
@@ -1418,7 +1713,7 @@ class WorkspaceIntelligenceMixin:
             key_files = self.local_key_files(list(self.iter_workspace_files(limit=300)), limit=max_files)
             file_lines = key_files.splitlines() if key_files else ["- Nenhum arquivo candidato detectado."]
 
-        validation = self.validation_command_for_smart_intent(intent)
+        validation = self.validation_command_for_changed_paths(candidate_files, objective) if candidate_files else self.validation_command_for_smart_intent(intent)
         risk_notes = []
         if intent in {"corrigir", "implementar"}:
             risk_notes.append("Leia o trecho exato antes de alterar e prefira patch pequeno.")
@@ -1442,6 +1737,11 @@ class WorkspaceIntelligenceMixin:
             "responder": "Responder diretamente se nao houver necessidade de editar ou executar.",
         }.get(intent, "Avancar com a menor acao verificavel.")
 
+        creation_blueprint = ""
+        creation_terms = {"criar", "crie", "novo", "nova", "sistema", "app", "aplicativo", "site", "jogo"}
+        if intent == "implementar" and bool(set(re.findall(r"[a-z0-9_]+", normalized)) & creation_terms):
+            creation_blueprint = "\nRoteiro para criar sistema:\n" + self.smart_creation_blueprint(objective, kind)
+
         return (
             "BRIEFING INTELIGENTE DA IDE:\n"
             f"- Intencao detectada: {intent}\n"
@@ -1450,8 +1750,11 @@ class WorkspaceIntelligenceMixin:
             f"- Validacao sugerida: {validation or 'sem comando automatico; conclua em texto ou escolha validacao pontual'}\n"
             "Arquivos candidatos:\n"
             + "\n".join(file_lines[:max_files])
+            + "\nRanking por sinais:\n"
+            + ranked_context
             + "\nRiscos e cuidados:\n"
             + "\n".join(f"- {note}" for note in risk_notes)
+            + creation_blueprint
         )
 
     def extract_mentioned_file_paths(self, text):
@@ -1932,6 +2235,8 @@ class WorkspaceIntelligenceMixin:
             f"{summary}\n\n"
             "Arquivos-chave do projeto:\n"
             f"{key_files}\n\n"
+            "Ranking inteligente para a missao atual:\n"
+            f"{self.format_ranked_workspace_files_for_agent(getattr(self, 'active_ai_objective', '') or '', limit=8)}\n\n"
             "Manifesto compacto do projeto:\n"
             f"{manifest}\n\n"
             "Subprojetos detectados:\n"
@@ -1940,6 +2245,8 @@ class WorkspaceIntelligenceMixin:
             f"{self.format_recent_changes_for_agent(limit=10)}\n\n"
             "Sub-rede de memoria do projeto:\n"
             f"{memory_subnet}\n\n"
+            "Qualidade de desenvolvimento:\n"
+            f"{self.build_development_quality_report(max_files=500)}\n\n"
             "Direcionamento de trabalho:\n"
             + "\n".join(run_hints)
             + "\n- Entenda o projeto como um todo antes de editar, mas nao repita leitura do mesmo arquivo em loop.\n"

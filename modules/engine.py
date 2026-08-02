@@ -490,17 +490,14 @@ class UniversalEngine:
             model = f"{model}/{self.codex_reasoning_effort}"
         prefix = f"{self.provider.upper()} {model}"
 
-        if self.latest_quota_problem:
-            return f"{prefix} | {self.latest_quota_problem}"
-
         rate_text = self._format_rate_limit_status(self.latest_rate_limits)
         token_text = self._format_token_usage_status(self.latest_token_usage)
-        if rate_text and token_text:
-            return f"{prefix} | {rate_text} | {token_text}"
-        if rate_text:
-            return f"{prefix} | {rate_text}"
-        if token_text:
-            return f"{prefix} | {token_text}"
+        problem_text = str(self.latest_quota_problem or "").strip()
+        status_parts = [part for part in (rate_text, token_text) if part]
+        if problem_text:
+            status_parts.append(problem_text)
+        if status_parts:
+            return f"{prefix} | " + " | ".join(status_parts)
         return f"{prefix} | uso aguardando"
 
     def _remember_rate_limits(self, payload):
@@ -633,8 +630,14 @@ class UniversalEngine:
         if isinstance(credits, dict):
             if credits.get("unlimited"):
                 pieces.append("creditos ilimitados")
-            elif credits.get("balance"):
-                pieces.append(f"creditos {credits.get('balance')}")
+            else:
+                balance = credits.get("balance")
+                try:
+                    has_positive_balance = float(balance) > 0
+                except (TypeError, ValueError):
+                    has_positive_balance = bool(balance)
+                if has_positive_balance:
+                    pieces.append(f"creditos {balance}")
         return " | ".join(pieces)
 
     def _format_token_usage_status(self, token_usage):
@@ -839,6 +842,8 @@ Regras:
 - REGRA PYTHON: após def, class, if, for, while, try, except, with ou match, preserve o bloco indentado.
 - REGRA PYTHON: se receber IndentationError, TabError ou SyntaxError, leia o arquivo indicado e corrija a estrutura; não repita o comando.
 - Se estiver criando um app novo, escreva os arquivos diretamente; nao peca confirmacao.
+- CRIACAO DE SISTEMAS: quando o usuario pedir um sistema, app, site, API ou jogo novo, transforme o pedido em uma primeira versao utilizavel. Escolha a stack mais simples compativel com o workspace e o pedido, crie um ponto de entrada, separe responsabilidades sem arquitetura excessiva, inclua instrucoes de execucao e valide o fluxo central. Nao bloqueie por detalhes secundarios: implemente defaults seguros e informe-os no encerramento. Antes de integrar servicos externos, deixe configuracao por ambiente e um fallback local funcional quando possivel.
+- EVOLUCAO INCREMENTAL: entregue primeiro o caminho principal completo (interface/entrada, acao central, persistencia simulada ou real quando solicitada e feedback de erro), depois refine recursos adicionais. Se o pedido mencionar login, pagamentos, IA, banco ou API externa, mantenha segredos fora do codigo e implemente a integracao somente com credenciais/configuracao fornecidas; caso contrario, prepare a interface e um modo demonstracao local.
 - Seja objetivo. Evite introducao longa.
 """
 
@@ -1087,6 +1092,14 @@ Regras essenciais:
                 stream_callback=stream_callback,
                 workspace_path=workspace_path,
             )
+
+        # Os provedores diretos desta integração só recebem imagens. Arquivos
+        # arbitrários seguem como File real pelo Chat Web, sem serem forçados
+        # através de APIs visuais incompatíveis.
+        if image_path and Path(image_path).suffix.lower() not in {
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff"
+        }:
+            image_path = None
 
         if provider == "local_gguf":
             return self._generate_local_gguf_solution(

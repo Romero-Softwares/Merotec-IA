@@ -37,6 +37,26 @@ class EditorInteractionTests(unittest.TestCase):
         self.assertIn("wrap=\"none\"", source)
         self.assertNotIn("show_editor_completion(event, name)", source)
 
+    def test_tab_change_schedules_layout_refresh(self):
+        source = inspect.getsource(UniversalApp._on_main_tab_changed)
+        self.assertIn("after_idle(self._refresh_active_tab_layout)", source)
+        self.assertIn("self.after(40, self._refresh_active_tab_layout)", source)
+
+    def test_live_status_uses_accumulated_action_and_specific_execution_text(self):
+        activity = []
+        app = SimpleNamespace(
+            normalize_plain_text=lambda text: text.lower(),
+            set_ai_activity=activity.append,
+            ai_assistant_display_name=lambda: "Codex",
+        )
+
+        UniversalApp.update_ai_activity_from_stream(
+            app,
+            "[READ: main.py]\n[EXECUTE: python -m unittest]",
+        )
+
+        self.assertEqual(activity, ["Codex executando validacao"])
+
 
 if __name__ == "__main__":
     unittest.main()

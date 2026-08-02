@@ -65,9 +65,57 @@ class SmartTaskBriefTest(unittest.TestCase):
             self.assertIn("Intencao detectada: corrigir", brief)
             self.assertIn("modules/engine.py", brief)
             self.assertIn("-m compileall", brief)
-            self.assertIn("-q main.py modules", brief)
+            self.assertIn('"modules/engine.py"', brief)
             self.assertIn("venv", brief)
             self.assertIn("Leia o trecho exato", brief)
+            self.assertIn("Ranking por sinais", brief)
+
+    def test_workspace_file_ranking_uses_task_terms_symbols_and_entry_signals(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            (workspace / "main.py").write_text("print('ok')\n", encoding="utf-8")
+            (workspace / "orders.py").write_text(
+                "class OrderService:\n    def calculate_total(self):\n        return 1\n",
+                encoding="utf-8",
+            )
+            (workspace / "notes.md").write_text("# unrelated\n", encoding="utf-8")
+            app = DummySmartWorkspace(workspace)
+
+            ranked = app.rank_workspace_files_for_task("corrija calculate_total no OrderService")
+
+            self.assertEqual("orders.py", ranked[0]["rel_text"])
+            self.assertGreater(ranked[0]["score"], 0)
+            self.assertTrue(ranked[0]["reasons"])
+
+    def test_validation_command_for_changed_python_path_is_targeted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            (workspace / "main.py").write_text("print('ok')\n", encoding="utf-8")
+            (workspace / "feature.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+            app = DummySmartWorkspace(workspace)
+
+            command = app.validation_command_for_changed_paths(["feature.py"], "corrija feature")
+
+            self.assertIn("-m compileall -q", command)
+            self.assertIn('"feature.py"', command)
+            self.assertNotIn('"main.py"', command)
+
+    def test_quality_report_and_failure_classifier_are_available(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            (workspace / "main.py").write_text("# TODO revisar\nprint('ok')\n", encoding="utf-8")
+            (workspace / "requirements.txt").write_text("customtkinter\n", encoding="utf-8")
+            app = DummySmartWorkspace(workspace)
+
+            report = app.build_development_quality_report()
+
+            self.assertIn("RELATORIO DE QUALIDADE DE DESENVOLVIMENTO", report)
+            self.assertIn("Arquivos indexados", report)
+            self.assertIn("Pendencias TODO/FIXME: 1", report)
+            self.assertEqual("ImportMissing", app.classify_validation_failure("ModuleNotFoundError: No module named 'x'"))
+
+            reply = app.local_autonomous_task("verifique a saude de desenvolvimento do projeto")
+            self.assertIn("RELATORIO DE QUALIDADE DE DESENVOLVIMENTO", reply)
 
     def test_smart_brief_distinguishes_flutter_dart_and_flet(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -110,6 +158,17 @@ class SmartTaskBriefTest(unittest.TestCase):
 
             self.assertEqual("flet", flet_app.detect_run_kind(flet_workspace))
             self.assertIn("Tipo detectado: Flet/Python", flet_app.local_project_summary())
+
+    def test_new_system_brief_includes_a_usable_creation_blueprint(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            app = DummySmartWorkspace(workspace)
+
+            brief = app.build_smart_task_brief("crie um sistema web para agendamento")
+
+            self.assertIn("Roteiro para criar sistema", brief)
+            self.assertIn("página funcional", brief)
+            self.assertIn("README.md", brief)
 
     def test_capability_question_replies_without_starting_execution(self):
         with tempfile.TemporaryDirectory() as temp_dir:

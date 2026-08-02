@@ -1,6 +1,6 @@
 # Merotec IA IDE
 
-Projeto Python desktop com interface em CustomTkinter para automacao assistida por IA,
+Projeto Python desktop com interface em PySide6 para automacao assistida por IA,
 gerenciamento de projetos, execucao de comandos, navegador interno e recursos de voz.
 
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/3d1391d1-e5d6-4e6d-af41-9fe28b041629" />
@@ -73,6 +73,7 @@ O workflow `.github/workflows/ci.yml` executa essa mesma validacao no GitHub Act
 ## Estrutura
 
 - `main.py`: entrada principal da IDE, composicao da UI e integracao dos mixins.
+- `pyside_app.py`: interface PySide6 principal. Para abrir a interface legada temporariamente, use `python main.py --legacy-tk`.
 - `modules/`: modulos de configuracao, motor, acoes de agente, memoria, executor, projetos, plugins e voz.
 - `tests/`: suite de regressao e qualidade do repositorio.
 - `docs/architecture.md`: visao da arquitetura, fluxo de IA, validacao, plugins, navegador e seguranca.

@@ -2,16 +2,17 @@
 
 ## Visao geral
 
-A Merotec IA IDE e uma aplicacao desktop Python com CustomTkinter. O arquivo `main.py`
-continua sendo a entrada da interface, mas o comportamento principal esta distribuido
+A Merotec IA IDE e uma aplicacao desktop Python com PySide6. O arquivo `main.py`
+continua sendo a entrada da interface e inicia `pyside_app.py`; o comportamento principal esta distribuido
 em mixins e modulos especializados em `modules/`.
 
 Os pontos centrais sao:
 
-- `main.py`: cria a janela, menus, abas, editor, terminal, navegador interno e integra os mixins.
+- `main.py`: entrada e compatibilidade da interface legada por `--legacy-tk`.
+- `pyside_app.py`: janela PySide6, menus, abas, editor, terminal, navegador interno e integrações Qt.
 - `modules/engine.py`: conversa com provedores de IA, Codex, modelos locais, OpenAI, Google e fallback externo.
 - `modules/agent_actions.py`: interpreta acoes retornadas pela IA, aplica edicoes, executa comandos e valida entregas.
-- `modules/workspace_intelligence.py`: cria briefing do workspace, resumo local, descoberta de stack e contexto de memoria.
+- `modules/workspace_intelligence.py`: cria briefing do workspace, resumo local, descoberta de stack, contexto de memoria, indice de desenvolvimento, ranking de arquivos e relatorio de qualidade.
 - `modules/ai_config.py`: controla perfis de IA, status, login do Codex e configuracoes visuais.
 - `modules/app_state.py`: persiste preferencias, historico de mudancas e restauracao de workspace.
 - `modules/plugin_manager.py`: carrega plugins instalados por entry point e publica capacidades para a aplicacao.
@@ -32,7 +33,9 @@ ou teste no navegador.
 Comandos sao executados pelo executor controlado da IDE. Alteracoes de codigo passam por
 validacao transacional antes de serem aceitas. Para Python, os comandos padrao evitam
 varrer `.git`, `venv`, caches e artefatos locais; quando o projeto tem `main.py`,
-`modules` ou `tests`, a validacao automatica usa esses alvos diretamente.
+`modules` ou `tests`, a validacao automatica usa esses alvos diretamente. Quando a
+IDE sabe quais arquivos mudaram, ela prefere comandos menores por impacto, como
+`compileall` no arquivo Python alterado, antes de cair para a validacao geral.
 
 A validacao continua esta em `.github/workflows/ci.yml`:
 
@@ -60,6 +63,17 @@ A pasta `.merotec_system_ai` guarda artefatos locais da sub-rede de memoria/RAG.
 serve como contexto offline e fallback extrativo quando um motor externo nao responde,
 mas nao substitui sozinha um LLM generativo. O modulo `modules/workspace_intelligence.py`
 resume essa memoria e injeta os trechos mais relevantes na missao.
+
+## Inteligencia de desenvolvimento
+
+O briefing inteligente combina intencao do pedido, tipo de projeto, arquivos candidatos
+e ranking por sinais. O ranking considera caminho mencionado, termos no conteudo,
+simbolos extraidos do arquivo, arquivos de entrada/configuracao e testes relacionados.
+
+A IDE tambem expoe um relatorio local de qualidade com assinatura do indice, extensoes
+principais, validacao base, arquivos grandes, TODO/FIXME e possiveis segredos em texto.
+Falhas de validacao sao classificadas em categorias como sintaxe, indentacao, dependencia,
+import ausente, teste, timeout ou visual para orientar o ciclo autonomo de reparo.
 
 ## Dependencias opcionais
 

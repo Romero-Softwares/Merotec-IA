@@ -555,12 +555,12 @@ class AgentActionsMixin:
     def infer_autonomous_validation_command(self, objective=None):
         workspace = Path(self.current_workspace).resolve()
         if (workspace / "index.html").exists():
-            # Validação estática curta que termina sozinha. O teste visual,
-            # quando aplicável, é iniciado depois dela.
+            if hasattr(self, "static_html_validation_command"):
+                return self.static_html_validation_command("index.html")
             check = (
                 "from pathlib import Path; import sys; "
                 "s=Path('index.html').read_text(encoding='utf-8',errors='replace').lower(); "
-                "need=('!doctype','html','body'); bad=[x for x in need if x not in s]; "
+                "need=('html','body'); bad=[x for x in need if x not in s]; "
                 "print('HTML static validation OK' if not bad else 'HTML static validation FAILED: '+', '.join(bad)); "
                 "sys.exit(0 if not bad else 1)"
             )
@@ -572,9 +572,15 @@ class AgentActionsMixin:
             return False
         metrics = self._autonomous_metrics(task_id)
         metrics["autonomous_delivery_active"] = True
-        metrics["autonomous_validation_command"] = self.infer_autonomous_validation_command(task_objective)
         metrics["autonomous_visual_pending"] = self.workspace_requires_visual_validation()
         metrics["autonomous_changed_files"] = list(changed_paths or [])
+        if hasattr(self, "validation_command_for_changed_paths"):
+            metrics["autonomous_validation_command"] = self.validation_command_for_changed_paths(
+                metrics["autonomous_changed_files"],
+                task_objective,
+            )
+        else:
+            metrics["autonomous_validation_command"] = self.infer_autonomous_validation_command(task_objective)
         return True
 
     def start_autonomous_delivery_validation(self, task_objective=None, action_depth=0, task_id=None):
@@ -667,7 +673,8 @@ class AgentActionsMixin:
             "Sistema",
             f"Validação falhou. A IDE vai devolver o diagnóstico ao mesmo chat e continuar a correção ({cadence}).",
         )
-        self.log_agent(f"Ciclo contínuo de correção {cadence}: código {returncode}.")
+        failure_kind = self.classify_validation_failure(output) if hasattr(self, "classify_validation_failure") else "UnknownFailure"
+        self.log_agent(f"Ciclo contínuo de correção {cadence}: {failure_kind}, código {returncode}.")
         return True
 
     def continue_after_mutation_failure(

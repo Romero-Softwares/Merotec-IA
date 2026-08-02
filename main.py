@@ -1,6 +1,7 @@
 import json
 import keyword
 import locale
+import mimetypes
 import os
 import re
 import shutil
@@ -23,6 +24,13 @@ from collections import Counter
 from datetime import datetime
 from decimal import Decimal, DivisionByZero, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
+
+
+# O processo normal da IDE nao carrega Tk/CustomTkinter. O modulo legado so e
+# importado quando a compatibilidade e solicitada explicitamente.
+if __name__ == "__main__" and "--legacy-tk" not in sys.argv:
+    from pyside_app import run as _run_pyside
+    sys.exit(_run_pyside())
 
 
 def _bootstrap_tcl_paths():
@@ -81,7 +89,7 @@ import pygments
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
-from PIL import Image, ImageGrab
+from PIL import Image, ImageGrab, ImageTk
 from pygments.lexers import get_lexer_for_filename
 from pygments.styles import get_style_by_name
 from pygments.util import ClassNotFound
@@ -118,6 +126,7 @@ from modules.ui_web_chat_bridge import InternalBrowserWebChatBridge
 
 
 BASE_MAIN_WINDOW_TITLE = f"{APP_NAME} - IA Engineering Workspace"
+IMAGE_FILE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tif", ".tiff"}
 
 
 def _truthy_env(name):
@@ -230,6 +239,8 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.cancelled_task_ids = set()
         self.codex_setup_started = False
         self.codex_login_started = False
+        self.pending_attachment_paths = []
+        self.pending_attachment_path = None
         self.pending_image_path = None
         self.pending_image_preview = None
         self.voice_capture_active = False
@@ -245,8 +256,8 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.active_terminal_processes = {}
         self.active_process_lock = threading.Lock()
         self.explorer_visible = True
-        self.sidebar_width = 228
-        self.explorer_width = 270
+        self.sidebar_width = 64
+        self.explorer_width = 352
         self.explorer_refresh_job = None
         self.editor_font_size = 14
         self.editor_tab_spaces = 4
@@ -461,52 +472,82 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
     def _build_visual_menu_bar(self):
         self.visual_menu_bar = ctk.CTkFrame(
             self,
-            height=30,
+            height=96,
             fg_color=THEME["menu_bottom"],
             border_color=THEME["menu_border"],
             border_width=1,
             corner_radius=0,
         )
-        self.visual_menu_bar.grid(row=0, column=0, columnspan=3, sticky="ew")
-        self.visual_menu_bar.grid_columnconfigure(4, weight=1)
-
-        menu_items = [
-            ("Arquivo", 0),
-            ("Visualizar", 1),
-            ("Editor", 2),
-            ("IA", 3),
-        ]
-        for label, index in menu_items:
-            button = ctk.CTkButton(
-                self.visual_menu_bar,
-                text=label,
-                width=82,
-                height=22,
-                fg_color=THEME["menu_top"],
-                hover_color=THEME["menu_active"],
-                border_color=THEME["menu_border"],
-                border_width=1,
-                corner_radius=5,
-                text_color=THEME["text"],
-                font=("Segoe UI", 11, "bold"),
-                command=lambda menu_index=index: self._show_visual_menu(menu_index),
-            )
-            button.grid(row=0, column=index, padx=(8 if index == 0 else 3, 3), pady=3)
+        self.visual_menu_bar.grid(row=0, column=0, columnspan=4, sticky="ew")
+        self.visual_menu_bar.grid_columnconfigure(5, weight=1)
 
         ctk.CTkLabel(
             self.visual_menu_bar,
-            text="Merotec IA",
+            text="Merotec IA IDE",
+            text_color="#f0f4fa",
+            font=("Segoe UI", 17, "bold"),
+            height=28,
+        ).grid(row=0, column=0, columnspan=7, sticky="w", padx=26, pady=(10, 2))
+
+        separator = ctk.CTkFrame(self.visual_menu_bar, height=1, fg_color=THEME["menu_border"], corner_radius=0)
+        separator.grid(row=1, column=0, columnspan=7, sticky="ew", pady=(3, 0))
+
+        menu_items = [
+            ("Arquivo", 1),
+            ("Visualizar", 2),
+            ("Editor", 3),
+            ("IA", 4),
+        ]
+        for menu_index, (label, column) in enumerate(menu_items):
+            button = ctk.CTkButton(
+                self.visual_menu_bar,
+                text=label,
+                width=72,
+                height=28,
+                fg_color="transparent",
+                hover_color=THEME["menu_active"],
+                border_width=0,
+                corner_radius=4,
+                text_color=THEME["text"],
+                font=("Segoe UI", 12),
+                command=lambda index=menu_index: self._show_visual_menu(index),
+            )
+            button.grid(row=2, column=column, padx=2, pady=8)
+
+        ctk.CTkLabel(
+            self.visual_menu_bar,
+            text="◌  Agente pronto",
             text_color=THEME["muted"],
-            font=("Segoe UI", 10),
+            font=("Segoe UI", 11),
             height=18,
-        ).grid(row=0, column=4, sticky="e", padx=(8, 14), pady=(4, 5))
+        ).grid(row=2, column=5, sticky="e", padx=(8, 6), pady=8)
+
+        quick_actions = ctk.CTkFrame(self.visual_menu_bar, fg_color="transparent")
+        quick_actions.grid(row=2, column=6, sticky="e", padx=(4, 16), pady=6)
+        for column, (text, command, width, accent) in enumerate((
+            ("+ Projeto", self.create_new_project, 82, False),
+            ("Salvar", self.save_current_tab, 62, False),
+            ("Executar", self.run_current_python_file, 76, True),
+        )):
+            button = self._elevated_button(
+                quick_actions,
+                text=text,
+                width=width,
+                height=28,
+                command=self._safe_ui_command(text, command),
+                font=("Segoe UI", 11, "bold"),
+                fg_color=THEME["accent_dark"] if accent else THEME["button_top"],
+                hover_color=THEME["accent"] if accent else THEME["panel_soft"],
+                text_color="#06111d" if accent else THEME["button_text"],
+            )
+            button.elevation_shadow.grid(row=0, column=column, padx=3)
 
     def _show_visual_menu(self, index, widget=None):
         menus = getattr(self, "visual_menus", [])
         if index >= len(menus):
             return
         if widget is None:
-            widget = self.visual_menu_bar.grid_slaves(row=0, column=index)[0]
+            widget = self.visual_menu_bar.grid_slaves(row=2, column=index + 1)[0]
         x = widget.winfo_rootx()
         y = widget.winfo_rooty() + widget.winfo_height()
         menu = menus[index]
@@ -563,7 +604,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
         defaults = {
             "fg_color": THEME["button_top"],
-            "hover_color": "#343c4b",
+            "hover_color": THEME["panel_soft"],
             "border_color": THEME["border_lift"],
             "border_width": 1,
             "corner_radius": 7,
@@ -589,7 +630,8 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.grid_columnconfigure(0, minsize=self.sidebar_width)
         self.grid_columnconfigure(1, minsize=self.explorer_width)
         self.grid_columnconfigure(2, weight=1)
-        self.grid_rowconfigure(0, minsize=38)
+        self.grid_columnconfigure(3, minsize=390)
+        self.grid_rowconfigure(0, minsize=96)
         self.grid_rowconfigure(1, weight=1)
         self.grid_rowconfigure(2, minsize=96)
         self.grid_rowconfigure(3, minsize=30)
@@ -603,9 +645,9 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
     def _build_sidebar(self):
         self.sidebar = ctk.CTkFrame(
             self,
-            width=228,
+            width=self.sidebar_width,
             fg_color=THEME["panel"],
-            border_color="#173a5c",
+            border_color=THEME["border"],
             border_width=1,
             corner_radius=0,
         )
@@ -625,6 +667,13 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             font=("Segoe UI", 11),
             text_color=THEME["muted"],
         ).grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 18))
+
+        ctk.CTkFrame(
+            self.sidebar,
+            height=2,
+            fg_color=THEME["accent_dark"],
+            corner_radius=1,
+        ).grid(row=2, column=0, sticky="ew", padx=22, pady=(0, 10))
 
         self.workspace_label = ctk.CTkLabel(
             self.sidebar,
@@ -646,6 +695,9 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         )
         self.ai_status_label.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 12))
 
+        # Mantém os comandos existentes, mas os apresenta como um trilho de
+        # atividades compacto, no estilo de um workbench de código.
+        activity_icons = ("▱", "✦", "↻", "◉")
         buttons = [
             ("Configurações", self.configure_ai),
             ("Entrar Codex", self.launch_codex_login),
@@ -657,13 +709,16 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         for row, (label, command) in enumerate(buttons, start=4):
             button = self._elevated_button(
                 self.sidebar,
-                text=label,
+                text=activity_icons[row - 4],
                 command=self._safe_ui_command(label, command),
-                height=38,
-                anchor="w",
-                font=("Segoe UI", 13, "bold"),
+                width=42,
+                height=42,
+                font=("Segoe UI Symbol", 19),
+                fg_color="transparent",
+                hover_color=THEME["menu_active"],
+                border_width=0,
             )
-            button.elevation_shadow.grid(row=row, column=0, sticky="ew", padx=18, pady=5)
+            button.elevation_shadow.grid(row=row, column=0, padx=11, pady=5)
             self.sidebar_buttons[label] = button
 
         ctk.CTkLabel(
@@ -677,8 +732,22 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         audio.grid(row=11, column=0, sticky="ew", padx=16)
         audio.grid_columnconfigure((0, 1), weight=1)
 
-        listen_button = self._elevated_button(audio, text="Ouvir", width=58, height=32, command=self.play_last_response)
-        stop_button = self._elevated_button(audio, text="Parar", width=58, height=32, command=self.stop_audio_playback)
+        listen_button = self._elevated_button(
+            audio,
+            text="▶",
+            width=58,
+            height=32,
+            command=self.play_last_response,
+            font=("Segoe UI Symbol", 16, "bold"),
+        )
+        stop_button = self._elevated_button(
+            audio,
+            text="■",
+            width=58,
+            height=32,
+            command=self.stop_audio_playback,
+            font=("Segoe UI Symbol", 14, "bold"),
+        )
         listen_button.elevation_shadow.grid(row=0, column=0, sticky="ew", padx=2)
         stop_button.elevation_shadow.grid(row=0, column=1, sticky="ew", padx=2)
 
@@ -696,6 +765,11 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self._style_text_surface(self.agent_summary, THEME["panel_alt"], THEME["muted"])
         self._show_ctk_textbox_scrollbar(self.agent_summary)
         self._replace_text(self.agent_summary, "Ações do agente aparecem aqui.")
+        # O conteúdo detalhado segue acessível pelo Log do Agente. O trilho
+        # lateral usa somente ícones para deixar espaço para o editor.
+        self.workspace_label.grid_remove()
+        self.ai_status_label.grid_remove()
+        self.agent_summary.grid_remove()
 
     def _build_explorer(self):
         self.explorer = ctk.CTkFrame(self, fg_color=THEME["panel_alt"], corner_radius=0)
@@ -705,12 +779,27 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self._configure_explorer_style()
         self._build_file_icons()
 
+        explorer_header = ctk.CTkFrame(self.explorer, fg_color="transparent")
+        explorer_header.grid(row=0, column=0, sticky="ew", padx=12, pady=(14, 6))
+        explorer_header.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(
-            self.explorer,
-            text="EXPLORER",
-            font=("Segoe UI", 12, "bold"),
-            text_color="#687b96",
-        ).grid(row=0, column=0, sticky="w", padx=14, pady=(14, 8))
+            explorer_header,
+            text="Projetos",
+            font=("Segoe UI", 17, "bold"),
+            text_color=THEME["text"],
+        ).grid(row=0, column=0, sticky="w", padx=6, pady=2)
+        add_button = self._elevated_button(
+            explorer_header, text="+", width=30, height=28,
+            command=self._safe_ui_command("Novo projeto", self.create_new_project),
+            font=("Segoe UI", 18, "bold"), fg_color="transparent", hover_color=THEME["menu_active"], border_width=0,
+        )
+        add_button.elevation_shadow.grid(row=0, column=1, padx=2)
+        refresh_button = self._elevated_button(
+            explorer_header, text="↻", width=30, height=28,
+            command=self._safe_ui_command("Atualizar Explorer", self.load_workspace_files),
+            font=("Segoe UI Symbol", 16), fg_color="transparent", hover_color=THEME["menu_active"], border_width=0,
+        )
+        refresh_button.elevation_shadow.grid(row=0, column=2, padx=2)
 
         self.explorer_filter = ctk.CTkEntry(
             self.explorer,
@@ -815,7 +904,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         except (tk.TclError, AttributeError):
             tab_name = "Scratchpad"
         info = self.open_editors.get(tab_name)
-        if info:
+        if info and info.get("widget") is not None:
             return tab_name, info
         if "Scratchpad" in self.open_editors:
             return "Scratchpad", self.open_editors["Scratchpad"]
@@ -1442,10 +1531,10 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 pass
 
         scroll_controls, scroll_bar = self._create_long_press_scroll_controls(
-            self.tab_chat,
+            self.chat_panel,
             canvas.yview,
             scroll_chat,
-            {"row": 0, "column": 1, "sticky": "ns", "padx": (0, 8), "pady": 8},
+            {"row": 1, "column": 1, "sticky": "ns", "padx": (0, 8), "pady": 8},
         )
         self.chat_scroll_controls = scroll_controls
         canvas.configure(yscrollcommand=lambda first, last: scroll_bar.set(first, last))
@@ -1522,6 +1611,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
     def _build_main_tabs(self):
         self.tabview = ctk.CTkTabview(
             self,
+            command=self._on_main_tab_changed,
             fg_color=THEME["panel"],
             text_color=THEME["text"],
             border_width=1,
@@ -1535,21 +1625,30 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.tabview.grid(row=1, column=2, sticky="nsew", padx=12, pady=(12, 8))
         self.tabview._segmented_button.configure(border_width=2)
 
-        self.tab_chat = self.tabview.add("Chat AI")
         self.tab_editor = self.tabview.add("Scratchpad")
         self.tab_terminal = self.tabview.add("Terminal Local")
         self.tab_browser = self.tabview.add("Navegador")
         self.tab_agent_log = self.tabview.add("Log do Agente")
 
-        for tab in (self.tab_chat, self.tab_editor, self.tab_terminal, self.tab_browser, self.tab_agent_log):
+        for tab in (self.tab_editor, self.tab_terminal, self.tab_browser, self.tab_agent_log):
             tab.grid_columnconfigure(0, weight=1)
             tab.grid_rowconfigure(0, weight=1)
 
-        self.chat_history = ctk.CTkScrollableFrame(self.tab_chat, fg_color=THEME["bg"])
-        self.chat_history.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        self.chat_panel = ctk.CTkFrame(self, fg_color=THEME["bg"], border_width=1, border_color=THEME["border"], corner_radius=0)
+        self.chat_panel.grid(row=1, column=3, rowspan=2, sticky="nsew", padx=(0, 12), pady=(12, 8))
+        self.chat_panel.grid_columnconfigure(0, weight=1)
+        self.chat_panel.grid_columnconfigure(1, minsize=34)
+        self.chat_panel.grid_rowconfigure(1, weight=1)
+        chat_header = ctk.CTkFrame(self.chat_panel, fg_color=THEME["panel_alt"], height=48, corner_radius=0)
+        chat_header.grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(chat_header, text="Merotec IA", font=("Segoe UI", 16, "bold"), text_color=THEME["text"]).pack(side="left", padx=18, pady=12)
+        ctk.CTkLabel(chat_header, text="✦", font=("Segoe UI Symbol", 19), text_color=THEME["muted"]).pack(side="right", padx=18)
+        self.chat_history = ctk.CTkScrollableFrame(self.chat_panel, fg_color=THEME["bg"])
+        self.chat_history.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
         self._style_chat_panel_layers()
         self._autohide_ctk_scrollable_frame_scrollbar(self.chat_history)
         self._install_chat_scroll_controls()
+        self._build_chat_welcome_card()
 
         self.code_editor_frame, self.code_editor = self._create_editor(self.tab_editor, "Scratchpad")
         self.code_editor_frame.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
@@ -1630,6 +1729,114 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self._style_text_surface(self.agent_log, THEME["terminal"], "#d7dee9")
         self._show_ctk_textbox_scrollbar(self.agent_log)
         self._replace_text(self.agent_log, "Log iniciado.\n")
+
+    def _build_chat_welcome_card(self):
+        """Apresenta ações iniciais sem alterar o histórico real do agente."""
+        card = ctk.CTkFrame(
+            self.chat_history,
+            fg_color=THEME["panel_alt"],
+            border_width=1,
+            border_color=THEME["border"],
+            corner_radius=10,
+        )
+        card.pack(fill="x", padx=10, pady=(10, 14))
+        card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            card,
+            text="✦  Merotec AI Workspace",
+            font=("Segoe UI", 17, "bold"),
+            text_color=THEME["accent"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 2))
+        ctk.CTkLabel(
+            card,
+            text="Descreva uma missão, envie um print ou escolha uma ação rápida para começar.",
+            font=("Segoe UI", 12),
+            text_color=THEME["muted"],
+            anchor="w",
+        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 12))
+
+        actions = ctk.CTkFrame(card, fg_color="transparent")
+        actions.grid(row=2, column=0, sticky="w", padx=12, pady=(0, 14))
+        suggestions = (
+            ("Analisar projeto", "Analise este projeto e apresente os próximos passos prioritários."),
+            ("Corrigir problema", "Investigue e corrija o problema atual do projeto."),
+            ("Criar recurso", "Implemente uma melhoria visual útil nesta interface."),
+        )
+        for column, (label, prompt) in enumerate(suggestions):
+            button = self._elevated_button(
+                actions,
+                text=label,
+                width=132,
+                height=30,
+                command=lambda value=prompt: self._use_quick_prompt(value),
+                font=("Segoe UI", 11, "bold"),
+                fg_color=THEME["button_top"],
+                hover_color=THEME["menu_active"],
+            )
+            button.elevation_shadow.grid(row=0, column=column, padx=3)
+
+    def _focus_chat_panel(self):
+        """Mantém o chat sempre visível no painel lateral, como em IDEs modernas."""
+        try:
+            self.chat_panel.focus_set()
+            self.text_input.focus_set()
+        except tk.TclError:
+            pass
+
+    def _use_quick_prompt(self, prompt):
+        self._replace_text(self.text_input, prompt)
+        self._update_input_placeholder()
+        self.text_input.focus_set()
+
+    def _on_main_tab_changed(self):
+        """Recalcula a aba selecionada depois que ela volta a ficar visível.
+
+        O CTkTabview remove a aba anterior da geometria. Widgets de texto e
+        CTkScrollableFrame criados enquanto ocultos podem manter dimensões
+        antigas até uma nova troca de aba; duas passagens curtas cobrem tanto
+        o layout do Tk quanto o redraw posterior do CustomTkinter.
+        """
+        self.after_idle(self._refresh_active_tab_layout)
+        self.after(40, self._refresh_active_tab_layout)
+
+    def _refresh_active_tab_layout(self):
+        try:
+            tab_name = self.tabview.get()
+            tab = self.tabview.tab(tab_name)
+            self.update_idletasks()
+            tab.update_idletasks()
+            tab.event_generate("<Configure>")
+
+            editor_info = self.open_editors.get(tab_name)
+            if editor_info is not None:
+                editor = editor_info["widget"]
+                editor.yview_moveto(editor.yview()[0])
+                self._sync_editor_horizontal_scrollbar(editor)
+                self._update_editor_view_after_navigation(tab_name)
+                return
+
+            if tab_name == "Chat AI":
+                canvas = self.chat_history._parent_canvas
+                bounds = canvas.bbox("all")
+                if bounds is not None:
+                    canvas.configure(scrollregion=bounds)
+                canvas.event_generate("<Configure>")
+                return
+
+            textboxes = {
+                "Terminal Local": getattr(self, "local_term_out", None),
+                "Navegador": getattr(self, "browser_info", None),
+                "Log do Agente": getattr(self, "agent_log", None),
+            }
+            textbox = textboxes.get(tab_name)
+            if textbox is not None:
+                textbox.yview_moveto(textbox.yview()[0])
+        except tk.TclError:
+            # A janela pode estar sendo encerrada enquanto um refresh agendado
+            # ainda aguarda na fila do Tk.
+            pass
 
     def _build_internal_browser_tab(self):
         self.tab_browser.grid_rowconfigure(1, weight=1)
@@ -2112,32 +2319,45 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         threading.Thread(target=ensure_closed, daemon=True).start()
 
     def _build_input_bar(self):
-        self.input_frame = ctk.CTkFrame(self, fg_color=THEME["panel"], corner_radius=0)
-        self.input_frame.grid(row=2, column=2, sticky="ew", padx=12, pady=(0, 8))
+        self.input_frame = ctk.CTkFrame(self.chat_panel, fg_color=THEME["panel"], corner_radius=0)
+        self.input_frame.grid(row=2, column=0, sticky="ew", padx=0, pady=0)
         self.input_frame.grid_columnconfigure(0, weight=1)
 
         self.attachment_frame = ctk.CTkFrame(self.input_frame, fg_color=THEME["panel_alt"], corner_radius=6)
         self.attachment_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=(10, 0))
-        self.attachment_frame.grid_columnconfigure(1, weight=1)
+        self.attachment_frame.grid_columnconfigure(0, weight=1)
         self.attachment_frame.grid_remove()
 
-        self.attachment_preview = ctk.CTkLabel(self.attachment_frame, text="", width=54, height=42)
-        self.attachment_preview.grid(row=0, column=0, padx=(8, 6), pady=6)
+        attachment_header = ctk.CTkFrame(self.attachment_frame, fg_color="transparent")
+        attachment_header.grid(row=0, column=0, sticky="ew", padx=8, pady=(7, 2))
+        attachment_header.grid_columnconfigure(0, weight=1)
         self.attachment_label = ctk.CTkLabel(
-            self.attachment_frame,
-            text="",
+            attachment_header,
+            text="Anexos prontos para enviar",
             text_color=THEME["text"],
             anchor="w",
+            font=("Segoe UI", 11, "bold"),
         )
-        self.attachment_label.grid(row=0, column=1, sticky="ew", padx=6)
+        self.attachment_label.grid(row=0, column=0, sticky="ew")
         remove_button = self._elevated_button(
-            self.attachment_frame,
-            text="Remover",
-            width=82,
-            height=28,
-            command=self.clear_pending_image,
+            attachment_header,
+            text="Remover tudo",
+            width=104,
+            height=26,
+            command=self.clear_pending_attachment,
+            font=("Segoe UI", 10),
         )
-        remove_button.elevation_shadow.grid(row=0, column=2, padx=8, pady=6)
+        remove_button.elevation_shadow.grid(row=0, column=1, padx=(8, 0))
+        self.attachment_list = ctk.CTkFrame(self.attachment_frame, fg_color="transparent")
+        self.attachment_list.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 7))
+        self.attachment_list.grid_columnconfigure(0, weight=1)
+        self.attachment_rows = []
+        self.attachment_preview = ctk.CTkLabel(
+            self.attachment_frame,
+            text="",
+            width=1,
+            height=1,
+        )
 
         self.text_input = ctk.CTkTextbox(
             self.input_frame,
@@ -2187,6 +2407,19 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         )
         self.btn_send.elevation_shadow.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
+        voice_button = self._elevated_button(
+            actions,
+            text="Voz",
+            width=50,
+            height=30,
+            command=self.voice_command,
+            font=("Segoe UI", 11, "bold"),
+            fg_color=THEME["accent_dark"],
+            hover_color=THEME["accent"],
+            text_color="#06111d",
+        )
+        voice_button.elevation_shadow.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 6))
+
         clear_button = self._elevated_button(
             actions,
             text="Limpar",
@@ -2195,6 +2428,16 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             command=lambda: self._replace_text(self.text_input, ""),
         )
         clear_button.elevation_shadow.grid(row=1, column=0, sticky="ew")
+
+        attach_button = self._elevated_button(
+            actions,
+            text="Anexar",
+            width=50,
+            height=30,
+            command=self.upload_and_update_code,
+            font=("Segoe UI", 11),
+        )
+        attach_button.elevation_shadow.grid(row=1, column=1, sticky="ew", padx=(6, 0))
 
         self.ai_progress = ctk.CTkProgressBar(
             self.input_frame,
@@ -2492,23 +2735,82 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             image.save(path, "PNG")
         return path
 
-    def set_pending_image(self, path):
-        self.pending_image_path = str(path)
-        with Image.open(path) as preview_source:
-            preview_source.thumbnail((54, 42))
-            preview_image = preview_source.copy()
-        self.pending_image_preview = ctk.CTkImage(
-            light_image=preview_image,
-            dark_image=preview_image,
-            size=preview_image.size,
-        )
+    def _is_image_attachment(self, path):
+        return Path(str(path or "")).suffix.lower() in IMAGE_FILE_SUFFIXES
+
+    def _attachment_summary(self, path):
+        file_path = Path(path)
         try:
-            self.attachment_preview.configure(image=self.pending_image_preview, text="")
-        except tk.TclError:
-            self.recreate_attachment_preview()
-            self.attachment_preview.configure(image=self.pending_image_preview, text="")
-        self.attachment_label.configure(text="")
+            size = file_path.stat().st_size
+            size_text = f"{size / 1024:.1f} KB" if size < 1024 * 1024 else f"{size / (1024 * 1024):.1f} MB"
+        except OSError:
+            size_text = "tamanho indisponivel"
+        mime_type = mimetypes.guess_type(file_path.name)[0] or "arquivo binario"
+        return f"{file_path.name}\n{mime_type} • {size_text}"
+
+    def _attachment_text_preview(self, path, limit=900):
+        file_path = Path(path)
+        mime_type = mimetypes.guess_type(file_path.name)[0] or ""
+        if not (mime_type.startswith("text/") or file_path.suffix.lower() in {".json", ".xml", ".yaml", ".yml", ".csv", ".log", ".md", ".py", ".js", ".ts", ".html", ".css"}):
+            return ""
+        try:
+            preview = file_path.read_text(encoding="utf-8", errors="replace")[:limit].strip()
+            return preview + ("…" if file_path.stat().st_size > len(preview.encode("utf-8", "replace")) else "")
+        except OSError:
+            return ""
+
+    def set_pending_attachment(self, path):
+        path = str(Path(path))
+        if path not in self.pending_attachment_paths:
+            self.pending_attachment_paths.append(path)
+        self.pending_attachment_path = self.pending_attachment_paths[0] if self.pending_attachment_paths else None
+        self.pending_image_path = next(
+            (item for item in self.pending_attachment_paths if self._is_image_attachment(item)),
+            None,
+        )
+        self.render_pending_attachments()
+
+    def render_pending_attachments(self):
+        for row in self.attachment_rows:
+            row.destroy()
+        self.attachment_rows = []
+        paths = list(self.pending_attachment_paths)
+        if not paths:
+            self.attachment_frame.grid_remove()
+            return
+        self.attachment_label.configure(text=f"Anexos prontos para enviar ({len(paths)})")
+        self.pending_image_preview = []
+        for index, item in enumerate(paths):
+            path = Path(item)
+            row = ctk.CTkFrame(self.attachment_list, fg_color=THEME["panel"], corner_radius=5)
+            row.grid(row=index, column=0, sticky="ew", pady=2)
+            row.grid_columnconfigure(1, weight=1)
+            preview = ctk.CTkLabel(row, text="ARQ", width=46, height=34, text_color=THEME["accent"], font=("Segoe UI", 11, "bold"))
+            preview.grid(row=0, column=0, padx=(7, 4), pady=4)
+            if self._is_image_attachment(path):
+                try:
+                    with Image.open(path) as source:
+                        source.thumbnail((46, 34))
+                        image = source.copy()
+                    image_ref = ctk.CTkImage(light_image=image, dark_image=image, size=image.size)
+                    self.pending_image_preview.append(image_ref)
+                    preview.configure(image=image_ref, text="")
+                except (OSError, tk.TclError):
+                    pass
+            ctk.CTkLabel(row, text=self._attachment_summary(path), text_color=THEME["text"], anchor="w", justify="left").grid(row=0, column=1, sticky="ew", padx=4)
+            remove = ctk.CTkButton(row, text="X", width=28, height=26, fg_color="transparent", hover_color=THEME["danger"], text_color=THEME["muted"], command=lambda target=item: self.remove_pending_attachment(target))
+            remove.grid(row=0, column=2, padx=(4, 7), pady=4)
+            self.attachment_rows.append(row)
         self.attachment_frame.grid()
+
+    def remove_pending_attachment(self, path):
+        self.pending_attachment_paths = [item for item in self.pending_attachment_paths if item != str(path)]
+        self.pending_attachment_path = self.pending_attachment_paths[0] if self.pending_attachment_paths else None
+        self.pending_image_path = next((item for item in self.pending_attachment_paths if self._is_image_attachment(item)), None)
+        self.render_pending_attachments()
+
+    def set_pending_image(self, path):
+        self.set_pending_attachment(path)
 
     def recreate_attachment_preview(self):
         try:
@@ -2518,15 +2820,30 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.attachment_preview = ctk.CTkLabel(self.attachment_frame, text="", width=54, height=42)
         self.attachment_preview.grid(row=0, column=0, padx=(8, 6), pady=6)
 
-    def clear_pending_image(self):
+    def clear_pending_attachment(self):
+        self.pending_attachment_paths = []
+        self.pending_attachment_path = None
         self.pending_image_path = None
-        try:
-            self.attachment_preview.configure(image=None, text="")
-        except tk.TclError:
-            self.recreate_attachment_preview()
         self.pending_image_preview = None
-        self.attachment_label.configure(text="")
-        self.attachment_frame.grid_remove()
+        self.render_pending_attachments()
+
+    def clear_pending_image(self):
+        self.clear_pending_attachment()
+
+    def build_pending_attachment_context(self, paths):
+        """Resume a fila inteira para a IA sem tentar ler arquivos binários."""
+        if not paths:
+            return ""
+        entries = ["ANEXOS ENVIADOS PELA INTERFACE:"]
+        for item in paths:
+            path = Path(item)
+            entries.append(f"- {self._attachment_summary(path).replace(chr(10), ' | ')}")
+            preview = self._attachment_text_preview(path, limit=1600)
+            if preview:
+                entries.append(f"  Prévia textual de {path.name}:\n{preview}")
+            elif self._is_image_attachment(path):
+                entries.append(f"  A imagem {path.name} foi exibida no chat; use-a na análise visual quando disponível.")
+        return "\n".join(entries)
 
     def report_callback_exception(self, exc, val, tb):
         if self.reporting_callback_error:
@@ -2836,6 +3153,9 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
     def open_file_in_editor(self, file_path):
         path = Path(file_path).resolve()
+        if path.suffix.lower() in IMAGE_FILE_SUFFIXES:
+            self.open_image_in_viewer(path)
+            return
         existing_tab = self.path_to_tab.get(str(path))
         tab_name = existing_tab or self.unique_tab_name(self.make_tab_name(path), path)
 
@@ -2917,6 +3237,93 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.update_editor_markers(tab_name)
         self.add_chat_message("Sistema", f"Arquivo aberto: {tab_name}")
 
+    def open_image_in_viewer(self, file_path):
+        """Abre arquivos de imagem em uma aba própria, sem tentar decodificá-los como texto."""
+        path = Path(file_path).resolve()
+        existing_tab = self.path_to_tab.get(str(path))
+        tab_name = existing_tab or self.unique_tab_name(self.make_tab_name(path), path)
+        if tab_name in self.open_editors:
+            self.tabview.set(tab_name)
+            return
+
+        try:
+            with Image.open(path) as source:
+                source.load()
+                image = source.copy()
+        except (OSError, ValueError) as exc:
+            self.add_chat_message("Erro", f"Nao foi possivel visualizar a imagem: {exc}")
+            return
+
+        tab = self.tabview.add(tab_name)
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        top_bar = self._section_bar(tab, height=44, corner_radius=8)
+        top_bar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        top_bar.grid_columnconfigure(0, weight=1)
+        top_bar.grid_propagate(False)
+        ctk.CTkLabel(
+            top_bar,
+            text=f"Imagem  |  {tab_name}  |  {image.width} x {image.height}",
+            font=("Segoe UI", 12, "bold"),
+            text_color=THEME["text"],
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=(12, 8), pady=6)
+
+        state = {"image": image, "zoom": 1.0, "photo": None, "fit": True}
+        actions = ctk.CTkFrame(top_bar, fg_color="transparent")
+        actions.grid(row=0, column=1, sticky="e", padx=10, pady=6)
+
+        viewer_frame = ctk.CTkFrame(tab, fg_color="#111827", corner_radius=8)
+        viewer_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+        viewer_frame.grid_columnconfigure(0, weight=1)
+        viewer_frame.grid_rowconfigure(0, weight=1)
+        canvas = tk.Canvas(viewer_frame, background="#0a111c", highlightthickness=0, borderwidth=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        y_scroll = ttk.Scrollbar(viewer_frame, orient="vertical", command=canvas.yview)
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        x_scroll = ttk.Scrollbar(viewer_frame, orient="horizontal", command=canvas.xview)
+        x_scroll.grid(row=1, column=0, sticky="ew")
+        canvas.configure(xscrollcommand=x_scroll.set, yscrollcommand=y_scroll.set)
+        zoom_label = ctk.CTkLabel(actions, text="100%", width=52, text_color=THEME["muted"])
+
+        def render_image(fit=False):
+            if fit:
+                available_width = max(canvas.winfo_width() - 28, 120)
+                available_height = max(canvas.winfo_height() - 28, 120)
+                state["zoom"] = min(available_width / image.width, available_height / image.height, 1.0)
+                state["fit"] = True
+            width = max(1, round(image.width * state["zoom"]))
+            height = max(1, round(image.height * state["zoom"]))
+            rendered = image.resize((width, height), Image.Resampling.LANCZOS) if (width, height) != image.size else image
+            state["photo"] = ImageTk.PhotoImage(rendered)
+            canvas.delete("all")
+            canvas.create_image(14, 14, image=state["photo"], anchor="nw")
+            canvas.configure(scrollregion=(0, 0, width + 28, height + 28))
+            zoom_label.configure(text=f"{round(state['zoom'] * 100)}%")
+
+        def change_zoom(factor):
+            state["zoom"] = max(0.1, min(4.0, state["zoom"] * factor))
+            state["fit"] = False
+            render_image()
+
+        self._elevated_button(actions, text="−", width=34, height=28, command=lambda: change_zoom(1 / 1.25)).elevation_shadow.grid(row=0, column=0, padx=3)
+        zoom_label.grid(row=0, column=1, padx=2)
+        self._elevated_button(actions, text="+", width=34, height=28, command=lambda: change_zoom(1.25)).elevation_shadow.grid(row=0, column=2, padx=3)
+        self._elevated_button(actions, text="Ajustar", width=72, height=28, command=lambda: render_image(fit=True)).elevation_shadow.grid(row=0, column=3, padx=3)
+        self._elevated_button(
+            actions, text="Fechar", width=72, height=28, fg_color=THEME["danger"], hover_color="#b84b4b",
+            border_color="#ee8888", command=lambda t=tab_name: self.close_specific_tab(t),
+        ).elevation_shadow.grid(row=0, column=4, padx=(3, 0))
+
+        canvas.bind("<Configure>", lambda _event: render_image(fit=True) if state["fit"] else None)
+        canvas.bind("<Control-MouseWheel>", lambda event: change_zoom(1.25 if event.delta > 0 else 1 / 1.25))
+        self.open_editors[tab_name] = {"path": str(path), "dirty": False, "kind": "image", "viewer": state}
+        self.path_to_tab[str(path)] = tab_name
+        self.tabview.set(tab_name)
+        self.after(20, lambda: render_image(fit=True))
+        self.add_chat_message("Sistema", f"Imagem aberta: {tab_name}")
+
     def build_chatgpt_web_mission(self, command):
         objective = (command or "").strip() or self.active_ai_objective or "Analise o projeto e proponha a proxima melhoria concreta."
         return (
@@ -2952,7 +3359,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 "Sistema",
                 "Missao enviada diretamente ao Chat Web. A IDE vai aplicar acoes, validar e continuar sem copiar/colar manual.",
             )
-            self.tabview.set(CHAT_TAB_NAME)
+            self._focus_chat_panel()
             self._run_ai_task(command or self.active_ai_objective or "Continue a missao ativa pelo Chat Web.")
             return
         mission = self.build_chatgpt_web_mission(command)
@@ -3273,7 +3680,9 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
     def save_current_tab(self, event=None):
         current_tab = self.tabview.get()
         info = self.open_editors.get(current_tab)
-        if not info:
+        if not info or info.get("kind") == "image":
+            if info:
+                self.set_status("A visualizacao de imagem nao possui alteracoes para salvar.", "ready")
             return "break"
         path = info.get("path")
         if not path:
@@ -3320,10 +3729,17 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.set_terminal_busy(True, f"Executando Python: {tab_name}")
 
         def execute():
+            process = None
             try:
-                ok, output = self.executor.run_python_code(path)
+                def register(processo):
+                    nonlocal process
+                    process = processo
+                    self.register_terminal_process(process, f"Python: {tab_name}")
+
+                ok, output = self.executor.run_python_code(path, on_start=register)
                 self.append_to_term(output or ("Processo finalizado sem saida.\n" if ok else "Falha sem saida.\n"))
             finally:
+                self.unregister_terminal_process(process)
                 self.set_terminal_busy(False)
 
         threading.Thread(target=execute, daemon=True).start()
@@ -3579,7 +3995,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 or bool(re.search(r"\[(READ|WRITE|REPLACE|EXECUTE|EXECUTE_ADMIN|OPEN_URL|BROWSER_INSPECT|BROWSER_CLICK|BROWSER_TYPE|BROWSER_SCROLL|SCREENSHOT|HUMAN_TEST|SEARCH_TEXT|WEB_SEARCH|SCAN_TEXT|UNDO)\s*:", chunk, re.IGNORECASE))
             )
             if not should_log:
-                self.update_ai_activity_from_stream(chunk)
+                self.update_ai_activity_from_stream(self.ai_live_trace)
                 return
             self.ai_live_trace_last_log_at = now
             self.ai_live_trace_last_length = current_length
@@ -3587,7 +4003,10 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
         if live_text:
             self.log_agent(f"IA: {live_text}")
-        self.update_ai_activity_from_stream(chunk)
+        # O stream chega em fragmentos pequenos; interpretar somente o último
+        # fragmento fazia o status voltar para "respondendo" depois de a IA já
+        # ter solicitado uma leitura, alteração ou execução.
+        self.update_ai_activity_from_stream(self.ai_live_trace)
 
     def finish_ai_live_trace(self, task_id=None):
         with self.ai_live_trace_lock:
@@ -3652,12 +4071,25 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
     def update_ai_activity_from_stream(self, text):
         normalized = self.normalize_plain_text(text or "")
-        if re.search(r"(?:\[(write|replace|fix_mojibake|undo)(?:\s*:|\])|^(write|replace|fix_mojibake|undo)\s*(?::|\s))", normalized, re.MULTILINE):
-            self.set_ai_activity("IA preparando alteracao")
-        elif re.search(r"(?:\[(execute|execute_admin|open_url|browser_inspect|browser_click|browser_type|browser_scroll|screenshot|human_test)(?:\s*:|\])|^(execute|execute_admin|open_url|browser_inspect|browser_click|browser_type|browser_scroll|screenshot|human_test)\s*(?::|\s))", normalized, re.MULTILINE):
-            self.set_ai_activity("IA preparando validacao")
-        elif re.search(r"(?:\[(read|search_text|web_search|scan_text)(?:\s*:|\])|^(read|search_text|web_search|scan_text)\s*(?::|\s))", normalized, re.MULTILINE):
-            self.set_ai_activity("IA pedindo contexto")
+        action_pattern = re.compile(
+            r"\[(read|search_text|web_search|scan_text|write|replace|fix_mojibake|undo|"
+            r"execute|execute_admin|open_url|browser_inspect|browser_click|browser_type|"
+            r"browser_scroll|screenshot|human_test)(?:\s*:|\])",
+            re.IGNORECASE,
+        )
+        actions = action_pattern.findall(normalized)
+        latest_action = actions[-1].lower() if actions else ""
+        assistant_name = self.ai_assistant_display_name()
+
+        if latest_action in {"write", "replace", "fix_mojibake", "undo"}:
+            self.set_ai_activity(f"{assistant_name} alterando arquivos")
+        elif latest_action in {
+            "execute", "execute_admin", "open_url", "browser_inspect", "browser_click",
+            "browser_type", "browser_scroll", "screenshot", "human_test",
+        }:
+            self.set_ai_activity(f"{assistant_name} executando validacao")
+        elif latest_action in {"read", "search_text", "web_search", "scan_text"}:
+            self.set_ai_activity(f"{assistant_name} analisando contexto")
         elif any(term in normalized for term in ("patch", "filechange", "apply", "alterando", "escrevendo")):
             self.set_ai_activity(f"{self.ai_assistant_display_name()} alterando arquivos")
         elif any(term in normalized for term in ("command", "execut", "rodando", "testando")):
@@ -3795,9 +4227,17 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.after(0, lambda: self._add_chat_message_sync(sender, text))
 
     def add_chat_image_message(self, sender, image_path, text=""):
+        if not self._is_image_attachment(image_path):
+            self.add_chat_attachment_message(sender, image_path, text)
+            return
         image_note = f"{text}\n[imagem anexada: {Path(image_path).name}]" if text else f"[imagem anexada: {Path(image_path).name}]"
         self.remember_ai_context_message(sender, image_note)
         self.after(0, lambda: self._add_chat_image_message_sync(sender, image_path, text))
+
+    def add_chat_attachment_message(self, sender, file_path, text=""):
+        note = f"{text}\n[arquivo anexado: {Path(file_path).name}]" if text else f"[arquivo anexado: {Path(file_path).name}]"
+        self.remember_ai_context_message(sender, note)
+        self.after(0, lambda: self._add_chat_attachment_message_sync(sender, file_path, text))
 
     def remember_ai_context_message(self, sender, text, max_chars=2400):
         text = str(text or "").strip()
@@ -3933,6 +4373,23 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         except Exception as exc:
             self.log_agent(f"Nao consegui renderizar imagem no chat: {exc}")
 
+        self.safe_chat_scroll_bottom()
+
+    def _add_chat_attachment_message_sync(self, sender, file_path, text=""):
+        frame = ctk.CTkFrame(self.chat_history, fg_color=THEME["panel"], border_width=1, border_color=THEME["accent_dark"], corner_radius=6)
+        frame.pack(fill="x", padx=6, pady=5)
+        self.register_chat_frame(frame)
+        ctk.CTkLabel(frame, text=sender, font=("Segoe UI", 12, "bold"), text_color="#ffffff" if sender.lower() in {"voce", "você"} else THEME["accent"], anchor="w").pack(anchor="w", padx=10, pady=(8, 0))
+        if text:
+            content = ctk.CTkLabel(frame, text=self.format_chat_text_for_display(text, sender=sender), text_color=THEME["text"], justify="left", anchor="w", wraplength=650)
+            content.pack(fill="x", padx=10, pady=(2, 6))
+        card = ctk.CTkFrame(frame, fg_color=THEME["panel_alt"], corner_radius=6)
+        card.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkLabel(card, text="ARQUIVO", font=("Segoe UI", 11, "bold"), text_color=THEME["accent"]).pack(anchor="w", padx=10, pady=(7, 0))
+        ctk.CTkLabel(card, text=self._attachment_summary(file_path), text_color=THEME["text"], justify="left", anchor="w").pack(anchor="w", padx=10, pady=(0, 7))
+        preview = self._attachment_text_preview(file_path)
+        if preview:
+            ctk.CTkLabel(card, text=preview, text_color=THEME["muted"], font=("Consolas", 11), justify="left", anchor="w", wraplength=620).pack(fill="x", padx=10, pady=(0, 8))
         self.safe_chat_scroll_bottom()
 
     def chat_text_font(self, text):
@@ -4198,13 +4655,14 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
 
     def text_command(self):
         command = self.text_input.get("1.0", "end-1c").strip()
-        image_path = self.pending_image_path
+        attachment_paths = list(self.pending_attachment_paths)
+        image_path = next((path for path in attachment_paths if self._is_image_attachment(path)), None)
         if self.agent_busy:
             self.cancel_ai_task()
             return
         if self.has_terminal_processes():
             self.set_status("Terminal Local em execucao; use Cancelar terminal na aba Terminal Local.", "warning")
-        if not command and not image_path:
+        if not command and not attachment_paths:
             if self.last_failed_ai_task:
                 self.retry_last_ai_task()
             return
@@ -4212,15 +4670,17 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             self._replace_text(self.text_input, "")
             self.retry_last_ai_task()
             return
-        if not command and image_path:
-            command = "Analise este print e me diga o que fazer."
+        if not command and attachment_paths:
+            command = "Analise os anexos e me diga o que fazer."
         self._replace_text(self.text_input, "")
-        if image_path:
-            self.add_chat_image_message("Voce", image_path, command)
-            self.clear_pending_image()
+        attachment_context = self.build_pending_attachment_context(attachment_paths)
+        if attachment_paths:
+            for index, path in enumerate(attachment_paths):
+                self.add_chat_image_message("Voce", path, command if index == 0 else "")
+            self.clear_pending_attachment()
         else:
             self.add_chat_message("Voce", command)
-        self.tabview.set("Chat AI")
+        self._focus_chat_panel()
 
         local_reply = self.local_quick_reply(command, image_path=image_path)
         if local_reply:
@@ -4244,6 +4704,8 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             self.add_chat_message("Sistema", "Continuando a missao anterior com memoria recente da IDE.")
 
         extra_context = continuation_context
+        if attachment_context:
+            extra_context = f"{extra_context}\n\n{attachment_context}" if extra_context else attachment_context
         if answer_only:
             answer_context = (
                 "MODO RESPOSTA SOMENTE:\n"
@@ -4317,7 +4779,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.btn_send.configure(text="Enviar")
         self.add_chat_message("Voce", "Tentar novamente")
         self.add_chat_message("Sistema", f"Reenviando tarefa anterior: {task['command']}")
-        self.tabview.set("Chat AI")
+        self._focus_chat_panel()
         self._run_ai_task(
             task["command"],
             image_path=task.get("image_path"),
@@ -4451,7 +4913,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.voice_capture_started_at = None
         self.set_voice_button_text("Processando voz...", active=True)
         self.add_chat_message("Sistema", f"Audio capturado por {elapsed}s. Convertendo para texto...")
-        self.tabview.set("Chat AI")
+        self._focus_chat_panel()
 
         def run():
             try:
@@ -4534,7 +4996,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 return
 
             image_path = self.pending_image_path
-            self.tabview.set("Chat AI")
+            self._focus_chat_panel()
             if image_path:
                 self.add_chat_image_message("Voce", image_path, clean_command)
                 self.after(0, self.clear_pending_image)
@@ -4728,7 +5190,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         Não exigimos uma tag textual do modelo, porque ela conflita com a ação
         executável que o agente precisa devolver na mesma resposta.
         """
-        if not image_path or getattr(self.engine, "provider", "") != "web_chat":
+        if not self._is_image_attachment(image_path) or getattr(self.engine, "provider", "") != "web_chat":
             return ""
         name = Path(str(image_path)).name or "screenshot.png"
         return (
@@ -4913,7 +5375,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         na mensagem do usuário), o print está disponível para o Chat Web mesmo
         que o modelo responda diretamente com uma ação e não escreva um recibo.
         """
-        if not image_path or getattr(self.engine, "provider", "") != "web_chat":
+        if not self._is_image_attachment(image_path) or getattr(self.engine, "provider", "") != "web_chat":
             return ""
         delivery = getattr(self.engine, "latest_web_chat_delivery", {})
         if not isinstance(delivery, dict):
@@ -5629,15 +6091,18 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.set_status("Leitura de audio parada.", "ready")
 
     def upload_and_update_code(self):
-        file_path = filedialog.askopenfilename(
+        file_paths = filedialog.askopenfilenames(
             initialdir=self.current_workspace,
-            filetypes=[
-                ("Codigo", "*.py *.js *.ts *.tsx *.jsx *.cpp *.c *.h *.css *.html *.json *.md"),
-                ("Todos", "*.*"),
-            ],
+            filetypes=[("Todos os arquivos", "*.*")],
         )
-        if not file_path:
+        if not file_paths:
             return
+
+        for file_path in file_paths:
+            self.set_pending_attachment(file_path)
+        count = len(file_paths)
+        self.set_status(f"{count} anexo(s) pronto(s) para enviar no chat.", "ready")
+        return
 
         try:
             path = Path(file_path)
@@ -5883,5 +6348,7 @@ UniversalApp.local_llm_fallback_reply = _merotec_locked_local_llm_fallback_reply
 # Inicialize somente depois de registrar todos os patches da aplicação.
 if __name__ == "__main__":
     if not _activate_existing_instance():
+        app = UniversalApp()
+        app.mainloop()
         app = UniversalApp()
         app.mainloop()
