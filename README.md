@@ -2,8 +2,13 @@
 
 Projeto Python desktop com interface em PySide6 para automacao assistida por IA,
 gerenciamento de projetos, execucao de comandos, navegador interno e recursos de voz.
+## Interface antiga em customtkinter
 
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/3d1391d1-e5d6-4e6d-af41-9fe28b041629" />
+
+## Nova interface PySide6
+
+<img width="1919" height="1019" alt="image" src="https://github.com/user-attachments/assets/c9f5e7c7-9087-4601-8ea3-2030219c49bf" />
 
 ## Fluxo de projetos
 
