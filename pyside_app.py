@@ -6,19 +6,21 @@ janela Tk por uma superficie desktop inspirada no mockup da IDE.
 
 from __future__ import annotations
 
+import locale
 import os
 import re
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QDir, QFileInfo, QProcess, QSortFilterProxyModel, QStandardPaths, Qt, QTimer, Signal
+from PySide6.QtCore import QDir, QFileInfo, QProcess, QProcessEnvironment, QSortFilterProxyModel, QStandardPaths, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap, QSyntaxHighlighter, QTextCharFormat, QTextDocument
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
-    QSizePolicy, QSplitter, QStyle, QTabWidget, QTextEdit, QToolBar, QTreeView,
+    QSizePolicy, QSplitter, QStyle, QTabWidget, QTextEdit, QToolBar, QTreeView, QProgressBar,
     QVBoxLayout, QWidget, QFileSystemModel, QScrollArea,
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -320,6 +322,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self._apply_settings_to_environment()
         self.current_workspace = str(self._initial_workspace())
         self.workspace = Path(self.current_workspace)
+        self.terminal_working_directory = self.workspace
         self.memory_subnet = MemorySubnet(self.current_workspace)
         self.engine = UniversalEngine()
         self.pm = ProjectManager(str(PROJECTS_DIR))
@@ -327,12 +330,27 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.voice = VoiceModule(self.settings)
         self.voice_capture_active = False
         self.terminal_process = None
+        self.terminal_session = None
         self._terminal_command = ""
+        self._terminal_cancel_requested = False
+        self._terminal_replace_current_line = False
+        self._terminal_progress_sources = {}
+        self._terminal_progress_frame = 0
+        self._terminal_progress_percent = None
+        self._terminal_session_command_number = 0
+        self._terminal_session_marker = ""
+        self._terminal_session_output_buffer = ""
+        self._terminal_session_queue = []
+        self._terminal_session_interactive = False
         self.pending_attachments = []
         self.chat_busy = False
+        self.chat_started_at = None
+        self.chat_last_activity = ""
         self.speech_active = False
         self.streaming_bubble = None
         self.streaming_text = ""
+        self.activity_bubble = None
+        self.activity_lines = []
         self.browser_view = None
         self.internal_browser_url = "about:blank"
         self.paths_by_tab = {}
@@ -341,6 +359,12 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.setMinimumSize(1120, 600)
         self._build_ui()
         self._connect_signals()
+        self.terminal_progress_timer = QTimer(self)
+        self.terminal_progress_timer.setInterval(180)
+        self.terminal_progress_timer.timeout.connect(self._render_terminal_progress)
+        self.quota_refresh_timer = QTimer(self)
+        self.quota_refresh_timer.setInterval(500)
+        self.quota_refresh_timer.timeout.connect(self._refresh_chat_runtime_status)
         self._open_initial_file()
         self.load_plugins()
         self.report_plugin_status()
@@ -360,6 +384,17 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             quota = ""
         self.quota_status.setText(f"Cota: {quota}" if quota else "Cota: indisponivel")
         self.quota_status.setToolTip(quota or "A cota sera exibida quando o provedor informar o status.")
+
+    def _refresh_chat_runtime_status(self):
+        """Atualiza cota e estado da rodada sem deixar a barra presa em 'pensando'."""
+        self.refresh_quota_status()
+        if not self.chat_busy or not self.chat_started_at or not hasattr(self, "status"):
+            return
+        elapsed = max(0, int(time.monotonic() - self.chat_started_at))
+        detail = self.chat_last_activity or "Processando a tarefa"
+        if len(detail) > 72:
+            detail = detail[:69].rstrip() + "..."
+        self.status.setText(f"â—  IA: {detail} ({elapsed}s)")
 
     def log_agent(self, text):
         # Durante a migracao, o terminal e o registro visivel da atividade.
@@ -525,6 +560,11 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.search.setPlaceholderText("Filtrar arquivos")
         self.search.textChanged.connect(self.filter_tree)
         layout.addWidget(self.search)
+        self.workspace_root_label = QLabel()
+        self.workspace_root_label.setObjectName("explorerRoot")
+        self.workspace_root_label.setToolTip(str(self.workspace))
+        layout.addWidget(self.workspace_root_label)
+        self._update_workspace_root_label()
         self.model = QFileSystemModel(self)
         self.model.setRootPath(str(self.workspace))
         self.file_filter = RecursiveFileFilter(self)
@@ -541,6 +581,12 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             self.tree.hideColumn(column)
         layout.addWidget(self.tree, 1)
         return panel
+
+    def _update_workspace_root_label(self):
+        if not hasattr(self, "workspace_root_label"):
+            return
+        self.workspace_root_label.setText(f"📁  {self.workspace.name or str(self.workspace)}")
+        self.workspace_root_label.setToolTip(str(self.workspace))
 
     def _build_workspace(self):
         self.workspace_splitter = QSplitter(Qt.Orientation.Vertical)
@@ -559,6 +605,10 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         title = QLabel("TERMINAL")
         title.setObjectName("terminalTitle")
         terminal_header.addWidget(title)
+        self.terminal_progress_label = QLabel()
+        self.terminal_progress_label.setObjectName("terminalProgress")
+        self.terminal_progress_label.hide()
+        terminal_header.addWidget(self.terminal_progress_label)
         terminal_header.addStretch()
         clear = QPushButton("Limpar")
         clear.setObjectName("terminalAction")
@@ -569,6 +619,12 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         stop.clicked.connect(self.cancel_terminal_process)
         terminal_header.addWidget(stop)
         terminal_layout.addLayout(terminal_header)
+        self.terminal_progress_bar = QProgressBar()
+        self.terminal_progress_bar.setObjectName("terminalProgressBar")
+        self.terminal_progress_bar.setTextVisible(False)
+        self.terminal_progress_bar.setFixedHeight(5)
+        self.terminal_progress_bar.hide()
+        terminal_layout.addWidget(self.terminal_progress_bar)
         self.terminal = QPlainTextEdit()
         self.terminal.setObjectName("terminal")
         self.terminal.setReadOnly(True)
@@ -716,9 +772,44 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.ui_bridge.after_cancel(token)
 
     def _open_initial_file(self):
-        candidate = ROOT / "main.py"
-        if candidate.exists():
-            self.open_file(candidate)
+        """Exibe orientacoes iniciais sem expor o codigo-fonte da propria IDE."""
+        editor = CodeEditor()
+        editor.setReadOnly(True)
+        editor.setPlainText(
+            "# Bem-vindo ao Merotec IA IDE\n\n"
+            "# Como comecar\n"
+            "# 1. Abra uma pasta de projeto em Arquivo > Abrir projeto.\n"
+            "# 2. Selecione um arquivo no painel PROJETOS para edita-lo.\n"
+            "# 3. Crie arquivos pelo botao + ou use Arquivo > Novo arquivo.\n"
+            "# 4. Execute o arquivo Python aberto pelo botao ▶ ou menu Executar.\n\n"
+            "# Teste visual de projetos\n"
+            "# Flutter: no terminal, execute `flutter pub get` e depois `flutter run -d chrome`.\n"
+            "#          Para abrir como aplicativo Windows, use `flutter run -d windows`.\n"
+            "# Flet: execute `flet run main.py --web` para abrir no navegador.\n"
+            "#       Sem `--web`, `flet run main.py` abre a janela do aplicativo.\n"
+            "# Python: abra o arquivo principal e pressione F5; a saida aparece no terminal.\n"
+            "# HTML/CSS/JS: execute `python -m http.server 8000 --bind 127.0.0.1`\n"
+            "#               e abra http://127.0.0.1:8000 no navegador.\n"
+            "# Flask API: execute `flask --app app run --debug` e abra http://127.0.0.1:5000.\n"
+            "#            Troque `app` pelo arquivo/modulo que contem a aplicacao, se necessario.\n"
+            "# FastAPI: execute `uvicorn main:app --reload` e abra http://127.0.0.1:8000/docs.\n"
+            "#          Troque `main:app` pelo modulo e objeto da sua API, se necessario.\n\n"
+            "# C++: abra um arquivo .cpp e pressione F5; a IDE usa g++ para compilar e executar.\n"
+            "# C#: abra Program.cs e pressione F5; a IDE executa o projeto com `dotnet run`.\n\n"
+            "# Terminal\n"
+            "# Digite comandos na caixa abaixo do terminal e pressione Enter.\n"
+            "# O comando e executado na pasta do projeto aberto. Para parar um servidor, use Ctrl+C.\n"
+            "# Use Interromper para encerrar um processo em execucao.\n\n"
+            "# Atalhos\n"
+            "# Ctrl+S  Salvar arquivo\n"
+            "# Ctrl+`  Focar o terminal\n"
+            "# Ctrl+C  Interromper o processo do terminal\n\n"
+            "# Esta aba e somente informativa. Abra ou crie um arquivo para comecar.\n"
+        )
+        editor.cursorPositionChanged.connect(self.update_cursor)
+        tab = self.tabs.addTab(editor, "Comece aqui")
+        self.tabs.setCurrentIndex(tab)
+        self.language.setText("Uso da IDE")
 
     def open_index(self, index):
         path = Path(self.model.filePath(self.file_filter.mapToSource(index)))
@@ -881,7 +972,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             if choice != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-        self.cancel_terminal_process()
+        self._shutdown_terminal_processes()
         try:
             self.voice.stop()
         except Exception:
@@ -889,6 +980,25 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.settings["last_workspace"] = str(self.workspace)
         self._save_settings()
         event.accept()
+
+    def _shutdown_terminal_processes(self):
+        """Encerra processos antes de destruir a janela e seus objetos Qt."""
+        for attribute in ("terminal_process", "terminal_session"):
+            process = getattr(self, attribute, None)
+            if not process:
+                continue
+            try:
+                if process.state() != QProcess.ProcessState.NotRunning:
+                    process.kill()
+                    process.waitForFinished(1500)
+            except RuntimeError:
+                pass
+            setattr(self, attribute, None)
+        self._stop_terminal_progress("process")
+        self._stop_terminal_progress("session")
+        self._terminal_session_marker = ""
+        self._terminal_session_queue.clear()
+        self._terminal_session_interactive = False
 
     def new_file(self):
         editor = CodeEditor()
@@ -917,23 +1027,13 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         filename, _ = QFileDialog.getOpenFileName(self, "Abrir arquivo", str(self.workspace))
         if filename:
             path = Path(filename).resolve()
-            self.open_workspace(self._project_root_for_file(path))
             self.open_file(path)
-
-    def _project_root_for_file(self, path: Path):
-        """Encontra a raiz mais proxima para alinhar editor, IA e terminal."""
-        markers = (".git", "pyproject.toml", "requirements.txt", "setup.py", "main.py")
-        candidate = path if path.is_dir() else path.parent
-        for folder in (candidate, *candidate.parents):
-            if any((folder / marker).exists() for marker in markers):
-                return folder
-        return candidate
 
     def create_project(self):
         name, accepted = QInputDialog.getText(self, "Novo projeto", "Nome do projeto:")
         if not accepted or not name.strip():
             return
-        kinds = ["python", "web", "flet", "dart", "flutter", "empty"]
+        kinds = ["python", "web", "flet", "dart", "flutter", "cpp", "csharp", "empty"]
         kind, accepted = QInputDialog.getItem(self, "Tipo do projeto", "Template:", kinds, 0, False)
         if not accepted:
             return
@@ -950,12 +1050,14 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
 
     def open_workspace(self, folder):
         self.workspace = Path(folder).resolve()
+        self.terminal_working_directory = self.workspace
         self.current_workspace = str(self.workspace)
         self.memory_subnet.reset_workspace(self.workspace)
         self.settings["last_workspace"] = self.current_workspace
         self.settings["recent_projects"] = [self.current_workspace, *[item for item in self.settings.get("recent_projects", []) if item != self.current_workspace]][:10]
         self._save_settings()
         self.update_recent_menu()
+        self._update_workspace_root_label()
         self.model.setRootPath(self.current_workspace)
         self.tree.setRootIndex(self.file_filter.mapFromSource(self.model.index(self.current_workspace)))
         self.append_terminal(f"\nPasta aberta: {self.workspace}\n")
@@ -974,27 +1076,85 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
     def run_current(self):
         path = self.current_path()
         if not path:
-            QMessageBox.information(self, "Merotec IA", "Abra ou salve um arquivo Python para executar.")
+            QMessageBox.information(self, "Merotec IA", "Abra ou salve um arquivo Python, C++ ou C# para executar.")
             return
         self.save_current()
-        if path.suffix.lower() != ".py":
-            QMessageBox.information(self, "Merotec IA", "A execucao integrada esta disponivel para arquivos Python.")
+        suffix = path.suffix.lower()
+        if suffix in {".cpp", ".cc", ".cxx"}:
+            self._run_cpp(path)
+            return
+        if suffix == ".cs":
+            self._run_csharp(path)
+            return
+        if suffix != ".py":
+            QMessageBox.information(self, "Merotec IA", "A execucao integrada esta disponivel para arquivos Python, C++ e C#.")
             return
         self.set_status("Executando...")
-        self.append_terminal(f"\nPS {self.workspace}> python {path.name}\n")
-        self.start_terminal_process(sys.executable, ["-u", str(path)], f"python {path.name}")
+        working_directory = path.parent
+        self.append_terminal(f"\nPS {working_directory}> python {path.name}\n")
+        self.start_terminal_process(
+            sys.executable,
+            ["-u", str(path)],
+            f"python {path.name}",
+            working_directory=working_directory,
+        )
+
+    def _run_cpp(self, path: Path):
+        """Compila e executa o arquivo C++ aberto usando o compilador g++ instalado."""
+        output_dir = path.parent / "build"
+        output_dir.mkdir(exist_ok=True)
+        executable = output_dir / path.stem
+        if os.name == "nt":
+            executable = executable.with_suffix(".exe")
+        command = f'g++ -std=c++17 "{path}" -o "{executable}" && "{executable}"'
+        self.append_terminal(f"\nPS {path.parent}> {command}\n")
+        self._send_to_terminal_session(command)
+        self.set_status("Compilando e executando C++")
+
+    def _run_csharp(self, path: Path):
+        """Executa o projeto .NET associado ao arquivo C# aberto."""
+        project_file = next(path.parent.glob("*.csproj"), None)
+        for parent in path.parents:
+            if project_file or parent == self.workspace.parent:
+                break
+            project_file = next(parent.glob("*.csproj"), None)
+        if not project_file:
+            QMessageBox.information(
+                self,
+                "Merotec IA",
+                "Nenhum arquivo .csproj foi encontrado. Crie um projeto C# pela opção Novo projeto ou abra uma pasta .NET.",
+            )
+            return
+        command = f'dotnet run --project "{project_file}"'
+        self.append_terminal(f"\nPS {project_file.parent}> {command}\n")
+        self._send_to_terminal_session(command)
+        self.set_status("Compilando e executando C#")
 
     def terminal_clear(self):
         self.terminal.clear()
         self._terminal_prompt()
 
     def _terminal_prompt(self):
-        self.terminal.appendPlainText(f"PS {self.workspace}> ")
+        self.terminal.appendPlainText(f"PS {self.terminal_working_directory}> ")
 
     def append_terminal(self, text):
+        """Acrescenta saida preservando atualizacoes de progresso com ``\r``."""
+        text = str(text).replace("\r\n", "\n")
         cursor = self.terminal.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
-        cursor.insertText(text)
+        if self._terminal_replace_current_line:
+            if not text.startswith("\n"):
+                cursor.select(cursor.SelectionType.BlockUnderCursor)
+                cursor.removeSelectedText()
+            self._terminal_replace_current_line = False
+        pieces = text.split("\r")
+        cursor.insertText(pieces[0])
+        for piece in pieces[1:]:
+            cursor.movePosition(cursor.MoveOperation.End)
+            cursor.select(cursor.SelectionType.BlockUnderCursor)
+            cursor.removeSelectedText()
+            cursor.insertText(piece)
+        self._terminal_replace_current_line = text.endswith("\r")
         self.terminal.setTextCursor(cursor)
         self.terminal.ensureCursorVisible()
 
@@ -1009,9 +1169,121 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             self.append_terminal("Um processo ja esta em execucao. Interrompa-o antes de iniciar outro.\n")
             return
         self.terminal_input.clear()
+        if self._terminal_session_marker and self._terminal_session_interactive:
+            self._send_terminal_session_input(command)
+            return
         self.terminal_input.remember(command)
-        self.append_terminal(f"{command}\n")
-        self._start_shell_command(command)
+        self._send_to_terminal_session(command)
+
+    def _send_to_terminal_session(self, command):
+        """Envia comandos para o mesmo PowerShell, preservando venv, cd e variaveis."""
+        if self._terminal_session_marker:
+            self._terminal_session_queue.append(command)
+            self.append_terminal(f"[Terminal] Comando adicionado a fila ({len(self._terminal_session_queue)}): {command}\n")
+            self.set_status("Comando aguardando na fila do terminal")
+            return
+        process = self.terminal_session
+        try:
+            session_is_running = bool(process) and process.state() != QProcess.ProcessState.NotRunning
+        except RuntimeError:
+            session_is_running = False
+            self.terminal_session = None
+        if not session_is_running:
+            process = QProcess(self)
+            process.setWorkingDirectory(str(self.terminal_working_directory.resolve()))
+            # O painel recebe stdout por pipe, nao por um console Win32. Flet/Rich
+            # precisa de saida simples nesse caso; o modo Live tenta controlar o
+            # cursor do terminal e encerra o build com traceback.
+            environment = QProcessEnvironment.systemEnvironment()
+            environment.insert("FLET_CLI_NO_RICH_OUTPUT", "1")
+            environment.insert("TERM", "dumb")
+            environment.insert("TTY_COMPATIBLE", "0")
+            environment.insert("TTY_INTERACTIVE", "0")
+            environment.insert("PYTHONUTF8", "1")
+            environment.insert("PYTHONUNBUFFERED", "1")
+            process.setProcessEnvironment(environment)
+            process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+            process.readyReadStandardOutput.connect(lambda p=process: self._read_terminal_stdout(p))
+            process.finished.connect(lambda exit_code, exit_status, p=process: self._terminal_session_finished(p, exit_code, exit_status))
+            process.errorOccurred.connect(lambda error, p=process: self._terminal_session_error(p, error))
+            self.terminal_session = process
+            if os.name == "nt":
+                # A compilacao Android/Flet normalmente e documentada e testada
+                # via activate.bat. Usar cmd preserva esse ambiente entre comandos.
+                process.start(os.environ.get("COMSPEC", "cmd.exe"), ["/Q", "/K"])
+            else:
+                process.start("/bin/sh", ["-i"])
+        self._terminal_session_command_number += 1
+        marker = f"__MEROTEC_COMMAND_DONE_{self._terminal_session_command_number}__"
+        self._terminal_session_marker = marker
+        self._terminal_session_output_buffer = ""
+        self._terminal_session_interactive = self._command_requires_interactive_input(command)
+        self._start_terminal_progress("session", f"Executando: {command}")
+        if os.name == "nt":
+            wrapped_command = f"{command} & echo {marker}"
+        else:
+            wrapped_command = f"({command}); printf '{marker}\\n'"
+        try:
+            process.write((wrapped_command + "\r\n").encode("utf-8"))
+        except RuntimeError:
+            self.terminal_session = None
+            self._stop_terminal_progress("session")
+            self._terminal_session_queue.clear()
+            self.append_terminal("A sessao do terminal foi encerrada. Envie o comando novamente.\n")
+            return
+        self.set_status("Executando comando no terminal")
+
+    @staticmethod
+    def _command_requires_interactive_input(command):
+        """Ferramentas que normalmente pedem senha ou confirmação no próprio terminal."""
+        return bool(re.search(r"\b(?:jarsigner|keytool|apksigner|adb)\b", str(command or ""), re.IGNORECASE))
+
+    def _send_terminal_session_input(self, value):
+        """Envia uma resposta ao processo ativo sem expô-la como comando ou histórico."""
+        process = self.terminal_session
+        try:
+            if not process or process.state() == QProcess.ProcessState.NotRunning:
+                raise RuntimeError("sessao encerrada")
+            process.write((value + "\r\n").encode("utf-8"))
+        except RuntimeError:
+            self.terminal_session = None
+            self._terminal_session_interactive = False
+            self._stop_terminal_progress("session")
+            self.append_terminal("A sessao interativa foi encerrada. Execute o comando novamente.\n")
+            return
+        self.append_terminal("[Terminal] Resposta enviada ao processo interativo.\n")
+        self.set_status("Aguardando o processo interativo")
+
+    def _terminal_session_finished(self, process, _exit_code, _exit_status):
+        if process is not self.terminal_session:
+            return
+        self._read_terminal_stdout(process)
+        self.terminal_session = None
+        self._stop_terminal_progress("session")
+        self._terminal_session_marker = ""
+        self._terminal_session_queue.clear()
+        self._terminal_session_interactive = False
+        try:
+            process.deleteLater()
+        except RuntimeError:
+            pass
+        self.set_status("Sessao do terminal encerrada")
+
+    def _terminal_session_error(self, process, error):
+        if process is not self.terminal_session or error != QProcess.ProcessError.FailedToStart:
+            return
+        try:
+            detail = process.errorString()
+            process.deleteLater()
+        except RuntimeError:
+            detail = "processo removido"
+        self.append_terminal(f"Nao foi possivel iniciar o terminal: {detail}.\n")
+        self.terminal_session = None
+        self._stop_terminal_progress("session")
+        self._terminal_session_marker = ""
+        self._terminal_session_queue.clear()
+        self._terminal_session_interactive = False
+        self.set_status("Falha ao iniciar terminal")
 
     def _shell_command(self, command):
         """Retorna o interpretador que corresponde ao prompt exibido pela IDE."""
@@ -1046,72 +1318,194 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         pattern = r"^(\s*(?:python(?:\.exe)?|py)(?:\s+-\d+(?:\.\d+)*)?)(?!\s+-u\b)(?=\s)"
         return re.sub(pattern, r"\1 -u", command, count=1, flags=re.IGNORECASE)
 
-    def start_terminal_process(self, program, arguments, label):
+    def start_terminal_process(self, program, arguments, label, working_directory=None):
         if self.terminal_process and self.terminal_process.state() != QProcess.ProcessState.NotRunning:
             self.append_terminal("Um processo ja esta em execucao. Interrompa-o antes de iniciar outro.\n")
             return False
         process = QProcess(self)
-        process.setWorkingDirectory(str(self.workspace))
+        process.setWorkingDirectory(str(Path(working_directory or self.terminal_working_directory).resolve()))
         # Um único fluxo preserva a ordem entre stdout/stderr e evita que logs
         # importantes do compilador só apareçam quando o processo terminar.
         process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        process.readyReadStandardOutput.connect(self._read_terminal_stdout)
-        process.readyReadStandardError.connect(self._read_terminal_stderr)
-        process.finished.connect(self._terminal_finished)
-        process.errorOccurred.connect(self._terminal_error)
+        process.readyReadStandardOutput.connect(lambda p=process: self._read_terminal_stdout(p))
+        process.finished.connect(lambda exit_code, exit_status, p=process: self._terminal_finished(p, exit_code, exit_status))
+        process.errorOccurred.connect(lambda error, p=process: self._terminal_error(p, error))
         self.terminal_process = process
         self._terminal_command = label
+        self._terminal_cancel_requested = False
         self.terminal_input.setEnabled(False)
+        self._start_terminal_progress("process", f"Executando: {label}")
         process.start(program, arguments)
         return True
 
-    def _read_terminal_stdout(self):
-        if self.terminal_process:
-            data = bytes(self.terminal_process.readAllStandardOutput())
-            self.append_terminal(data.decode("utf-8", errors="replace"))
+    def _start_terminal_progress(self, source, description):
+        self._terminal_progress_percent = None
+        self._terminal_progress_sources[source] = (str(description), time.monotonic())
+        if hasattr(self, "terminal_progress_timer") and not self.terminal_progress_timer.isActive():
+            self.terminal_progress_timer.start()
+        self._render_terminal_progress()
 
-    def _read_terminal_stderr(self):
-        if self.terminal_process:
-            data = bytes(self.terminal_process.readAllStandardError())
-            self.append_terminal(data.decode("utf-8", errors="replace"))
+    def _stop_terminal_progress(self, source):
+        self._terminal_progress_sources.pop(source, None)
+        if self._terminal_progress_sources:
+            self._render_terminal_progress()
+            return
+        if hasattr(self, "terminal_progress_timer"):
+            self.terminal_progress_timer.stop()
+        if hasattr(self, "terminal_progress_label"):
+            self.terminal_progress_label.hide()
+        if hasattr(self, "terminal_progress_bar"):
+            self.terminal_progress_bar.hide()
 
-    def _terminal_error(self, error):
-        process = self.terminal_process
+    def _render_terminal_progress(self):
+        if not self._terminal_progress_sources or not hasattr(self, "terminal_progress_label"):
+            return
+        description, started_at = next(reversed(self._terminal_progress_sources.values()))
+        elapsed = max(0, int(time.monotonic() - started_at))
+        frames = ("|", "/", "-", "\\")
+        frame = frames[self._terminal_progress_frame % len(frames)]
+        self._terminal_progress_frame += 1
+        self.terminal_progress_label.setText(f"{frame} {description} ({elapsed}s)")
+        self.terminal_progress_label.show()
+        if hasattr(self, "terminal_progress_bar"):
+            if self._terminal_progress_percent is None:
+                self.terminal_progress_bar.setRange(0, 0)
+            else:
+                self.terminal_progress_bar.setRange(0, 100)
+                self.terminal_progress_bar.setValue(self._terminal_progress_percent)
+            self.terminal_progress_bar.show()
+
+    @staticmethod
+    def _decode_process_output(data):
+        """Aceita tanto UTF-8 quanto a pagina de codigo do terminal local."""
+        if not data:
+            return ""
+        for encoding in ("utf-8", locale.getpreferredencoding(False), "cp850", "cp1252"):
+            try:
+                return data.decode(encoding)
+            except (LookupError, UnicodeDecodeError):
+                continue
+        return data.decode("utf-8", errors="replace")
+
+    def _read_terminal_stdout(self, process=None):
+        process = process or self.terminal_process
         if not process:
+            return
+        try:
+            data = bytes(process.readAllStandardOutput())
+        except RuntimeError:
+            return
+        text = self._decode_process_output(data)
+        self._observe_terminal_progress_output(text)
+        if process is self.terminal_session:
+            self._append_terminal_session_output(text)
+            return
+        self.append_terminal(text)
+
+    def _observe_terminal_progress_output(self, text):
+        """Aproveita porcentagens emitidas por Flutter/Flet e outros instaladores."""
+        matches = re.findall(r"\b(\d{1,3})%", str(text or ""))
+        if not matches:
+            return
+        percent = int(matches[-1])
+        if 0 <= percent <= 100:
+            self._terminal_progress_percent = percent
+            self._render_terminal_progress()
+
+    def _append_terminal_session_output(self, text):
+        """Remove o marcador interno usado para saber quando um comando da sessão terminou."""
+        self._terminal_session_output_buffer += text
+        marker = self._terminal_session_marker
+        if not marker:
+            self.append_terminal(self._terminal_session_output_buffer)
+            self._terminal_session_output_buffer = ""
+            return
+        marker_index = self._terminal_session_output_buffer.find(marker)
+        if marker_index >= 0:
+            before = self._terminal_session_output_buffer[:marker_index]
+            after = self._terminal_session_output_buffer[marker_index + len(marker):]
+            self.append_terminal((before + after).lstrip("\r\n"))
+            self._terminal_session_output_buffer = ""
+            self._terminal_session_marker = ""
+            self._terminal_session_interactive = False
+            self._stop_terminal_progress("session")
+            self.set_status("Terminal pronto")
+            self._run_next_terminal_session_command()
+            return
+        safe_length = max(0, len(self._terminal_session_output_buffer) - len(marker) - 2)
+        if safe_length:
+            self.append_terminal(self._terminal_session_output_buffer[:safe_length])
+            self._terminal_session_output_buffer = self._terminal_session_output_buffer[safe_length:]
+
+    def _run_next_terminal_session_command(self):
+        if not self._terminal_session_queue:
+            return
+        command = self._terminal_session_queue.pop(0)
+        QTimer.singleShot(0, lambda value=command: self._send_to_terminal_session(value))
+
+    def _read_terminal_stderr(self, process=None):
+        process = process or self.terminal_process
+        if not process:
+            return
+        try:
+            data = bytes(process.readAllStandardError())
+        except RuntimeError:
+            return
+        self.append_terminal(self._decode_process_output(data))
+
+    def _terminal_error(self, process, error):
+        if process is not self.terminal_process:
             return
         if error == QProcess.ProcessError.FailedToStart:
             detail = process.errorString().strip()
             self.append_terminal(f"Nao foi possivel iniciar '{self._terminal_command}': {detail or 'executavel indisponivel'}.\n")
             self.set_status("Falha ao iniciar comando")
             self.terminal_input.setEnabled(True)
+            self._terminal_cancel_requested = False
+            self._stop_terminal_progress("process")
             process.deleteLater()
             self.terminal_process = None
             self._terminal_prompt()
             self.terminal_input.setFocus()
 
-    def _terminal_finished(self, exit_code, exit_status):
-        if not self.terminal_process:
+    def _terminal_finished(self, process, exit_code, exit_status):
+        if process is not self.terminal_process:
             return
-        self._read_terminal_stdout()
-        self._read_terminal_stderr()
+        self._read_terminal_stdout(process)
+        self._read_terminal_stderr(process)
         succeeded = exit_status == QProcess.ExitStatus.NormalExit and exit_code == 0
-        message = "\nProcesso concluido com sucesso.\n" if succeeded else f"\nProcesso terminou com codigo {exit_code}.\n"
+        was_cancelled = self._terminal_cancel_requested
+        if was_cancelled:
+            message = "\nProcesso interrompido.\n"
+        else:
+            message = "\nProcesso concluido com sucesso.\n" if succeeded else f"\nProcesso terminou com codigo {exit_code}.\n"
         self.append_terminal(message)
-        self.set_status("Pronto" if succeeded else "Execucao com erro")
+        self.set_status("Interrompido" if was_cancelled else ("Pronto" if succeeded else "Execucao com erro"))
         self.terminal_input.setEnabled(True)
-        self.terminal_process.deleteLater()
+        self._terminal_cancel_requested = False
+        self._stop_terminal_progress("process")
+        process.deleteLater()
         self.terminal_process = None
         self._terminal_prompt()
         self.terminal_input.setFocus()
 
     def cancel_terminal_process(self):
-        process = self.terminal_process
+        process = self.terminal_process or self.terminal_session
         if not process or process.state() == QProcess.ProcessState.NotRunning:
             self.set_status("Nenhum processo em execucao")
             return
         self.append_terminal("\nInterrompendo processo...\n")
+        self._terminal_cancel_requested = True
         process.terminate()
-        QTimer.singleShot(1500, lambda: process.kill() if process.state() != QProcess.ProcessState.NotRunning else None)
+        QTimer.singleShot(1500, lambda: self._force_stop_terminal_process(process))
+
+    def _force_stop_terminal_process(self, process):
+        """Encerra tambem os filhos iniciados pelo shell, se ainda houver processo."""
+        if process not in (self.terminal_process, self.terminal_session) or process.state() == QProcess.ProcessState.NotRunning:
+            return
+        if os.name == "nt" and process.processId():
+            QProcess.startDetached("taskkill.exe", ["/PID", str(process.processId()), "/T", "/F"])
+        process.kill()
 
     def add_chat(self, author, message, outgoing=False):
         bubble = ChatBubble(author, message, outgoing)
@@ -1138,12 +1532,25 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
 
     def _set_chat_busy(self, busy):
         self.chat_busy = busy
+        if busy:
+            self.chat_started_at = time.monotonic()
+            self.chat_last_activity = "Preparando a tarefa"
+            self._start_terminal_progress("ai", "IA processando")
+        else:
+            self.chat_started_at = None
+            self._stop_terminal_progress("ai")
         self.chat_input.setEnabled(not busy)
         self.send_button.setEnabled(not busy)
         self.attach_button.setEnabled(not busy)
         self._set_button_state(self.send_button, busy=busy)
         self._set_button_state(self.cancel_button, active=busy)
         self.cancel_button.setVisible(busy)
+        if hasattr(self, "quota_refresh_timer"):
+            if busy:
+                self.quota_refresh_timer.start()
+            else:
+                self.quota_refresh_timer.stop()
+                self.refresh_quota_status()
 
     def _clear_attachment_rows(self):
         while self.attachment_items_layout.count():
@@ -1279,22 +1686,25 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
                     context_parts.append(f"ANEXO: {path.name} (binario ou indisponivel)")
         image = next((path for path in attachments if self._is_image_attachment(path)), None)
         self.streaming_text = ""
-        self.streaming_bubble = self.add_chat("Merotec IA", "Pensando...")
+        self.streaming_bubble = None
+        self.activity_bubble = self.add_chat("Atividade da IA", "• Preparando a tarefa...")
+        self.activity_lines = ["• Preparando a tarefa..."]
         threading.Thread(target=self._generate_reply, args=(prompt, "\n\n".join(context_parts), image), daemon=True).start()
 
     def _generate_reply(self, prompt, context, image_path=None):
         try:
+            self.chat_stream.emit("[ATIVIDADE] Montando o contexto do editor e do projeto...")
             smart_context = "\n\n".join(part for part in [
                 context,
                 self.build_smart_task_brief(prompt, objective=prompt),
                 self.build_project_intelligence_context(),
                 f"Arquivos do workspace:\n{self.get_workspace_tree()}",
             ] if part)
+            self.chat_stream.emit("[ATIVIDADE] Enviando a tarefa para o provedor de IA...")
             reply = self.engine.generate_solution(prompt, image_path=str(image_path) if image_path else None, code_context=smart_context, stream_callback=self.chat_stream.emit, workspace_path=self.current_workspace)
         except Exception as exc:
             reply = f"Nao foi possivel consultar o provedor configurado: {exc}"
         self.chat_reply.emit(reply or "Nao recebi uma resposta do provedor configurado.")
-        self.ui_bridge.call_soon(lambda: self.set_status("Pronto"))
 
     def get_workspace_tree(self, limit=220):
         paths = []
@@ -1333,20 +1743,59 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.add_chat("Sistema", "Tarefa da IA cancelada pelo usuario.")
 
     def append_chat_stream(self, chunk):
+        text = str(chunk or "")
+        if text.startswith("[TERMINAL_IA]"):
+            command = text.removeprefix("[TERMINAL_IA]").strip()
+            if command:
+                self.append_terminal(f"\n[IA - comando executado] {command}\n")
+                self._append_chat_activity(f"Comando enviado ao terminal: {command}")
+            return
+        if text.startswith("[TERMINAL_IA_OUTPUT]"):
+            output = text.removeprefix("[TERMINAL_IA_OUTPUT]").lstrip()
+            if output:
+                self.append_terminal(f"[IA - saida]\n{output}\n")
+            return
+        if text.startswith("[ATIVIDADE]"):
+            self._append_chat_activity(text.removeprefix("[ATIVIDADE]").strip())
+            return
         if not self.streaming_bubble:
             self.streaming_bubble = self.add_chat("Merotec IA", "")
-        self.streaming_text += str(chunk or "")
+        self.chat_last_activity = "Recebendo a resposta da IA"
+        self.streaming_text += text
         self.streaming_bubble.label.setText(self.streaming_text)
+        self.chat_scroll.verticalScrollBar().setValue(self.chat_scroll.verticalScrollBar().maximum())
+
+    def _append_chat_activity(self, detail):
+        """Exibe etapas do agente sem mistura-las ao texto final da resposta."""
+        detail = " ".join(str(detail or "").split())
+        if not detail:
+            return
+        self.chat_last_activity = detail
+        line = f"• {detail}"
+        if self.activity_lines and self.activity_lines[-1] == line:
+            return
+        self.activity_lines.append(line)
+        self.activity_lines = self.activity_lines[-12:]
+        if not self.activity_bubble:
+            self.activity_bubble = self.add_chat("Atividade da IA", "")
+        self.activity_bubble.label.setText("\n".join(self.activity_lines))
         self.chat_scroll.verticalScrollBar().setValue(self.chat_scroll.verticalScrollBar().maximum())
 
     def finish_chat_reply(self, reply):
         self.last_response = reply
         self._set_chat_busy(False)
+        self._append_chat_activity("Resposta recebida; finalizando a tarefa.")
         if self.streaming_bubble:
             self.streaming_bubble.label.setText(reply)
             self.streaming_bubble = None
         else:
             self.add_chat("Merotec IA", reply)
+        # Atualiza a interface antes de processar PATCH/EXECUTE da resposta,
+        # pois essas acoes podem levar alguns segundos no thread principal.
+        self.set_status("Pronto")
+        QTimer.singleShot(0, lambda text=reply: self._apply_agent_reply_actions(text))
+
+    def _apply_agent_reply_actions(self, reply):
         actions = QtAgentActions(self.workspace, self.add_chat, self.run_agent_command, self.agent_changed_files)
         actions.apply(reply)
 
@@ -1445,7 +1894,8 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         if self.terminal_process and self.terminal_process.state() != QProcess.ProcessState.NotRunning:
             self.add_chat("Sistema", "Comando da IA nao executado: o terminal ja esta ocupado.")
             return
-        self.append_terminal(f"\n[IA] {command}\n")
+        self.append_terminal(f"\n[IA - comando executado] {command}\n")
+        self._append_chat_activity(f"Comando enviado ao terminal: {command}")
         self._start_shell_command(command)
 
     def agent_changed_files(self, paths):
@@ -1577,12 +2027,12 @@ QSplitter::handle { background: #223347; } QSplitter::handle:hover { background:
 QFrame#activityBar, QFrame#explorer, QFrame#chatPanel { background: #0c1826; border-right: 1px solid #26384c; }
 QFrame#chatPanel { border-right: 0; border-left: 1px solid #26384c; }
 QPushButton#activityButton { min-width: 42px; max-width: 42px; min-height: 42px; border: 0; border-radius: 4px; background: transparent; } QPushButton#activityButton:hover { background: #183449; } QPushButton#activityButton:pressed, QPushButton#activityButton[active="true"], QPushButton#activityButton[busy="true"] { background: #1d5b78; color: #ffffff; }
-QLabel#panelTitle, QLabel#terminalTitle { color: #dbe6f5; font-weight: 700; font-size: 15px; } QLineEdit#search { background: #122235; border: 1px solid #2b4057; border-radius: 4px; padding: 7px; color: #dce8f6; }
+QLabel#panelTitle, QLabel#terminalTitle { color: #dbe6f5; font-weight: 700; font-size: 15px; } QLabel#explorerRoot { color: #dbe6f5; background: #122235; border: 1px solid #2b4057; border-radius: 4px; padding: 6px 8px; font-weight: 600; } QLineEdit#search { background: #122235; border: 1px solid #2b4057; border-radius: 4px; padding: 7px; color: #dce8f6; }
 QTreeView#fileTree { background: transparent; border: 0; color: #c6d1df; padding: 3px; } QTreeView#fileTree::item { padding: 5px; border-radius: 4px; } QTreeView#fileTree::item:selected { background: #24344b; color: white; }
 QPushButton#tinyButton { background: transparent; border: 0; color: #c9d9ea; font-size: 21px; } QPushButton#tinyButton:hover { color: #27d7f0; }
 QTabWidget#editorTabs::pane { border: 0; } QTabBar::tab { background: #0d1927; color: #b5c3d3; padding: 10px 18px; border-right: 1px solid #223347; min-width: 105px; } QTabBar::tab:hover { background: #17334a; color: #edf8ff; } QTabBar::tab:selected { background: #173b56; color: #eef6ff; border-top: 2px solid #20cbea; } QTabBar::close-button { background: #29445b; border: 1px solid #416881; border-radius: 4px; margin: 3px; } QTabBar::close-button:hover { background: #a63e50; border-color: #f28b99; } QTabBar::close-button:pressed { background: #d05064; border-color: #ffd0d6; }
 QPlainTextEdit#editor { background: #0c1725; color: #d9e2ed; border: 0; padding: 10px; selection-background-color: #294a65; }
-QFrame#terminalPanel { background: #0a1420; border-top: 1px solid #26384c; } QPlainTextEdit#terminal { background: #09131f; border: 0; border-top: 1px solid #203349; color: #bdc9d9; padding: 10px; } QLineEdit#terminalInput { background: #0b1725; border: 1px solid #203349; color: #dce8f6; padding: 8px 12px; } QPushButton#terminalAction { background: transparent; border: 0; color: #a5b8cc; padding: 4px 9px; } QPushButton#terminalAction:hover { color: #21d0eb; }
+QFrame#terminalPanel { background: #0a1420; border-top: 1px solid #26384c; } QLabel#terminalProgress { color: #79d8e9; padding-left: 12px; } QProgressBar#terminalProgressBar { background: #11263a; border: 0; } QProgressBar#terminalProgressBar::chunk { background: #20cbe8; } QPlainTextEdit#terminal { background: #09131f; border: 0; border-top: 1px solid #203349; color: #bdc9d9; padding: 10px; } QLineEdit#terminalInput { background: #0b1725; border: 1px solid #203349; color: #dce8f6; padding: 8px 12px; } QPushButton#terminalAction { background: transparent; border: 0; color: #a5b8cc; padding: 4px 9px; } QPushButton#terminalAction:hover { color: #21d0eb; }
 QLabel#chatTitle { font-weight: 700; font-size: 17px; color: #eef5ff; } QLabel#provider { color: #68cfea; font-size: 11px; } QScrollArea#chatScroll, QScrollArea#chatScroll > QWidget > QWidget { border: 0; background: #0c1826; } QFrame#chatIncoming, QFrame#chatOutgoing { border-radius: 8px; max-width: 300px; } QFrame#chatIncoming { background: #182637; } QFrame#chatOutgoing { background: #164a75; } QLabel#chatText { color: #e1ebf6; } QLabel#chatMeta { color: #8fa2b7; font-size: 11px; }
 QFrame#attachmentPanel { background: #102238; border: 1px solid #2e5e7b; border-radius: 6px; }
 QLabel#attachmentLabel { color: #9be7f6; font-weight: 600; }

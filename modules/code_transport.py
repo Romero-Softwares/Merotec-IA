@@ -24,6 +24,10 @@ SOURCE_SUFFIXES = {
     ".scss",
     ".ps1",
     ".sh",
+    ".cs",
+    ".cpp",
+    ".cc",
+    ".cxx",
 }
 
 LANGUAGE_BY_SUFFIX = {
@@ -43,6 +47,10 @@ LANGUAGE_BY_SUFFIX = {
     ".scss": "css",
     ".ps1": "powershell",
     ".sh": "shell",
+    ".cs": "csharp",
+    ".cpp": "cpp",
+    ".cc": "cpp",
+    ".cxx": "cpp",
 }
 
 VOID_HTML_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}

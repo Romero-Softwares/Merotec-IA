@@ -39,12 +39,20 @@ class ProjectManager:
             "dart/flutter": "flutter",
             "flet-python": "flet",
             "python-flet": "flet",
+            "c++": "cpp",
+            "cxx": "cpp",
+            "c#": "csharp",
+            "csharp": "csharp",
+            "dotnet": "csharp",
         }
         kind = aliases.get(kind, kind)
-        if kind not in {"empty", "python", "web", "flet", "dart", "flutter"}:
-            raise ValueError("Tipo invalido. Use vazio, python, web, flet, dart ou flutter.")
+        if kind not in {"empty", "python", "web", "flet", "dart", "flutter", "cpp", "csharp"}:
+            raise ValueError("Tipo invalido. Use vazio, python, web, flet, dart, flutter, cpp ou csharp.")
         safe_pubspec_name = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_") or "merotec_app"
         dart_display_name = name.replace("\\", "\\\\").replace("'", "\\'")
+        dotnet_project_name = re.sub(r"[^A-Za-z0-9_]", "", name) or "MerotecApp"
+        if dotnet_project_name[0].isdigit():
+            dotnet_project_name = f"App{dotnet_project_name}"
 
         project_path.mkdir()
         (project_path / "README.md").write_text(
@@ -132,6 +140,30 @@ class ProjectManager:
                 "body { font-family: system-ui, sans-serif; margin: 2rem; }\n", encoding="utf-8"
             )
             (project_path / "app.js").write_text('console.log("Projeto pronto.");\n', encoding="utf-8")
+        elif kind == "cpp":
+            (project_path / "main.cpp").write_text(
+                "#include <iostream>\n\n"
+                "int main() {\n"
+                "    std::cout << \"Ola, Merotec IA + C++!\\n\";\n"
+                "    return 0;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+        elif kind == "csharp":
+            (project_path / f"{dotnet_project_name}.csproj").write_text(
+                "<Project Sdk=\"Microsoft.NET.Sdk\">\n"
+                "  <PropertyGroup>\n"
+                "    <OutputType>Exe</OutputType>\n"
+                "    <TargetFramework>net8.0</TargetFramework>\n"
+                "    <ImplicitUsings>enable</ImplicitUsings>\n"
+                "    <Nullable>enable</Nullable>\n"
+                "  </PropertyGroup>\n"
+                "</Project>\n",
+                encoding="utf-8",
+            )
+            (project_path / "Program.cs").write_text(
+                'Console.WriteLine("Ola, Merotec IA + C#!");\n', encoding="utf-8"
+            )
         return project_path
 
     def save_file(self, project_name, subfolder, filename, content):

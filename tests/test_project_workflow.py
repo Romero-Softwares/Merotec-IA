@@ -52,6 +52,16 @@ class ProjectManagerTests(unittest.TestCase):
             self.assertEqual("dart", ProjectLoader.detect_project_type(dart_project))
             self.assertEqual("flutter", ProjectLoader.detect_project_type(flutter_project))
 
+    def test_create_cpp_and_csharp_projects_with_runnable_starters(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = ProjectManager(temp_dir)
+            cpp_project = manager.create_project(temp_dir, "console-cpp", "cpp")
+            csharp_project = manager.create_project(temp_dir, "console-csharp", "csharp")
+
+            self.assertIn("int main()", (cpp_project / "main.cpp").read_text(encoding="utf-8"))
+            self.assertTrue((csharp_project / "Program.cs").is_file())
+            self.assertEqual(1, len(list(csharp_project.glob("*.csproj"))))
+
     def test_existing_project_is_never_overwritten(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             manager = ProjectManager(temp_dir)

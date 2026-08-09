@@ -31,8 +31,9 @@ echo.
 echo ********************************************************
 echo.
 echo [SISTEMA] Abrindo a interface grafica da IDE...
-"venv\Scripts\python.exe" main.py ::--legacy-tk
-if errorlevel 1 goto :startup_error
+:: pythonw evita manter um console externo concorrendo com o terminal integrado.
+:: Todos os comandos de projeto devem ser executados pelo painel TERMINAL da IDE.
+start "" /b "venv\Scripts\pythonw.exe" main.py
 exit /b 0
 
 :startup_error

@@ -522,10 +522,23 @@ class UniversalEngine:
     def _remember_token_usage(self, payload):
         if not isinstance(payload, dict):
             return
-        token_usage = payload.get("tokenUsage") if "tokenUsage" in payload else payload
+        token_usage = payload.get("tokenUsage", payload.get("totalTokenUsage", payload))
         if isinstance(token_usage, dict):
             self.latest_token_usage = token_usage
             self.latest_quota_updated_at = time.time()
+
+    def _remember_runtime_usage(self, payload):
+        """Captura uso enviado em eventos de progresso ou na conclusao da rodada."""
+        if not isinstance(payload, dict):
+            return
+        if any(key in payload for key in ("tokenUsage", "totalTokenUsage", "modelContextWindow", "totalTokens")):
+            self._remember_token_usage(payload)
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            self._remember_openai_usage(usage)
+        turn = payload.get("turn")
+        if isinstance(turn, dict):
+            self._remember_runtime_usage(turn)
 
     def _remember_openai_usage(self, usage):
         if not isinstance(usage, dict):
@@ -590,6 +603,7 @@ class UniversalEngine:
             self._remember_token_usage(params)
         if lower_method in {"error", "warning"} or lower_method.endswith("/error"):
             self._remember_quota_error(params)
+        self._remember_runtime_usage(params)
 
     def _remember_app_server_quota_message(self, method, params):
         self._remember_quota_message_handler(method, params)
@@ -645,9 +659,16 @@ class UniversalEngine:
             return ""
         total = token_usage.get("total") or {}
         last = token_usage.get("last") or {}
-        total_tokens = total.get("totalTokens") if isinstance(total, dict) else None
-        last_tokens = last.get("totalTokens") if isinstance(last, dict) else None
-        context_window = token_usage.get("modelContextWindow")
+        total_tokens = total.get("totalTokens") if isinstance(total, dict) else token_usage.get("totalTokens")
+        last_tokens = last.get("totalTokens") if isinstance(last, dict) else token_usage.get("lastTokens")
+        if total_tokens is None:
+            input_tokens = token_usage.get("inputTokens", token_usage.get("input_tokens", 0)) or 0
+            output_tokens = token_usage.get("outputTokens", token_usage.get("output_tokens", 0)) or 0
+            try:
+                total_tokens = int(input_tokens) + int(output_tokens)
+            except (TypeError, ValueError):
+                total_tokens = input_tokens or None
+        context_window = token_usage.get("modelContextWindow") or token_usage.get("contextWindow") or token_usage.get("context_window")
         if total_tokens is not None and context_window:
             return f"ctx {self._compact_number(total_tokens)}/{self._compact_number(context_window)}"
         if total_tokens is not None:
@@ -2411,7 +2432,13 @@ except Exception as exc:
 
                 progress = self._extract_app_server_progress(method, params)
                 if progress and stream_callback:
-                    stream_callback(progress)
+                    stream_callback(f"[ATIVIDADE] {progress}")
+                    command = self._extract_app_server_command_text(params)
+                    if command:
+                        stream_callback(f"[TERMINAL_IA] {command}")
+                    output = params.get("output")
+                    if output and any(marker in method.lower() for marker in ("command", "exec")):
+                        stream_callback(f"[TERMINAL_IA_OUTPUT] {output}")
                     continue
 
                 if method in {"error", "warning", "rawOutput"}:
@@ -2472,17 +2499,20 @@ except Exception as exc:
             or ""
         )
         if text:
-            return text
+            label = "Progresso do agente"
+            if "patch" in lower_method or "filechange" in lower_method:
+                label = "Alterando arquivos"
+            elif "command" in lower_method or "exec" in lower_method:
+                label = "Executando comando"
+            return f"{label}: {str(text).strip()}"
 
-        command = params.get("command")
-        if isinstance(command, list):
-            command = " ".join(str(part) for part in command)
-        if command and any(marker in lower_method for marker in ("start", "begin", "created")):
-            return f"\nExecutando: {command}\n"
+        command = self._extract_app_server_command_text(params)
+        if command:
+            return f"Executando: {command}"
 
         status = params.get("status")
         if status:
-            return f"\nStatus: {status}\n"
+            return f"Status da atividade: {status}"
 
         return ""
 
