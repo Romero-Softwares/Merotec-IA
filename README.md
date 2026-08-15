@@ -8,7 +8,8 @@ gerenciamento de projetos, execucao de comandos, navegador interno e recursos de
 
 ## Nova interface PySide6
 
-<img width="1919" height="1019" alt="image" src="https://github.com/user-attachments/assets/c9f5e7c7-9087-4601-8ea3-2030219c49bf" />
+<img width="1919" height="1013" alt="image" src="https://github.com/user-attachments/assets/62908d27-b26a-4af2-9783-57446523791a" />
+
 
 ## Fluxo de projetos
 
