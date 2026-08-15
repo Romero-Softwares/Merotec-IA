@@ -6350,5 +6350,3 @@ if __name__ == "__main__":
     if not _activate_existing_instance():
         app = UniversalApp()
         app.mainloop()
-        app = UniversalApp()
-        app.mainloop()

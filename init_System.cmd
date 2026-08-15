@@ -31,9 +31,9 @@ echo.
 echo ********************************************************
 echo.
 echo [SISTEMA] Abrindo a interface grafica da IDE...
-:: pythonw evita manter um console externo concorrendo com o terminal integrado.
+:: Executa a IDE no processo Python do ambiente virtual.
 :: Todos os comandos de projeto devem ser executados pelo painel TERMINAL da IDE.
-start "" /b "venv\Scripts\pythonw.exe" main.py
+start "" /b "venv\Scripts\python.exe" main.py
 exit /b 0
 
 :startup_error

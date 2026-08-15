@@ -16,6 +16,7 @@ import os
 import sys
 import threading
 import time
+from urllib.parse import unquote
 from pathlib import Path
 
 
@@ -37,6 +38,24 @@ def _storage_path(scope: object = "chat-web") -> str:
 
 def _js_arg(value: object) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def _decoded_dom_text(payload: object) -> str:
+    """Lê texto do DOM sem depender da conversão Unicode do pywebview.
+
+    Em alguns WebView2, o retorno direto de ``evaluate_js`` troca acentos por
+    U+FFFD antes de chegar ao Python. O JavaScript devolve ``encodeURIComponent``
+    (ASCII), que aqui é restaurado depois da travessia da ponte nativa.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    encoded = payload.get("textEncoded")
+    if isinstance(encoded, str):
+        try:
+            return unquote(encoded)
+        except Exception:
+            pass
+    return str(payload.get("text") or "")
 
 
 def _page_info(window, fallback_url: str = "") -> dict:
@@ -500,10 +519,110 @@ def run(
                       }});
                     }})()
                     """
-                    prepared_raw = window.evaluate_js(prepare_script)
-                    prepared = json.loads(prepared_raw) if isinstance(prepared_raw, str) else (prepared_raw or {})
+                    if bool(command.get("direct_chat")):
+                        # Perguntas comuns não têm anexos nem precisam do
+                        # pipeline de drag/drop. Um script curto elimina a
+                        # falha intermitente do evaluate_js em páginas recém-
+                        # carregadas e mantém a conversa responsiva desde a
+                        # primeira mensagem.
+                        prepare_script = f"""
+                        (() => {{
+                          const visible = el => {{
+                            if (!el) return false;
+                            const s=getComputedStyle(el), r=el.getBoundingClientRect();
+                            return s.display!=='none' && s.visibility!=='hidden' && r.width>0 && r.height>0;
+                          }};
+                          const input = [
+                            '#prompt-textarea', 'textarea[placeholder]',
+                            '[contenteditable="true"][role="textbox"]',
+                            '.ql-editor[contenteditable="true"]', 'textarea',
+                            '[contenteditable]:not([contenteditable="false"])'
+                          ].flatMap(selector => [...document.querySelectorAll(selector)]).find(visible);
+                          if (!input) return JSON.stringify({{ok:false,error:'campo de conversa nao encontrado'}});
+                          const before = [...document.querySelectorAll('[data-message-author-role="assistant"], .model-response-text')].filter(visible);
+                          const value = {_js_arg(prompt)};
+                          input.focus();
+                          if (input.isContentEditable) {{
+                            const selection=getSelection(), range=document.createRange();
+                            range.selectNodeContents(input); range.collapse(false);
+                            selection?.removeAllRanges(); selection?.addRange(range);
+                            if (!document.execCommand('insertText', false, value)) input.textContent=value;
+                          }} else {{
+                            const proto=input.tagName==='TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                            const setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;
+                            if (setter) setter.call(input,value); else input.value=value;
+                          }}
+                          input.dispatchEvent(new InputEvent('input',{{bubbles:true,composed:true,inputType:'insertText',data:value}}));
+                          input.dispatchEvent(new Event('change',{{bubbles:true}}));
+                          return JSON.stringify({{ok:true,beforeCount:before.length,beforeText:(before.at(-1)?.innerText||'').trim(),inputTag:input.tagName.toLowerCase(),attachmentError:'',attachmentCount:0,attachmentInputFound:false}});
+                        }})()
+                        """
+                    # O ChatGPT termina de montar o compositor depois do evento
+                    # ``loaded`` do WebView. Além disso, pywebview retorna None
+                    # quando uma avaliação JavaScript falha sem propagar a
+                    # exceção. Envolvemos a avaliação e aguardamos o compositor
+                    # antes de decidir que o envio falhou.
+                    safe_prepare_script = f"""
+                    (() => {{
+                      try {{
+                        const result = ({prepare_script});
+                        return typeof result === 'string' ? result : JSON.stringify(result);
+                      }} catch (error) {{
+                        return JSON.stringify({{ok:false,error:'falha JavaScript ao preparar mensagem: ' + String(error?.message || error)}});
+                      }}
+                    }})()
+                    """
+                    prepared_raw = None
+                    prepared = {}
+                    # WebView2 pode devolver None por alguns instantes após o
+                    # evento "loaded", enquanto a página ainda inicializa o
+                    # React. Isso não é uma resposta válida nem um motivo para
+                    # abortar a conversa: aguarde o compositor de fato existir.
+                    for _attempt in range(75):
+                        try:
+                            prepared_raw = window.evaluate_js(safe_prepare_script)
+                            if prepared_raw is None or prepared_raw == "":
+                                prepared = {
+                                    "ok": False,
+                                    "error": "avaliacao JavaScript ainda sem retorno",
+                                }
+                            elif isinstance(prepared_raw, str):
+                                prepared = json.loads(prepared_raw)
+                            elif isinstance(prepared_raw, dict):
+                                prepared = prepared_raw
+                            else:
+                                prepared = {
+                                    "ok": False,
+                                    "error": "retorno JavaScript em formato inesperado",
+                                }
+                        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                            prepared = {"ok": False, "error": f"retorno inválido do JavaScript: {exc}"}
+                        if prepared.get("ok"):
+                            break
+                        error_text = str(prepared.get("error") or "").lower()
+                        transient = (
+                            "campo de conversa" in error_text
+                            or "sem retorno" in error_text
+                            or "formato inesperado" in error_text
+                            or "retorno inválido" in error_text
+                        )
+                        if not transient:
+                            break
+                        time.sleep(0.4)
                     if not prepared.get("ok"):
-                        _emit("browser_result", request_id=request_id, action=action, ok=False, result=prepared_raw)
+                        failure = prepared if isinstance(prepared, dict) else {}
+                        failure.setdefault("ok", False)
+                        failure.setdefault(
+                            "error",
+                            "O navegador não retornou dados ao preparar a mensagem.",
+                        )
+                        _emit(
+                            "browser_result",
+                            request_id=request_id,
+                            action=action,
+                            ok=False,
+                            result=json.dumps(failure, ensure_ascii=False),
+                        )
                         continue
                     # O print deve chegar ao modelo como anexo real, nunca apenas
                     # como nome de arquivo no texto. Primeiro tentamos input/drop;
@@ -670,7 +789,12 @@ def run(
                     # no compositor e a IDE esperava uma resposta que nunca
                     # seria gerada. A IDE agora confirma que o campo foi limpo
                     # ou que uma nova resposta/stream começou antes de seguir.
-                    send_wait_seconds = 18.0 if prepared.get("attachmentCount") else 6.0
+                    # O React do ChatGPT habilita o controlo de envio alguns
+                    # instantes depois de receber o evento de input. Aguarde o
+                    # botão real em vez de tentar submeter o <form> nativo:
+                    # requestSubmit() apenas muda a URL para
+                    # ?prompt-textarea=... e não publica a mensagem.
+                    send_wait_seconds = 20.0
                     send_deadline = time.time() + send_wait_seconds
                     send_script = r"""
                     (() => {
@@ -679,16 +803,23 @@ def run(
                         const s=getComputedStyle(el), r=el.getBoundingClientRect();
                         return s.display!=='none' && s.visibility!=='hidden' && r.width>0 && r.height>0;
                       };
-                      const direct = [
-                        document.querySelector('[data-testid="send-button"]'),
-                        document.querySelector('button[aria-label*="Send" i]'),
-                        document.querySelector('button[aria-label*="Enviar" i]'),
-                        document.querySelector('button[type="submit"]')
-                      ].find(el => visible(el) && !el.disabled);
-                      let button = direct;
-                      if (!button) button = [...document.querySelectorAll('button')].find(el => {
+                      const selectors = [
+                        '[data-testid="send-button"]',
+                        '[data-testid*="send" i]',
+                        'button[aria-label*="Send" i]',
+                        'button[aria-label*="Enviar" i]',
+                        'button[aria-label*="submit" i]',
+                        'button[type="submit"]'
+                      ];
+                      const candidates = [...new Set(selectors.flatMap(selector =>
+                        [...document.querySelectorAll(selector)]
+                      ))];
+                      let button = candidates.find(el =>
+                        visible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true'
+                      );
+                      if (!button) button = [...document.querySelectorAll('button,[role="button"]')].find(el => {
                         const label=(el.innerText||el.getAttribute('aria-label')||'').toLowerCase();
-                        return visible(el) && !el.disabled && /send|enviar|submit/.test(label);
+                        return visible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true' && /send|enviar|submit/.test(label);
                       });
                       if (button) {
                         try {
@@ -700,17 +831,14 @@ def run(
                           return JSON.stringify({ok:false,error:'falha ao acionar envio: '+String(error?.message||error)});
                         }
                       }
-                      const input=document.querySelector('#prompt-textarea,textarea,[contenteditable]:not([contenteditable="false"])');
-                      const form=input?.closest('form');
-                      if (form?.requestSubmit) { form.requestSubmit(); return JSON.stringify({ok:true,method:'form'}); }
-                      if (input) {
-                        try {
-                          input.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter',code:'Enter',bubbles:true,cancelable:true}));
-                          input.dispatchEvent(new KeyboardEvent('keyup', {key:'Enter',code:'Enter',bubbles:true,cancelable:true}));
-                          return JSON.stringify({ok:true,method:'enter'});
-                        } catch (_) {}
-                      }
-                      return JSON.stringify({ok:false,error:'botao de envio nao encontrado ou desabilitado'});
+                      const detail = candidates.slice(0, 8).map(el => ({
+                        tag: el.tagName,
+                        testid: el.getAttribute('data-testid') || '',
+                        aria: el.getAttribute('aria-label') || '',
+                        disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true',
+                        visible: visible(el)
+                      }));
+                      return JSON.stringify({ok:false,error:'botao de envio nao encontrado ou desabilitado',candidates:detail});
                     })()
                     """
                     confirm_script = r"""
@@ -804,12 +932,20 @@ def run(
                         message="Mensagem enviada; aguardando a resposta do Chat Web.",
                     )
                     deadline = time.time() + timeout_seconds
+                    # Perguntas diretas não executam ações na IDE. Podemos
+                    # verificar a resposta com mais frequência e entregá-la
+                    # assim que o streaming terminar, mantendo a confirmação
+                    # conservadora para tarefas que alteram o projeto.
+                    direct_chat = bool(command.get("direct_chat"))
+                    poll_interval = 0.45 if direct_chat else 1.0
+                    stable_polls_required = 1 if direct_chat else 2
                     last_text = ""
                     stable_polls = 0
                     response_text = ""
                     last_progress_at = time.time()
+                    last_partial_emitted = ""
                     while time.time() < deadline:
-                        time.sleep(1.0)
+                        time.sleep(poll_interval)
                         if time.time() - last_progress_at >= 10.0:
                             _emit(
                                 "browser_progress",
@@ -855,20 +991,30 @@ def run(
                             document.querySelector('button[aria-label*="Stop" i]'),
                             document.querySelector('button[aria-label*="Parar" i]')
                           ].find(visible);
-                          return JSON.stringify({count:nodes.length,text,streaming:stopping});
+                          return JSON.stringify({count:nodes.length,textEncoded:encodeURIComponent(text),streaming:stopping});
                         })()
                         """)
                         poll = json.loads(poll_raw) if isinstance(poll_raw, str) else (poll_raw or {})
-                        current = str(poll.get("text") or "").strip()
+                        current = _decoded_dom_text(poll).strip()
                         changed = poll.get("count", 0) > prepared.get("beforeCount", 0) or current != prepared.get("beforeText", "")
                         if current and changed:
                             response_text = current
+                            if direct_chat and current != last_partial_emitted:
+                                last_partial_emitted = current
+                                _emit(
+                                    "browser_progress",
+                                    request_id=request_id,
+                                    action=action,
+                                    phase="streaming",
+                                    message="Recebendo a resposta do Chat Web.",
+                                    partial=current,
+                                )
                             if current == last_text and not poll.get("streaming"):
                                 stable_polls += 1
                             else:
                                 stable_polls = 0
                             last_text = current
-                            if stable_polls >= 2:
+                            if stable_polls >= stable_polls_required:
                                 break
 
                     if not response_text:
@@ -914,19 +1060,19 @@ def run(
                             '[class*="markdown"]'
                           ].join(',');
                           const nodes = [...document.querySelectorAll(selectors)].filter(visible);
-                          const actionRe = /\[(?:FINAL|READ|SEARCH_TEXT|WEB_SEARCH|SCAN_TEXT|FIX_MOJIBAKE|UNDO|EXECUTE|EXECUTE_ADMIN|OPEN_URL|BROWSER_INSPECT|BROWSER_CLICK|BROWSER_TYPE|BROWSER_SCROLL|BROWSER_CHAT|SCREENSHOT|HUMAN_TEST|WRITE|REPLACE|PATCH)\s*:/i;
+                          const actionRe = /\[(?:FINAL|READ|SEARCH_TEXT|WEB_SEARCH|SCAN_TEXT|FIX_MOJIBAKE|UNDO|VALIDATE|EXECUTE|EXECUTE_ADMIN|OPEN_URL|BROWSER_INSPECT|BROWSER_CLICK|BROWSER_TYPE|BROWSER_SCROLL|BROWSER_CHAT|SCREENSHOT|HUMAN_TEST|WRITE_PART|WRITE|REPLACE|INSERT_BEFORE|INSERT_AFTER|PATCH)\s*:/i;
                           for (const node of nodes.slice().reverse()) {
                             const text = messageText(node).trim();
-                            if (text && actionRe.test(text)) return JSON.stringify({text, source:'assistant-node'});
+                            if (text && actionRe.test(text)) return JSON.stringify({textEncoded:encodeURIComponent(text), source:'assistant-node'});
                           }
                           const body = String(document.body?.innerText || document.body?.textContent || '');
                           const upper = body.toUpperCase();
                           let best = -1;
                           for (const marker of [
                             '[FINAL:', '[READ:', '[SEARCH_TEXT:', '[WEB_SEARCH:', '[SCAN_TEXT:',
-                            '[FIX_MOJIBAKE:', '[UNDO:', '[EXECUTE:', '[EXECUTE_ADMIN:', '[OPEN_URL:',
+                            '[FIX_MOJIBAKE:', '[UNDO:', '[VALIDATE:', '[EXECUTE:', '[EXECUTE_ADMIN:', '[OPEN_URL:',
                             '[BROWSER_INSPECT:', '[BROWSER_CLICK:', '[BROWSER_TYPE:', '[BROWSER_SCROLL:',
-                            '[BROWSER_CHAT:', '[SCREENSHOT:', '[HUMAN_TEST:', '[WRITE:', '[REPLACE:', '[PATCH'
+                            '[BROWSER_CHAT:', '[SCREENSHOT:', '[HUMAN_TEST:', '[WRITE_PART:', '[WRITE:', '[REPLACE:', '[INSERT_BEFORE:', '[INSERT_AFTER:', '[PATCH'
                           ]) {
                             const index = upper.lastIndexOf(marker.toUpperCase());
                             if (index > best) best = index;
@@ -934,7 +1080,7 @@ def run(
                           if (best >= 0) {
                             let text = body.slice(best).trim();
                             text = text.split(/\n(?:Avaliar resposta|Gostei|Não gostei|Copiar|Compartilhar|Regenerar|Tentar novamente|Nova resposta|Read aloud|Copy|Share|Regenerate|Try again|Good response|Bad response|Like|Dislike)/i)[0].trim();
-                            return JSON.stringify({text, source:'body-action-tail'});
+                            return JSON.stringify({textEncoded:encodeURIComponent(text), source:'body-action-tail'});
                           }
                           return JSON.stringify({text:'', source:'none'});
                         })()
@@ -943,7 +1089,7 @@ def run(
                             rescue = json.loads(rescue_raw) if isinstance(rescue_raw, str) else (rescue_raw or {})
                         except Exception:
                             rescue = {}
-                        rescued_text = str(rescue.get("text") or "").strip()
+                        rescued_text = _decoded_dom_text(rescue).strip()
                         if rescued_text:
                             response_text = rescued_text
                             _emit(

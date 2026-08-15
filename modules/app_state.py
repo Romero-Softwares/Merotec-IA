@@ -14,6 +14,7 @@ from modules.app_constants import (
 from modules.ai_profiles import (
     activate_profile,
     active_profile,
+    clear_web_chat_session,
     ensure_ai_profiles,
     get_web_chat_session,
     is_restorable_web_chat_url,
@@ -208,6 +209,24 @@ class AppStateMixin:
             str(url),
             entry_url=entry_url,
             title=title,
+        )
+        self._save_settings()
+
+    def discard_internal_browser_chat_session(self, workspace=None):
+        """Esquece uma conversa restaurada que a conta atual não pode abrir."""
+        workspace = workspace or getattr(self, "current_workspace", "")
+        if not workspace:
+            return
+        entry_url = str(
+            self.settings.get("ai_profiles", {}).get("web_chat", {}).get(
+                "web_chat_url", self.settings.get("web_chat_url", "")
+            )
+        )
+        clear_web_chat_session(
+            self.settings,
+            workspace,
+            "web_chat",
+            entry_url=entry_url,
         )
         self._save_settings()
 

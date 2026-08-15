@@ -7,11 +7,13 @@ janela Tk por uma superficie desktop inspirada no mockup da IDE.
 from __future__ import annotations
 
 import locale
+import json
 import os
 import re
 import sys
 import threading
 import time
+import ctypes
 from datetime import datetime
 from pathlib import Path
 
@@ -23,6 +25,7 @@ from PySide6.QtWidgets import (
     QSizePolicy, QSplitter, QStyle, QTabWidget, QTextEdit, QToolBar, QTreeView, QProgressBar,
     QVBoxLayout, QWidget, QFileSystemModel, QScrollArea,
 )
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtCore import QUrl
 
@@ -42,6 +45,7 @@ from modules.plugin_manager import build_plugin_report_messages, initialize_plug
 
 ROOT = Path(__file__).resolve().parent
 ACCENT = "#18c9e8"
+APP_ICON_PATH = ROOT / "assets" / "merotec-ide-icon.svg"
 
 
 class PythonHighlighter(QSyntaxHighlighter):
@@ -278,11 +282,22 @@ class TerminalInput(QLineEdit):
 
 
 class ChatInput(QPlainTextEdit):
-    """Compositor que converte prints colados em anexos da conversa."""
+    """Compositor que envia com Enter e converte prints colados em anexos."""
 
-    def __init__(self, on_image_paste, parent=None):
+    def __init__(self, on_image_paste, on_submit, parent=None):
         super().__init__(parent)
         self._on_image_paste = on_image_paste
+        self._on_submit = on_submit
+
+    def keyPressEvent(self, event):
+        if (
+            event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter}
+            and not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        ):
+            self._on_submit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def insertFromMimeData(self, source):
         if source is not None and source.hasImage() and self._on_image_paste():
@@ -291,17 +306,42 @@ class ChatInput(QPlainTextEdit):
 
 
 class ChatBubble(QFrame):
-    def __init__(self, author: str, message: str, outgoing=False):
+    def __init__(self, author: str, message: str, outgoing=False, attachments=None):
         super().__init__()
         self.setObjectName("chatOutgoing" if outgoing else "chatIncoming")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 9, 12, 9)
         layout.setSpacing(3)
         self.label = QLabel(message)
+        # Diagnósticos podem conter trechos como <html>; mostre-os literalmente.
+        self.label.setTextFormat(Qt.TextFormat.PlainText)
         self.label.setWordWrap(True)
         self.label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.label.setObjectName("chatText")
         layout.addWidget(self.label)
+        for path in attachments or []:
+            path = Path(path)
+            if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
+                pixmap = QPixmap(str(path))
+                if not pixmap.isNull():
+                    preview = QLabel()
+                    preview.setObjectName("chatImagePreview")
+                    preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    preview.setPixmap(
+                        pixmap.scaled(
+                            260,
+                            180,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                    )
+                    preview.setToolTip(path.name)
+                    layout.addWidget(preview)
+                    continue
+            attachment_name = QLabel(f"Anexo: {path.name}")
+            attachment_name.setObjectName("chatAttachmentName")
+            attachment_name.setWordWrap(True)
+            layout.addWidget(attachment_name)
         sender = QLabel(author)
         sender.setObjectName("chatMeta")
         layout.addWidget(sender)
@@ -310,6 +350,7 @@ class ChatBubble(QFrame):
 class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
     chat_reply = Signal(str)
     chat_stream = Signal(str)
+    browser_action_requested = Signal(str, object, object)
 
     def __init__(self):
         super().__init__()
@@ -351,10 +392,17 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.streaming_text = ""
         self.activity_bubble = None
         self.activity_lines = []
+        self._chat_task_prompt = ""
+        self._chat_agent_round = 0
         self.browser_view = None
+        self.browser_profile = None
         self.internal_browser_url = "about:blank"
+        self.internal_browser_ready_event = threading.Event()
         self.paths_by_tab = {}
-        self.setWindowTitle("Merotec IA IDE")
+        self.attach_internal_web_chat_bridge()
+        self._apply_brand_icon()
+        self.setWindowTitle("Merotec IA IDE — Engenharia Autônoma")
+        self._enable_dark_title_bar()
         self.resize(1400, 700)
         self.setMinimumSize(1120, 600)
         self._build_ui()
@@ -369,10 +417,66 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.load_plugins()
         self.report_plugin_status()
 
+    def _apply_brand_icon(self):
+        """Aplica a marca da IDE na barra de título, seletor Alt+Tab e taskbar."""
+        icon = QIcon(str(APP_ICON_PATH))
+        if icon.isNull():
+            return
+        self.setWindowIcon(icon)
+        app = QApplication.instance()
+        if app is not None:
+            app.setWindowIcon(icon)
+
+    def _enable_dark_title_bar(self):
+        """Alinha a moldura nativa do Windows ao azul escuro da IDE."""
+        if sys.platform != "win32":
+            return
+        try:
+            enabled = ctypes.c_int(1)
+            window_handle = int(self.winId())
+            dwmapi = ctypes.windll.dwmapi
+            # 20 e o atributo atual; 19 atende versoes mais antigas do Windows 10.
+            for attribute in (20, 19):
+                result = dwmapi.DwmSetWindowAttribute(
+                    window_handle,
+                    attribute,
+                    ctypes.byref(enabled),
+                    ctypes.sizeof(enabled),
+                )
+                if result == 0:
+                    break
+
+            # Windows 11 aceita a cor da legenda diretamente pelo DWM.
+            # COLORREF usa BGR: #0a1421 vira 0x21140A.
+            caption_color = ctypes.c_uint(0x21140A)
+            text_color = ctypes.c_uint(0xEBDED5)  # #d5deeb em BGR
+            for attribute, color in ((35, caption_color), (36, text_color)):
+                dwmapi.DwmSetWindowAttribute(
+                    window_handle,
+                    attribute,
+                    ctypes.byref(color),
+                    ctypes.sizeof(color),
+                )
+        except (AttributeError, OSError):
+            # Em ambientes sem DWM, a janela segue com o comportamento nativo.
+            pass
+
     def set_status(self, text, mode="info"):
         if hasattr(self, "status"):
             self.status.setText(f"●  {text}")
             self.refresh_quota_status()
+
+    def attach_internal_web_chat_bridge(self):
+        """Usa o runtime WebView2 estável da interface anterior para o Chat Web.
+
+        O QWebEngine da nova janela continua disponível para navegação manual,
+        mas o ChatGPT pode recusar eventos de envio automatizados nesse widget.
+        Ao deixar a ponte vazia, ``UniversalEngine`` instancia
+        ``WebChatBridge``/``browser_runtime.py`` — o mesmo transporte WebView2
+        usado pela interface CustomTkinter, com o fluxo automático já validado.
+        """
+        self.engine.web_chat_bridge = None
+        return None
 
     def refresh_quota_status(self):
         """Mantem a cota visivel sem alongar a mensagem principal de status."""
@@ -710,7 +814,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.speak_button.setToolTip("Ler ultima resposta")
         self.speak_button.clicked.connect(self.play_last_response)
         composer.addWidget(self.speak_button)
-        self.chat_input = ChatInput(self.add_clipboard_image)
+        self.chat_input = ChatInput(self.add_clipboard_image, self.send_chat)
         self.chat_input.setObjectName("chatInput")
         self.chat_input.setPlaceholderText("Digite sua mensagem...")
         self.chat_input.setFixedHeight(64)
@@ -763,6 +867,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
     def _connect_signals(self):
         self.chat_reply.connect(self.finish_chat_reply)
         self.chat_stream.connect(self.append_chat_stream)
+        self.browser_action_requested.connect(self._run_browser_action)
 
     # Contrato de agendamento usado pela migracao dos mixins para Qt.
     def after(self, milliseconds, callback):
@@ -879,40 +984,263 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
 
     def open_internal_browser(self, url, source="usuario"):
         if self.browser_view is None:
+            # O perfil padrão do Qt pode ser efêmero ou variar conforme o modo
+            # de execução. Um perfil nomeado, com caminhos próprios da IDE,
+            # preserva autenticação, cookies e armazenamento do Chat Web entre
+            # reinicializações sem misturar dados com o navegador visual.
+            storage_root = Path(
+                QStandardPaths.writableLocation(
+                    QStandardPaths.StandardLocation.AppLocalDataLocation
+                )
+            ) / "MerotecIA" / "QWebEngine" / "chat-web"
+            storage_root.mkdir(parents=True, exist_ok=True)
+            self.browser_profile = QWebEngineProfile("merotec-chat-web", self)
+            self.browser_profile.setPersistentStoragePath(str(storage_root / "storage"))
+            self.browser_profile.setCachePath(str(storage_root / "cache"))
+            self.browser_profile.setPersistentCookiesPolicy(
+                QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies
+            )
             self.browser_view = QWebEngineView()
+            self.browser_view.setPage(QWebEnginePage(self.browser_profile, self.browser_view))
             self.browser_view.setObjectName("internalBrowser")
             self.browser_view.urlChanged.connect(lambda value: setattr(self, "internal_browser_url", value.toString()))
+            self.browser_view.loadFinished.connect(self._internal_browser_loaded)
             index = self.tabs.addTab(self.browser_view, "Navegador")
             self.tabs.setCurrentIndex(index)
         else:
             self.tabs.setCurrentWidget(self.browser_view)
         target = QUrl.fromUserInput(str(url))
+        self.internal_browser_ready_event.clear()
         self.browser_view.load(target)
         self.internal_browser_url = target.toString()
         self.set_status(f"Navegador: {source}")
         return self.internal_browser_url
 
+    def _internal_browser_loaded(self, ok):
+        if ok:
+            self.internal_browser_ready_event.set()
+            page = self.browser_view.page() if self.browser_view is not None else None
+            if page is not None:
+                page.runJavaScript(
+                    "document.title || ''",
+                    lambda title: self.remember_internal_browser_chat_url(
+                        self.internal_browser_url, str(title or "")
+                    ),
+                )
+            self.set_status("Navegador interno pronto")
+        else:
+            # Libera quem estiver aguardando a navegacao. Sem isso a thread da
+            # conversa ficava presa por 35 segundos e parecia que a IDE nao
+            # falava mais com o navegador.
+            self.internal_browser_ready_event.set()
+            self.set_status("O navegador interno nao conseguiu carregar a pagina", "error")
+
     def request_internal_browser_action(self, action, payload=None, callback=None):
         if self.browser_view is None:
             return None
+        request_id = f"qt-browser-{time.time_ns()}"
+        self.browser_action_requested.emit(str(action), dict(payload or {}), callback)
+        return request_id
+
+    @staticmethod
+    def _decode_web_javascript_result(result):
+        """Normaliza o retorno do QWebEngine antes de validar a automaÃ§Ã£o.
+
+        Dependendo da versÃ£o do Qt/WebEngine, objetos retornados por
+        ``runJavaScript`` chegam como ``dict`` ou como JSON serializado. A
+        segunda forma era tratada como resposta invÃ¡lida, apesar de o envio ao
+        Chat Web ter sido aceito pelo navegador.
+        """
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, str):
+            try:
+                decoded = json.loads(result)
+            except json.JSONDecodeError:
+                return None
+            return decoded if isinstance(decoded, dict) else None
+        return None
+
+    def _run_browser_chat_action(self, payload, callback):
+        """Envia uma mensagem e acompanha a resposta sem devolver uma Promise.
+
+        ``QWebEnginePage.runJavaScript`` não aguarda funções JavaScript
+        ``async``: ele entrega o resultado da Promise imediatamente ao Python.
+        O bridge então interpretava esse retorno vazio como sucesso e o agente
+        ficava sem resposta. Mantemos cada avaliação síncrona e fazemos o
+        acompanhamento pelo timer do Qt.
+        """
+        prompt = json.dumps(str(payload.get("prompt", "")), ensure_ascii=False)
+        timeout_ms = max(30000, min(600000, int(payload.get("timeout", 300) or 300) * 1000))
+        prepare_script = f"""(() => {{
+            const visible = el => {{ if (!el) return false; const s=getComputedStyle(el), r=el.getBoundingClientRect(); return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0; }};
+            const assistantSelector = '[data-message-author-role="assistant"], article[data-turn="assistant"], model-response, response-container, message-content, .model-response-text, .response-content, [data-testid*="model-response"], [data-test-id*="model-response"], [class*="assistant-message"]';
+            const assistants = () => [...document.querySelectorAll(assistantSelector)].filter(visible);
+            const inputs = () => ['#prompt-textarea','textarea[placeholder]','[contenteditable="true"][role="textbox"]','.ql-editor[contenteditable="true"]','textarea','[contenteditable]:not([contenteditable="false"])'].flatMap(s => [...document.querySelectorAll(s)]).filter(visible);
+            const latest = () => {{ const items=assistants(); return items.length ? (items[items.length-1].innerText || items[items.length-1].textContent || '').trim() : ''; }};
+            const input = inputs()[0];
+            if (!input) return {{ok:false,error:'Campo de mensagem nao encontrado.',url:location.href,title:document.title}};
+            // Guarda avisos transitórios do provedor. Eles normalmente somem
+            // antes do próximo ciclo Python, tornando a falha impossível de
+            // diagnosticar pela IDE.
+            window.__merotecChatNotice = '';
+            window.__merotecChatNoticeObserver?.disconnect?.();
+            window.__merotecChatNoticeObserver = new MutationObserver(() => {{
+                const notices = [...document.querySelectorAll('[role="alert"], [data-testid*="toast" i], [class*="toast" i], [class*="notification" i]')]
+                    .filter(visible)
+                    .map(el => (el.innerText || el.textContent || '').trim())
+                    .filter(text => text && text.length < 600);
+                if (notices.length) window.__merotecChatNotice = notices.at(-1);
+            }});
+            window.__merotecChatNoticeObserver.observe(document.body, {{childList:true, subtree:true, characterData:true}});
+            const prompt = {prompt};
+            input.focus();
+            if (input.isContentEditable) {{
+                const selection = getSelection(), range = document.createRange();
+                range.selectNodeContents(input); range.collapse(false);
+                selection?.removeAllRanges(); selection?.addRange(range);
+                // execCommand ainda e o caminho que React/ProseMirror observam
+                // de forma consistente em QWebEngine; textContent sozinho nao
+                // atualiza o estado interno de alguns chats.
+                if (!document.execCommand('insertText', false, prompt)) input.textContent = prompt;
+                input.dispatchEvent(new InputEvent('input', {{bubbles:true, composed:true, inputType:'insertText', data:prompt}}));
+            }} else {{
+                const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+                if (setter) setter.call(input, prompt); else input.value = prompt;
+                input.dispatchEvent(new InputEvent('input', {{bubbles:true, composed:true, inputType:'insertText', data:prompt}}));
+                input.dispatchEvent(new Event('change', {{bubbles:true}}));
+            }}
+            const sendTarget = ['button[data-testid="send-button"]','button[data-testid*="send" i]','button[aria-label*="Send" i]','button[aria-label*="Enviar" i]','button[title*="Send" i]','button[title*="Enviar" i]','button[type="submit"]'].flatMap(s => [...document.querySelectorAll(s)]).find(el => visible(el) && !el.disabled) || [...document.querySelectorAll('button,[role="button"]')].find(el => visible(el) && !el.disabled && /send|enviar|submit/i.test((el.getAttribute('aria-label')||'')+' '+(el.getAttribute('data-testid')||'')+' '+(el.getAttribute('title')||'')+' '+el.innerText));
+            const sendRect = sendTarget?.getBoundingClientRect();
+            const before = latest();
+            const beforeCount = assistants().length;
+            // O envio e feito pelo Qt como tecla Enter nativa. Alguns provedores
+            // descartam click() sintético e exibem um aviso breve sem publicar
+            // a mensagem, embora o botão esteja visível no DOM.
+            return {{ok:true,before:before,beforeCount:beforeCount,sendX:sendRect ? Math.round(sendRect.left + sendRect.width / 2) : -1,sendY:sendRect ? Math.round(sendRect.top + sendRect.height / 2) : -1,url:location.href,title:document.title}};
+        }})()"""
+        # Serializar o valor explicitamente evita a conversão inconsistente de
+        # objetos JavaScript para QVariant entre versões do QWebEngine. O
+        # invólucro também transforma uma exceção da página em erro útil, em
+        # vez de o callback receber ``None``.
+        prepare_script = f"""(() => {{
+            try {{
+                return JSON.stringify(({prepare_script}));
+            }} catch (error) {{
+                return JSON.stringify({{ok:false,error:'Falha ao preparar a mensagem: ' + String(error?.message || error),url:location.href,title:document.title}});
+            }}
+        }})()"""
+
+        def complete(result):
+            if callback:
+                callback({"result": result})
+
+        def prepared(result):
+            prepared_result = self._decode_web_javascript_result(result)
+            if not prepared_result or not prepared_result.get("ok"):
+                complete(prepared_result or {"ok": False, "error": "Resposta invalida ao enviar mensagem do Chat Web."})
+                return
+            before = str(prepared_result.get("before") or "")
+            deadline = time.monotonic() + (timeout_ms / 1000.0)
+            before_count = int(prepared_result.get("beforeCount") or 0)
+            state = {
+                "text": "",
+                "changed_at": 0.0,
+                "finished": False,
+                "sent": False,
+                "send_checks": 0,
+                "manual_send_announced": False,
+            }
+            poll_script = """(() => { try { const visible = el => { if (!el) return false; const s=getComputedStyle(el), r=el.getBoundingClientRect(); return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0; }; const inputs=['#prompt-textarea','textarea[placeholder]','[contenteditable="true"][role="textbox"]','.ql-editor[contenteditable="true"]','textarea','[contenteditable]:not([contenteditable="false"])'].flatMap(s=>[...document.querySelectorAll(s)]).filter(visible); const input=inputs[0]; const composer=input ? String(input.isContentEditable ? (input.innerText || input.textContent || '') : (input.value || '')).trim() : ''; const items=[...document.querySelectorAll('[data-message-author-role="assistant"], article[data-turn="assistant"], model-response, response-container, message-content, .model-response-text, .response-content, [data-testid*="model-response"], [data-test-id*="model-response"], [class*="assistant-message"]')].filter(visible); const stopping=!!['[data-testid="stop-button"]','button[aria-label*="Stop" i]','button[aria-label*="Parar" i]'].flatMap(s=>[...document.querySelectorAll(s)]).find(visible); const send=[...document.querySelectorAll('button,[role="button"]')].find(el => visible(el) && /send|enviar|submit/.test((el.getAttribute('aria-label')||'')+' '+(el.getAttribute('data-testid')||'')+' '+(el.getAttribute('title')||'')+' '+el.innerText)); return JSON.stringify({ok:true,url:location.href,title:document.title,response:items.length ? (items[items.length-1].innerText || items[items.length-1].textContent || '').trim() : '',count:items.length,composer:composer,streaming:stopping,notice:String(window.__merotecChatNotice || ''),inputTag:input?.tagName || '',inputFocused:!!input && (document.activeElement === input || input.contains(document.activeElement)),sendDisabled:send ? !!send.disabled : null}); } catch (error) { return JSON.stringify({ok:false,error:'Falha ao ler a resposta: '+String(error?.message || error)}); } })()"""
+
+            def poll():
+                if state["finished"]:
+                    return
+                if time.monotonic() >= deadline:
+                    state["finished"] = True
+                    complete({"ok": False, "error": "Tempo esgotado aguardando a resposta do Chat Web.", "url": self.internal_browser_url})
+                    return
+
+                def received(current):
+                    if state["finished"]:
+                        return
+                    current_result = self._decode_web_javascript_result(current)
+                    if not current_result:
+                        QTimer.singleShot(700, poll)
+                        return
+                    if not current_result.get("ok", True):
+                        state["finished"] = True
+                        complete({"ok": False, "error": str(current_result.get("error") or "Falha ao ler a resposta do Chat Web."), "url": current_result.get("url", self.internal_browser_url)})
+                        return
+                    answer = str(current_result.get("response") or "").strip()
+                    notice = str(current_result.get("notice") or "").strip()
+                    if notice and not current_result.get("streaming"):
+                        state["finished"] = True
+                        complete({"ok": False, "error": f"O Chat Web recusou o envio: {notice}", "url": current_result.get("url", self.internal_browser_url)})
+                        return
+                    if not state["sent"]:
+                        state["send_checks"] += 1
+                        state["sent"] = (
+                            not str(current_result.get("composer") or "").strip()
+                            or bool(current_result.get("streaming"))
+                            or int(current_result.get("count") or 0) > before_count
+                        )
+                        if not state["sent"]:
+                            if not state["manual_send_announced"] and state["send_checks"] >= 2:
+                                state["manual_send_announced"] = True
+                                self.set_status(
+                                    "Mensagem pronta no Chat Web — clique na seta azul para enviar.",
+                                    "info",
+                                )
+                            # O provedor exige um gesto diretamente do usuário
+                            # neste WebEngine. A tarefa fica ativa e, após o
+                            # clique manual, este mesmo loop recebe a resposta.
+                            QTimer.singleShot(700, poll)
+                            return
+                    if answer and (answer != before or int(current_result.get("count") or 0) > before_count):
+                        now = time.monotonic()
+                        if answer != state["text"]:
+                            state["text"] = answer
+                            state["changed_at"] = now
+                        elif not current_result.get("streaming") and now - state["changed_at"] >= 1.8:
+                            state["finished"] = True
+                            complete({"ok": True, "response": answer, "url": current_result.get("url", self.internal_browser_url), "title": current_result.get("title", ""), "artifacts": {}})
+                            return
+                    QTimer.singleShot(700, poll)
+
+                self.browser_view.page().runJavaScript(poll_script, received)
+
+            QTimer.singleShot(700, poll)
+
+        self.browser_view.page().runJavaScript(prepare_script, prepared)
+
+    def _run_browser_action(self, action, payload=None, callback=None):
+        if self.browser_view is None:
+            if callback:
+                callback({"result": {"ok": False, "error": "O navegador interno nao esta disponivel."}})
+            return
         payload = payload or {}
         target = str(payload.get("target", ""))
-        value = str(payload.get("value", "")).replace("\\", "\\\\").replace("'", "\\'")
+        value = str(payload.get("value", ""))
         if action == "inspect":
-            script = """(() => ({url: location.href, title: document.title, text: document.body.innerText.slice(0,12000), elements: [...document.querySelectorAll('a,button,input,textarea,select')].slice(0,120).map((e,i)=>({ref:'e'+i,tag:e.tagName.toLowerCase(),label:e.innerText||e.getAttribute('aria-label')||e.name||e.placeholder||'',href:e.href||''}))}))()"""
+            script = """(() => ({ok:true,url: location.href, title: document.title, text: document.body.innerText.slice(0,12000), elements: [...document.querySelectorAll('a,button,input,textarea,select')].slice(0,120).map((e,i)=>({ref:'e'+i,tag:e.tagName.toLowerCase(),label:e.innerText||e.getAttribute('aria-label')||e.name||e.placeholder||'',href:e.href||''}))}))()"""
         elif action == "scroll":
-            script = f"window.scrollBy(0, {'-600' if target == 'up' else '600'}); ({'{'}url:location.href{'}'})"
+            script = f"(() => {{ window.scrollBy(0, {'-600' if target == 'up' else '600'}); return {{ok:true,url:location.href}}; }})()"
+        elif action == "chat":
+            self._run_browser_chat_action(payload, callback)
+            return
         else:
             ref = target.replace("e", "")
             selector = f"[...document.querySelectorAll('a,button,input,textarea,select')][{ref}]"
             if action == "click":
-                script = f"(() => {{ const e={selector}; if(!e) return {{error:'elemento nao encontrado'}}; e.click(); return {{url:location.href}}; }})()"
+                script = f"(() => {{ const e={selector}; if(!e) return {{ok:false,error:'elemento nao encontrado'}}; e.click(); return {{ok:true,url:location.href}}; }})()"
             elif action == "type":
-                script = f"(() => {{ const e={selector}; if(!e) return {{error:'elemento nao encontrado'}}; e.focus(); e.value='{value}'; e.dispatchEvent(new Event('input',{{bubbles:true}})); return {{url:location.href}}; }})()"
+                script = f"(() => {{ const e={selector}; if(!e) return {{ok:false,error:'elemento nao encontrado'}}; e.focus(); e.value={json.dumps(value, ensure_ascii=False)}; e.dispatchEvent(new Event('input',{{bubbles:true}})); return {{ok:true,url:location.href}}; }})()"
             else:
-                return None
+                if callback:
+                    callback({"result": {"ok": False, "error": f"Acao nao suportada: {action}"}})
+                return
         self.browser_view.page().runJavaScript(script, lambda result: callback({"result": result}) if callback else None)
-        return action
 
     def current_editor(self):
         widget = self.tabs.currentWidget()
@@ -1294,6 +1622,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             powershell = QStandardPaths.findExecutable("pwsh.exe") or QStandardPaths.findExecutable("powershell.exe")
             if powershell:
                 command = self._expand_cmd_environment_variables(command)
+                command = self._normalize_powershell_command(command)
                 return powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command]
             # Fallback para instalacoes Windows reduzidas sem PowerShell.
             return os.environ.get("COMSPEC", "cmd.exe"), ["/d", "/s", "/c", command]
@@ -1308,14 +1637,28 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
 
         return re.sub(r"%([^%]+)%", replace, command)
 
-    def _start_shell_command(self, command):
+    @staticmethod
+    def _normalize_powershell_command(command):
+        """Acrescenta o operador PowerShell para um executável entre aspas."""
+        text = str(command or "")
+        quoted_executable = r'^([ \t]*)(["\'])(?:[^"\']+?\.(?:exe|cmd|bat))\2(?=\s|$)'
+        if re.match(quoted_executable, text, flags=re.IGNORECASE):
+            return re.sub(r"^([ \t]*)", r"\1& ", text, count=1)
+        return text
+
+    def _start_shell_command(self, command, working_directory=None):
         program, arguments = self._shell_command(self._make_python_output_unbuffered(command))
-        self.start_terminal_process(program, arguments, command)
+        return self.start_terminal_process(program, arguments, command, working_directory=working_directory)
 
     @staticmethod
     def _make_python_output_unbuffered(command):
         """Evita que Python/PyInstaller retenha logs quando a saída é um pipe."""
-        pattern = r"^(\s*(?:python(?:\.exe)?|py)(?:\s+-\d+(?:\.\d+)*)?)(?!\s+-u\b)(?=\s)"
+        pattern = (
+            r"^(\s*(?:&\s+)?(?:"
+            r"python(?:\.exe)?|py|"
+            r"[\"'][^\"']*?pythonw?(?:\.exe)?[\"']"
+            r")(?:\s+-\d+(?:\.\d+)*)?)(?!\s+-u\b)(?=\s)"
+        )
         return re.sub(pattern, r"\1 -u", command, count=1, flags=re.IGNORECASE)
 
     def start_terminal_process(self, program, arguments, label, working_directory=None):
@@ -1396,6 +1739,8 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         except RuntimeError:
             return
         text = self._decode_process_output(data)
+        if process is self.terminal_process and getattr(self, "_agent_command_pending", ""):
+            self._agent_command_output = (getattr(self, "_agent_command_output", "") + text)[-12000:]
         self._observe_terminal_progress_output(text)
         if process is self.terminal_session:
             self._append_terminal_session_output(text)
@@ -1451,7 +1796,10 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             data = bytes(process.readAllStandardError())
         except RuntimeError:
             return
-        self.append_terminal(self._decode_process_output(data))
+        text = self._decode_process_output(data)
+        if process is self.terminal_process and getattr(self, "_agent_command_pending", ""):
+            self._agent_command_output = (getattr(self, "_agent_command_output", "") + text)[-12000:]
+        self.append_terminal(text)
 
     def _terminal_error(self, process, error):
         if process is not self.terminal_process:
@@ -1467,6 +1815,10 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             self.terminal_process = None
             self._terminal_prompt()
             self.terminal_input.setFocus()
+            agent_command = getattr(self, "_agent_command_pending", "")
+            if agent_command:
+                self._agent_command_pending = ""
+                self._continue_agent_after_command(agent_command, False, -1, detail or "Não foi possível iniciar o comando.")
 
     def _terminal_finished(self, process, exit_code, exit_status):
         if process is not self.terminal_process:
@@ -1475,6 +1827,8 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self._read_terminal_stderr(process)
         succeeded = exit_status == QProcess.ExitStatus.NormalExit and exit_code == 0
         was_cancelled = self._terminal_cancel_requested
+        agent_command = getattr(self, "_agent_command_pending", "")
+        agent_output = getattr(self, "_agent_command_output", "")
         if was_cancelled:
             message = "\nProcesso interrompido.\n"
         else:
@@ -1488,6 +1842,10 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.terminal_process = None
         self._terminal_prompt()
         self.terminal_input.setFocus()
+        if agent_command:
+            self._agent_command_pending = ""
+            self._agent_command_output = ""
+            self._continue_agent_after_command(agent_command, succeeded and not was_cancelled, exit_code, agent_output)
 
     def cancel_terminal_process(self):
         process = self.terminal_process or self.terminal_session
@@ -1507,8 +1865,8 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             QProcess.startDetached("taskkill.exe", ["/PID", str(process.processId()), "/T", "/F"])
         process.kill()
 
-    def add_chat(self, author, message, outgoing=False):
-        bubble = ChatBubble(author, message, outgoing)
+    def add_chat(self, author, message, outgoing=False, attachments=None):
+        bubble = ChatBubble(author, message, outgoing, attachments)
         row = QHBoxLayout()
         if outgoing:
             row.addStretch()
@@ -1670,14 +2028,21 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         if not prompt and attachments:
             prompt = "Analise os anexos e me diga o que fazer."
         self._set_chat_busy(True)
+        self._chat_task_prompt = prompt
+        self._chat_agent_round = 0
+        self._chat_pending_validation_paths = set()
+        self._chat_waiting_for_command = False
+        self._chat_write_staging = {}
         self.chat_input.clear()
-        self.add_chat("Voce", prompt, True)
+        self.add_chat("Voce", prompt, True, attachments)
         if attachments:
-            self.add_chat("Voce", "Arquivos anexados: " + ", ".join(path.name for path in attachments), True)
             self.clear_attachments()
         self.set_status("Merotec IA pensando...")
         editor = self.current_editor()
-        context_parts = [editor.toPlainText()] if editor else []
+        direct_conversation = self._is_direct_chat_request(prompt)
+        # Perguntas comuns não precisam copiar o documento inteiro antes de
+        # abrir o Chat Web; em arquivos grandes isso atrasava a resposta.
+        context_parts = [editor.toPlainText()] if editor and not direct_conversation else []
         for path in attachments:
             if not self._is_image_attachment(path):
                 try:
@@ -1693,18 +2058,42 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
 
     def _generate_reply(self, prompt, context, image_path=None):
         try:
-            self.chat_stream.emit("[ATIVIDADE] Montando o contexto do editor e do projeto...")
-            smart_context = "\n\n".join(part for part in [
-                context,
-                self.build_smart_task_brief(prompt, objective=prompt),
-                self.build_project_intelligence_context(),
-                f"Arquivos do workspace:\n{self.get_workspace_tree()}",
-            ] if part)
+            direct_conversation = self._is_direct_chat_request(prompt)
+            if direct_conversation:
+                self.chat_stream.emit("[ATIVIDADE] Preparando conversa direta...")
+                # Perguntas e mensagens comuns não devem receber uma árvore de
+                # arquivos nem o protocolo de agente; isso fazia o modelo ler
+                # o projeto antes de simplesmente responder ao usuário.
+                smart_context = context
+                provider_prompt = "[MEROTEC_DIRECT_CHAT]\n" + prompt
+            else:
+                self.chat_stream.emit("[ATIVIDADE] Montando o contexto do editor e do projeto...")
+                smart_context = "\n\n".join(part for part in [
+                    context,
+                    self.build_smart_task_brief(prompt, objective=prompt),
+                    self.build_project_intelligence_context(),
+                    f"Arquivos do workspace:\n{self.get_workspace_tree()}",
+                ] if part)
+                provider_prompt = prompt
             self.chat_stream.emit("[ATIVIDADE] Enviando a tarefa para o provedor de IA...")
-            reply = self.engine.generate_solution(prompt, image_path=str(image_path) if image_path else None, code_context=smart_context, stream_callback=self.chat_stream.emit, workspace_path=self.current_workspace)
+            reply = self.engine.generate_solution(provider_prompt, image_path=str(image_path) if image_path else None, code_context=smart_context, stream_callback=self.chat_stream.emit, workspace_path=self.current_workspace)
         except Exception as exc:
             reply = f"Nao foi possivel consultar o provedor configurado: {exc}"
         self.chat_reply.emit(reply or "Nao recebi uma resposta do provedor configurado.")
+
+    @staticmethod
+    def _is_direct_chat_request(prompt):
+        """Separa conversa comum de pedidos que exigem agir no workspace."""
+        text = str(prompt or "").strip().lower()
+        if not text:
+            return True
+        project_markers = (
+            "arquivo", "codigo", "código", "projeto", "pasta", "bug", "erro",
+            "corrig", "implemente", "implementa", "edite", "altere", "modifique",
+            "crie", "criar", "teste", "execute", "roda", "terminal", "commit",
+            ".py", ".js", ".ts", ".html", ".css", ".json", "/", "\\",
+        )
+        return not any(marker in text for marker in project_markers)
 
     def get_workspace_tree(self, limit=220):
         paths = []
@@ -1744,6 +2133,16 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
 
     def append_chat_stream(self, chunk):
         text = str(chunk or "")
+        if text.startswith("[STREAM_UPDATE]"):
+            partial = text.removeprefix("[STREAM_UPDATE]")
+            if not self.streaming_bubble:
+                self.streaming_bubble = self.add_chat("Merotec IA", "")
+            should_follow = self._chat_scroll_is_at_end()
+            self.chat_last_activity = "Recebendo a resposta da IA"
+            self.streaming_text = partial
+            self.streaming_bubble.label.setText(partial)
+            self._follow_chat_scroll_if_needed(should_follow)
+            return
         if text.startswith("[TERMINAL_IA]"):
             command = text.removeprefix("[TERMINAL_IA]").strip()
             if command:
@@ -1760,10 +2159,22 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             return
         if not self.streaming_bubble:
             self.streaming_bubble = self.add_chat("Merotec IA", "")
+        should_follow = self._chat_scroll_is_at_end()
         self.chat_last_activity = "Recebendo a resposta da IA"
         self.streaming_text += text
         self.streaming_bubble.label.setText(self.streaming_text)
-        self.chat_scroll.verticalScrollBar().setValue(self.chat_scroll.verticalScrollBar().maximum())
+        self._follow_chat_scroll_if_needed(should_follow)
+
+    def _chat_scroll_is_at_end(self):
+        """Indica se o usuário está acompanhando a conversa no final."""
+        scrollbar = self.chat_scroll.verticalScrollBar()
+        return scrollbar.maximum() - scrollbar.value() <= 24
+
+    def _follow_chat_scroll_if_needed(self, should_follow):
+        """Mantém o acompanhamento automático sem interromper uma leitura anterior."""
+        if should_follow:
+            scrollbar = self.chat_scroll.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
 
     def _append_chat_activity(self, detail):
         """Exibe etapas do agente sem mistura-las ao texto final da resposta."""
@@ -1778,11 +2189,62 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.activity_lines = self.activity_lines[-12:]
         if not self.activity_bubble:
             self.activity_bubble = self.add_chat("Atividade da IA", "")
+        should_follow = self._chat_scroll_is_at_end()
         self.activity_bubble.label.setText("\n".join(self.activity_lines))
-        self.chat_scroll.verticalScrollBar().setValue(self.chat_scroll.verticalScrollBar().maximum())
+        self._follow_chat_scroll_if_needed(should_follow)
 
     def finish_chat_reply(self, reply):
         self.last_response = reply
+        actions = self._apply_agent_reply_actions(reply)
+        if actions is not None:
+            self._chat_pending_validation_paths.update(
+                Path(path).resolve() for path in getattr(actions, "changed_paths", [])
+            )
+            self._chat_pending_validation_paths.difference_update(
+                Path(path).resolve() for path in getattr(actions, "last_validated_paths", [])
+            )
+            if actions.last_command_requested:
+                self._chat_waiting_for_command = True
+                self._append_chat_activity("Aguardando o resultado real do EXECUTE no terminal.")
+                return
+        # READ/SEARCH/WRITE/PATCH são passos intermediários. A versão PySide
+        # antes parava aqui, então a IA só conseguia ler arquivos. Reenviamos
+        # o resultado à mesma conversa para ela concluir a tarefa.
+        if (
+            actions is not None
+            and (
+                actions.last_followup_required
+                or ("[FINAL:" in str(reply or "").upper() and self._chat_pending_validation_paths)
+            )
+            and self._chat_agent_round < 12
+        ):
+            self._chat_agent_round += 1
+            observation = "\n\n".join(actions.last_observations)[-18000:]
+            if "[FINAL:" in str(reply or "").upper() and self._chat_pending_validation_paths:
+                paths = ", ".join(path.relative_to(self.workspace).as_posix() for path in self._chat_pending_validation_paths)
+                observation += (
+                    "\n\nA alteração foi aplicada, mas ainda falta validação local obrigatória. "
+                    f"Responda somente [VALIDATE: {paths.split(', ', 1)[0]}]."
+                )
+            self._append_chat_activity(
+                f"Ação {self._chat_agent_round} aplicada; continuando a tarefa."
+            )
+            self.streaming_bubble = None
+            self.streaming_text = ""
+            continuation = (
+                "[MEROTEC_AGENT_CONTINUATION]\n"
+                f"Tarefa original: {self._chat_task_prompt}\n\n"
+                "A IDE executou sua última ação. Use o resultado abaixo para continuar "
+                "e responda com a próxima ação necessária ou uma conclusão final.\n\n"
+                f"RESULTADO DA IDE:\n{observation}"
+            )
+            threading.Thread(
+                target=self._generate_reply,
+                args=(continuation, observation, None),
+                daemon=True,
+            ).start()
+            return
+
         self._set_chat_busy(False)
         self._append_chat_activity("Resposta recebida; finalizando a tarefa.")
         if self.streaming_bubble:
@@ -1790,14 +2252,19 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             self.streaming_bubble = None
         else:
             self.add_chat("Merotec IA", reply)
-        # Atualiza a interface antes de processar PATCH/EXECUTE da resposta,
-        # pois essas acoes podem levar alguns segundos no thread principal.
         self.set_status("Pronto")
-        QTimer.singleShot(0, lambda text=reply: self._apply_agent_reply_actions(text))
 
     def _apply_agent_reply_actions(self, reply):
-        actions = QtAgentActions(self.workspace, self.add_chat, self.run_agent_command, self.agent_changed_files)
-        actions.apply(reply)
+        actions = QtAgentActions(
+            self.workspace,
+            self.add_chat,
+            self.run_agent_command,
+            self.agent_changed_files,
+            task_objective=getattr(self, "_chat_task_prompt", ""),
+            write_staging=getattr(self, "_chat_write_staging", None),
+        )
+        actions.changed_paths = actions.apply(reply)
+        return actions
 
     def toggle_voice_capture(self):
         if not self.voice_capture_active:
@@ -1893,10 +2360,44 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
     def run_agent_command(self, command):
         if self.terminal_process and self.terminal_process.state() != QProcess.ProcessState.NotRunning:
             self.add_chat("Sistema", "Comando da IA nao executado: o terminal ja esta ocupado.")
-            return
+            return False
         self.append_terminal(f"\n[IA - comando executado] {command}\n")
         self._append_chat_activity(f"Comando enviado ao terminal: {command}")
-        self._start_shell_command(command)
+        self._agent_command_pending = command
+        self._agent_command_output = ""
+        started = self._start_shell_command(command, working_directory=self.workspace)
+        if not started:
+            self._agent_command_pending = ""
+        return started
+
+    def _continue_agent_after_command(self, command, succeeded, exit_code, output):
+        """Entrega ao agente o resultado real de um EXECUTE antes de encerrar a tarefa."""
+        if not getattr(self, "_chat_waiting_for_command", False) or not self.chat_busy:
+            return
+        if self._chat_agent_round >= 12:
+            self._chat_waiting_for_command = False
+            self._set_chat_busy(False)
+            self.add_chat("Erro", "Limite de ciclos do agente atingido após EXECUTE; revise a saída do terminal.")
+            return
+        self._chat_waiting_for_command = False
+        self._chat_agent_round += 1
+        status = "sucesso" if succeeded else f"falha (código {exit_code})"
+        observation = (
+            f"EXECUTE concluído com {status}.\nCOMANDO: {command}\n"
+            f"SAÍDA:\n{str(output or '(sem saída)').strip()[-12000:]}"
+        )
+        self._append_chat_activity(f"EXECUTE terminou; continuando a tarefa ({self._chat_agent_round}/12).")
+        continuation = (
+            "[MEROTEC_AGENT_CONTINUATION]\n"
+            f"Tarefa original: {self._chat_task_prompt}\n\n"
+            "A IDE executou o comando solicitado. Use o resultado para corrigir, validar ou concluir a tarefa.\n\n"
+            f"RESULTADO DA IDE:\n{observation}"
+        )
+        threading.Thread(
+            target=self._generate_reply,
+            args=(continuation, observation, None),
+            daemon=True,
+        ).start()
 
     def agent_changed_files(self, paths):
         self.refresh_tree()
@@ -2002,9 +2503,10 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         dialog = QtSettingsDialog(self.settings, self)
         if dialog.exec():
             self._apply_settings_to_environment()
-            self.engine = UniversalEngine()
-            self.provider_label.setText(self.engine.provider)
             self._save_settings()
+            self.engine = UniversalEngine()
+            self.attach_internal_web_chat_bridge()
+            self.provider_label.setText(self.engine.provider)
             self.set_status("Configuracoes salvas.")
 
 
@@ -2013,14 +2515,16 @@ QMainWindow, QWidget#root { background: #0a1421; color: #d5deeb; font-family: 'S
 QMenuBar { background: #0d1927; border-bottom: 1px solid #223347; padding: 4px 10px; color: #ced8e6; }
 QMenuBar::item { padding: 8px 12px; } QMenuBar::item:selected, QMenu::item:selected { background: #213247; }
 QMenu { background: #101d2c; border: 1px solid #2a3c52; color: #d5deeb; } QMenu::item { padding: 8px 28px; }
-QScrollBar:vertical { background: #132338; width: 13px; margin: 0; border-left: 1px solid #29425d; }
-QScrollBar::handle:vertical { background: #4f7897; min-height: 36px; border-radius: 5px; margin: 2px; }
-QScrollBar::handle:vertical:hover { background: #6ca3c6; }
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; background: transparent; }
-QScrollBar:horizontal { background: #132338; height: 13px; margin: 0; border-top: 1px solid #29425d; }
-QScrollBar::handle:horizontal { background: #4f7897; min-width: 36px; border-radius: 5px; margin: 2px; }
-QScrollBar::handle:horizontal:hover { background: #6ca3c6; }
-QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; background: transparent; }
+QScrollBar:vertical { background: #0c1826; width: 10px; margin: 0; border: 0; }
+QScrollBar::handle:vertical { background: #365d79; min-height: 38px; border: 2px solid #0c1826; border-radius: 5px; }
+QScrollBar::handle:vertical:hover { background: #4f8caf; }
+QScrollBar::handle:vertical:pressed { background: #20bddd; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical, QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { background: transparent; height: 0; }
+QScrollBar:horizontal { background: #0c1826; height: 10px; margin: 0; border: 0; }
+QScrollBar::handle:horizontal { background: #365d79; min-width: 38px; border: 2px solid #0c1826; border-radius: 5px; }
+QScrollBar::handle:horizontal:hover { background: #4f8caf; }
+QScrollBar::handle:horizontal:pressed { background: #20bddd; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal, QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { background: transparent; width: 0; }
 QToolBar#toolbar { background: #0d1927; border: 0; border-bottom: 1px solid #223347; spacing: 5px; padding: 5px 12px; }
 QToolButton { color: #eef8ff; border: 1px solid #285a79; border-radius: 4px; background: #1d455f; padding: 6px; } QToolButton:hover { background: #2c7097; border-color: #86d5ed; } QToolButton:pressed { background: #2387a6; border-color: #b3edf8; color: #ffffff; }
 QSplitter::handle { background: #223347; } QSplitter::handle:hover { background: #2f607a; }
@@ -2033,7 +2537,7 @@ QPushButton#tinyButton { background: transparent; border: 0; color: #c9d9ea; fon
 QTabWidget#editorTabs::pane { border: 0; } QTabBar::tab { background: #0d1927; color: #b5c3d3; padding: 10px 18px; border-right: 1px solid #223347; min-width: 105px; } QTabBar::tab:hover { background: #17334a; color: #edf8ff; } QTabBar::tab:selected { background: #173b56; color: #eef6ff; border-top: 2px solid #20cbea; } QTabBar::close-button { background: #29445b; border: 1px solid #416881; border-radius: 4px; margin: 3px; } QTabBar::close-button:hover { background: #a63e50; border-color: #f28b99; } QTabBar::close-button:pressed { background: #d05064; border-color: #ffd0d6; }
 QPlainTextEdit#editor { background: #0c1725; color: #d9e2ed; border: 0; padding: 10px; selection-background-color: #294a65; }
 QFrame#terminalPanel { background: #0a1420; border-top: 1px solid #26384c; } QLabel#terminalProgress { color: #79d8e9; padding-left: 12px; } QProgressBar#terminalProgressBar { background: #11263a; border: 0; } QProgressBar#terminalProgressBar::chunk { background: #20cbe8; } QPlainTextEdit#terminal { background: #09131f; border: 0; border-top: 1px solid #203349; color: #bdc9d9; padding: 10px; } QLineEdit#terminalInput { background: #0b1725; border: 1px solid #203349; color: #dce8f6; padding: 8px 12px; } QPushButton#terminalAction { background: transparent; border: 0; color: #a5b8cc; padding: 4px 9px; } QPushButton#terminalAction:hover { color: #21d0eb; }
-QLabel#chatTitle { font-weight: 700; font-size: 17px; color: #eef5ff; } QLabel#provider { color: #68cfea; font-size: 11px; } QScrollArea#chatScroll, QScrollArea#chatScroll > QWidget > QWidget { border: 0; background: #0c1826; } QFrame#chatIncoming, QFrame#chatOutgoing { border-radius: 8px; max-width: 300px; } QFrame#chatIncoming { background: #182637; } QFrame#chatOutgoing { background: #164a75; } QLabel#chatText { color: #e1ebf6; } QLabel#chatMeta { color: #8fa2b7; font-size: 11px; }
+QLabel#chatTitle { font-weight: 700; font-size: 17px; color: #eef5ff; } QLabel#provider { color: #68cfea; font-size: 11px; } QScrollArea#chatScroll, QScrollArea#chatScroll > QWidget > QWidget { border: 0; background: #0c1826; } QScrollArea#chatScroll QScrollBar:vertical { background: #0c1826; width: 10px; } QScrollArea#chatScroll QScrollBar::handle:vertical { background: #365d79; border: 2px solid #0c1826; border-radius: 5px; min-height: 38px; } QScrollArea#chatScroll QScrollBar::handle:vertical:hover { background: #4f8caf; } QFrame#chatIncoming, QFrame#chatOutgoing { border-radius: 8px; max-width: 300px; } QFrame#chatIncoming { background: #182637; } QFrame#chatOutgoing { background: #164a75; } QLabel#chatText { color: #e1ebf6; } QLabel#chatMeta { color: #8fa2b7; font-size: 11px; }
 QFrame#attachmentPanel { background: #102238; border: 1px solid #2e5e7b; border-radius: 6px; }
 QLabel#attachmentLabel { color: #9be7f6; font-weight: 600; }
 QFrame#attachmentItem { background: #0d1b2c; border: 1px solid #264863; border-radius: 5px; }

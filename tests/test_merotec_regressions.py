@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import importlib
+import io
 import json
+import queue
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -21,6 +24,7 @@ from modules.ai_profiles import (
 )
 from modules.ui_web_chat_bridge import InternalBrowserWebChatBridge
 from modules.web_chat_bridge import WebChatBridge
+from modules.browser_runtime import _decoded_dom_text
 from modules.agent_actions import AgentActionsMixin
 from modules.engine import UniversalEngine
 
@@ -58,11 +62,120 @@ class _FakeProcessWebChatBridge(WebChatBridge):
             workspace_path=workspace_path,
         )
         self.requests = []
+        self.started_urls = []
+
+    def _start(self, initial_url: str) -> None:
+        self.started_urls.append(initial_url)
+        self.process = _RunningProcess()
+        self.current_url = initial_url
 
     def request(self, action: str, payload: dict | None = None, timeout: float = 60) -> dict:
         payload = dict(payload or {})
         self.requests.append((action, payload, timeout))
         return {"url": payload.get("url"), "title": "Chat"}
+
+
+class _FakeBrowserProcess:
+    def __init__(self):
+        self.stdin = io.StringIO()
+
+
+class WebChatBridgeProtocolTests(unittest.TestCase):
+    def test_old_runtime_close_event_stays_out_of_new_runtime_queue(self):
+        old_events = queue.Queue()
+        new_events = queue.Queue()
+        old_events.put({"event": "closed"})
+        new_events.put({"event": "ready", "url": "https://chatgpt.com/"})
+
+        self.assertEqual(new_events.get_nowait()["event"], "ready")
+        self.assertEqual(old_events.get_nowait()["event"], "closed")
+
+    def test_runtime_restores_accented_dom_text_from_ascii_transport(self):
+        self.assertEqual(
+            _decoded_dom_text({"textEncoded": "Ol%C3%A1%20%F0%9F%91%8B"}),
+            "Olá 👋",
+        )
+
+    def _bridge_with_events(self, *events):
+        bridge = WebChatBridge.__new__(WebChatBridge)
+        bridge.lock = threading.RLock()
+        bridge.profile = {"web_chat_url": "https://chatgpt.com/"}
+        bridge.process = _FakeBrowserProcess()
+        bridge.events = queue.Queue()
+        bridge.request_counter = 0
+        bridge._start = lambda _url: None
+        for event in events:
+            bridge.events.put(event)
+        return bridge
+
+    def test_navigate_accepts_runtime_navigated_event(self):
+        bridge = self._bridge_with_events(
+            {
+                "event": "navigated",
+                "request_id": "web-1000-1",
+                "url": "https://chatgpt.com/",
+                "title": "ChatGPT",
+            }
+        )
+        with patch("modules.web_chat_bridge.time.time", return_value=1):
+            result = bridge.request("navigate", {"url": "https://chatgpt.com/"})
+
+        self.assertEqual(result["url"], "https://chatgpt.com/")
+
+    def test_chat_ignores_progress_until_browser_result(self):
+        bridge = self._bridge_with_events(
+            {"event": "browser_progress", "request_id": "web-1000-1", "phase": "preparing"},
+            {
+                "event": "browser_result",
+                "request_id": "web-1000-1",
+                "result": '{"ok": true, "response": "pronto"}',
+            },
+        )
+        with patch("modules.web_chat_bridge.time.time", return_value=1):
+            result = bridge.request("chat", {"prompt": "teste"})
+
+        self.assertEqual(result, {"ok": True, "response": "pronto"})
+
+    def test_command_error_is_returned_instead_of_timing_out(self):
+        bridge = self._bridge_with_events(
+            {
+                "event": "command_error",
+                "request_id": "web-1000-1",
+                "action": "chat",
+                "message": "campo de conversa nao encontrado",
+            }
+        )
+        with patch("modules.web_chat_bridge.time.time", return_value=1):
+            with self.assertRaisesRegex(RuntimeError, "campo de conversa"):
+                bridge.request("chat", {"prompt": "teste"})
+
+    def test_empty_browser_result_preserves_failure_detail(self):
+        bridge = self._bridge_with_events(
+            {
+                "event": "browser_result",
+                "request_id": "web-1000-1",
+                "ok": False,
+                "message": "resposta sem payload",
+                "result": None,
+            }
+        )
+        with patch("modules.web_chat_bridge.time.time", return_value=1):
+            result = bridge.request("chat", {"prompt": "teste"})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "resposta sem payload")
+
+    def test_runtime_waits_for_composer_and_reports_prepare_failure(self):
+        source = (ROOT / "modules" / "browser_runtime.py").read_text(encoding="utf-8")
+        self.assertIn("safe_prepare_script", source)
+        self.assertIn("for _attempt in range(75)", source)
+        self.assertIn("retornou dados ao preparar a mensagem.", source)
+
+    def test_direct_chat_uses_the_small_composer_script(self):
+        source = (ROOT / "modules" / "browser_runtime.py").read_text(encoding="utf-8")
+        bridge_source = (ROOT / "modules" / "web_chat_bridge.py").read_text(encoding="utf-8")
+        self.assertIn('if bool(command.get("direct_chat"))', source)
+        self.assertIn('"direct_chat": bool(direct_chat and is_last)', bridge_source)
 
 
 class ProfileAndSessionTests(unittest.TestCase):
@@ -142,8 +255,8 @@ class ProfileAndSessionTests(unittest.TestCase):
             target = bridge.ensure_workspace_session(workspace)
 
             self.assertEqual(target, "https://chatgpt.com/")
-            self.assertEqual(bridge.requests[0][1]["url"], "https://chatgpt.com/")
-            self.assertFalse(bridge.requests[0][1]["restore_session"])
+            self.assertEqual(bridge.started_urls, ["https://chatgpt.com/"])
+            self.assertEqual(bridge.requests, [])
 
     def test_process_bridge_restore_enabled_uses_saved_session(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -172,8 +285,8 @@ class ProfileAndSessionTests(unittest.TestCase):
             target = bridge.ensure_workspace_session(workspace)
 
             self.assertEqual(target, saved_url)
-            self.assertEqual(bridge.requests[0][1]["url"], saved_url)
-            self.assertTrue(bridge.requests[0][1]["restore_session"])
+            self.assertEqual(bridge.started_urls, [saved_url])
+            self.assertEqual(bridge.requests, [])
 
     def test_saved_chat_session_rejects_unstable_internal_urls(self):
         with tempfile.TemporaryDirectory() as temp_dir:

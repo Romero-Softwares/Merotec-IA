@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="surface" x1="36" y1="26" x2="220" y2="232" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1B5376"/>
+      <stop offset="1" stop-color="#0A1627"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="65" y1="63" x2="194" y2="191" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#83ECFF"/>
+      <stop offset="1" stop-color="#18C9E8"/>
+    </linearGradient>
+  </defs>
+  <rect x="12" y="12" width="232" height="232" rx="54" fill="#07111F"/>
+  <rect x="20" y="20" width="216" height="216" rx="46" fill="url(#surface)" stroke="#3E92BB" stroke-width="4"/>
+  <path d="M61 79c0-12 10-22 22-22h91c12 0 22 10 22 22v98c0 12-10 22-22 22H83c-12 0-22-10-22-22V79Z" fill="#0B1B2D" stroke="#68DDF3" stroke-width="6"/>
+  <path d="M80 97h96M80 118h62" stroke="#416C86" stroke-width="7" stroke-linecap="round"/>
+  <path d="m92 154 23 20 48-55" fill="none" stroke="url(#signal)" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="187" cy="67" r="13" fill="#83ECFF"/>
+  <circle cx="187" cy="67" r="6" fill="#0A1627"/>
+</svg>

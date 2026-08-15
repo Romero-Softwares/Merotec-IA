@@ -20,6 +20,15 @@ else:
 
 @unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6 nao esta instalado neste interpretador")
 class PySideTerminalTests(unittest.TestCase):
+    def test_webengine_json_result_is_accepted_for_chat_actions(self):
+        result = MerotecIDE._decode_web_javascript_result(
+            '{"ok": true, "before": "resposta anterior"}'
+        )
+        self.assertEqual(result, {"ok": True, "before": "resposta anterior"})
+
+    def test_webengine_invalid_result_is_rejected_for_chat_actions(self):
+        self.assertIsNone(MerotecIDE._decode_web_javascript_result("resposta livre"))
+
     def test_terminal_output_accepts_utf8(self):
         self.assertEqual(MerotecIDE._decode_process_output("configuração pronta".encode("utf-8")), "configuração pronta")
 
@@ -29,6 +38,17 @@ class PySideTerminalTests(unittest.TestCase):
     def test_python_command_is_unbuffered_only_once(self):
         self.assertEqual(MerotecIDE._make_python_output_unbuffered("python main.py"), "python -u main.py")
         self.assertEqual(MerotecIDE._make_python_output_unbuffered("python -u main.py"), "python -u main.py")
+        self.assertEqual(
+            MerotecIDE._make_python_output_unbuffered('& "C:\\venv\\Scripts\\pythonw.exe" -m compileall'),
+            '& "C:\\venv\\Scripts\\pythonw.exe" -u -m compileall',
+        )
+
+    def test_quoted_executable_is_invoked_by_powershell(self):
+        command = '"C:\\venv\\Scripts\\pythonw.exe" -m compileall -q main.py'
+        self.assertEqual(
+            MerotecIDE._normalize_powershell_command(command),
+            '& "C:\\venv\\Scripts\\pythonw.exe" -m compileall -q main.py',
+        )
 
     def test_jarsigner_and_keytool_use_interactive_terminal_mode(self):
         self.assertTrue(MerotecIDE._command_requires_interactive_input("jarsigner -verify app.aab"))

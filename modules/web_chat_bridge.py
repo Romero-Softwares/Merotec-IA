@@ -85,8 +85,13 @@ class WebChatBridge:
         )
         self._save_settings(settings)
 
-    def _reader(self) -> None:
-        process = self.process
+    def _reader(self, process: subprocess.Popen, events: queue.Queue[dict]) -> None:
+        """Lê eventos de uma única geração do WebView2.
+
+        A fila é passada explicitamente: se uma janela antiga fechar depois de
+        uma nova abrir, seu evento ``closed`` não pode encerrar a conversa da
+        nova janela.
+        """
         if not process or not process.stdout:
             return
         for raw in iter(process.stdout.readline, ""):
@@ -99,8 +104,8 @@ class WebChatBridge:
                 self.log(f"Chat Web: saída inesperada: {line[:320]}")
                 continue
             if isinstance(event, dict):
-                self.events.put(event)
-        self.events.put({"event": "closed"})
+                events.put(event)
+        events.put({"event": "closed"})
 
     def _start(self, initial_url: str) -> None:
         if self.process and self.process.poll() is None:
@@ -111,8 +116,17 @@ class WebChatBridge:
         command = [sys.executable, str(self.runtime_path), "--url", initial_url]
         env = os.environ.copy()
         env["MEROTEC_WEB_CHAT_SESSIONS_FILE"] = str(self.settings_path)
+        # O processo filho produz eventos JSON com texto em português e esta
+        # ponte os lê explicitamente como UTF-8. Sem esta variável, o Python
+        # no Windows pode escrever no codec ANSI, corrompendo "não" para
+        # "nÃ£o" antes mesmo de a UI receber o evento.
+        env["PYTHONIOENCODING"] = "utf-8"
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-        self.process = subprocess.Popen(
+        # Cada processo possui sua própria fila. O WebView pode fechar alguns
+        # instantes depois de outro ser iniciado, e uma fila compartilhada
+        # fazia esse fechamento antigo derrubar a sessão recém-aberta.
+        events: queue.Queue[dict] = queue.Queue()
+        process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -124,7 +138,13 @@ class WebChatBridge:
             env=env,
             creationflags=flags,
         )
-        self.reader_thread = threading.Thread(target=self._reader, daemon=True)
+        self.process = process
+        self.events = events
+        self.reader_thread = threading.Thread(
+            target=self._reader,
+            args=(process, events),
+            daemon=True,
+        )
         self.reader_thread.start()
         ready = self._wait_for(lambda event: event.get("event") in {"ready", "error", "closed"}, timeout=30)
         if not ready:
@@ -139,7 +159,7 @@ class WebChatBridge:
         self.request_counter += 1
         return f"web-{int(time.time() * 1000)}-{self.request_counter}"
 
-    def _wait_for(self, predicate, timeout: float) -> dict | None:
+    def _wait_for(self, predicate, timeout: float, on_event=None) -> dict | None:
         deadline = time.time() + max(1.0, float(timeout))
         deferred: list[dict] = []
         matched = None
@@ -148,6 +168,8 @@ class WebChatBridge:
                 try:
                     event = self.events.get(timeout=min(0.5, max(0.05, deadline - time.time())))
                 except queue.Empty:
+                    continue
+                if callable(on_event) and on_event(event):
                     continue
                 if predicate(event):
                     matched = event
@@ -158,7 +180,13 @@ class WebChatBridge:
                 self.events.put(item)
         return matched
 
-    def request(self, action: str, payload: dict | None = None, timeout: float = 60) -> dict:
+    def request(
+        self,
+        action: str,
+        payload: dict | None = None,
+        timeout: float = 60,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> dict:
         with self.lock:
             entry_url = normalize_web_url(self.profile.get("web_chat_url"), "https://chatgpt.com/")
             self._start(entry_url)
@@ -168,14 +196,37 @@ class WebChatBridge:
             message = {"action": action, "request_id": request_id, **(payload or {})}
             self.process.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
             self.process.stdin.flush()
+
+            def handle_progress(item: dict) -> bool:
+                if item.get("request_id") != request_id or item.get("event") != "browser_progress":
+                    return False
+                if callable(progress_callback):
+                    partial = item.get("partial")
+                    if isinstance(partial, str) and partial:
+                        progress_callback("[STREAM_UPDATE]" + partial)
+                    else:
+                        detail = str(item.get("message") or "Chat Web processando a conversa.").strip()
+                        if detail:
+                            progress_callback("[ATIVIDADE] " + detail)
+                return True
+
             event = self._wait_for(
-                lambda item: item.get("request_id") == request_id
-                or item.get("event") in {"error", "closed"},
+                # ``browser_runtime`` responde a navigate/reload com o evento
+                # ``navigated`` (não com browser_result). O contrato anterior
+                # esperava apenas a resposta genérica e bloqueava a primeira
+                # mensagem da sessão antes de ela chegar ao Chat Web.
+                lambda item: (
+                    item.get("request_id") == request_id
+                    and item.get("event")
+                    == ("navigated" if action in {"navigate", "reload"} else "browser_result")
+                )
+                or item.get("event") in {"error", "command_error", "closed"},
                 timeout=timeout,
+                on_event=handle_progress,
             )
             if not event:
                 raise TimeoutError(f"O navegador não respondeu à ação {action}.")
-            if event.get("event") == "error":
+            if event.get("event") in {"error", "command_error"}:
                 raise RuntimeError(str(event.get("message") or "Falha no navegador interno."))
             if event.get("event") == "closed":
                 raise RuntimeError("O navegador interno foi fechado.")
@@ -185,7 +236,20 @@ class WebChatBridge:
                     result = json.loads(result)
                 except json.JSONDecodeError:
                     result = {"text": result}
-            return result if isinstance(result, dict) else {"result": result}
+            if isinstance(result, dict):
+                # O protocolo carrega ``ok`` no envelope e no resultado final.
+                # Preservar o envelope evita transformar uma falha sem payload
+                # em "erro desconhecido" na camada do motor.
+                if "ok" not in result and "ok" in event:
+                    result["ok"] = bool(event.get("ok"))
+                if not result.get("ok", True) and not result.get("error"):
+                    result["error"] = str(event.get("message") or "Falha sem detalhe retornada pelo navegador.")
+                return result
+            return {
+                "ok": bool(event.get("ok")),
+                "error": str(event.get("message") or "Resposta vazia retornada pelo navegador."),
+                "result": result,
+            }
 
     def ensure_workspace_session(self, workspace_path: str | Path | None) -> str:
         workspace = str(workspace_path or self.workspace_path or Path.cwd())
@@ -193,9 +257,6 @@ class WebChatBridge:
 # MEROTEC_CHAT_URL_SESSIONS_V2
         entry_url = normalize_web_url(self.profile.get("web_chat_url"), "https://chatgpt.com/")
         session_key = workspace_session_key(workspace, "web_chat", entry_url)
-        if session_key == self.current_session_key:
-            return self.current_url or entry_url
-
         restore_session = bool(self.profile.get("web_chat_restore_project_session", True))
         settings = self._settings()
         saved = (
@@ -204,6 +265,25 @@ class WebChatBridge:
             else {}
         )
         target_url = str(saved.get("url") or entry_url)
+        # Na primeira abertura, inicie o WebView diretamente na conversa
+        # desejada. Além de poupar uma navegação, isso evita depender de um
+        # comando ``navigate`` enquanto o loop de comandos do pywebview ainda
+        # está se estabilizando (o caso que deixava a UI parada em branco).
+        process = self.process
+        process_is_alive = process is not None and process.poll() is None
+        if session_key == self.current_session_key and process_is_alive:
+            return self.current_url or entry_url
+        if not process_is_alive:
+            self._start(target_url)
+            self.current_session_key = session_key
+            self.current_url = str(self.current_url or target_url)
+            self._remember_url(workspace, self.current_url)
+            return self.current_url
+
+        if str(self.current_url or "").rstrip("/") == target_url.rstrip("/"):
+            self.current_session_key = session_key
+            return self.current_url or target_url
+
         result = self.request(
             "navigate",
             {
@@ -250,6 +330,7 @@ class WebChatBridge:
         attachments: list[dict] | None = None,
         timeout: int | None = None,
         stream_callback: Callable[[str], None] | None = None,
+        direct_chat: bool = False,
     ) -> dict:
         with self.lock:
             self.ensure_workspace_session(workspace_path)
@@ -260,7 +341,7 @@ class WebChatBridge:
 
             for index, chunk in enumerate(chunks):
                 is_last = index == len(chunks) - 1
-                prefix = (
+                prefix = "" if direct_chat and is_last else (
                     f"[CONTEXTO {index + 1}/{len(chunks)} — preserve esta parte; "
                     "não responda até receber a parte final]\n"
                     if not is_last
@@ -276,9 +357,11 @@ class WebChatBridge:
                         "wait_response": is_last,
                         "timeout": int(timeout or self.profile.get("web_chat_timeout_seconds", 300) or 300),
                         "attachments": attachments if is_last else [],
+                        "direct_chat": bool(direct_chat and is_last),
                         "session_key": self.current_session_key,
                     },
                     timeout=max(45, int(timeout or self.profile.get("web_chat_timeout_seconds", 300) or 300) + 45),
+                    progress_callback=stream_callback if is_last else None,
                 )
                 url = str(result.get("url") or self.current_url)
                 if url:

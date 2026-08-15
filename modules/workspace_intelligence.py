@@ -1486,7 +1486,7 @@ class WorkspaceIntelligenceMixin:
                         pass
             if py_targets:
                 quoted = " ".join(f'"{target}"' for target in py_targets[:10])
-                return f'"{sys.executable}" -m compileall -q {quoted}'
+                return f'"venv\\Scripts\\python.exe" -m compileall -q {quoted}'
         if any(suffix in suffixes for suffix in {".js", ".jsx", ".ts", ".tsx", ".css", ".html"}):
             package_json = workspace / "package.json"
             if package_json.exists():

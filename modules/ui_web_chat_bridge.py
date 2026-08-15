@@ -114,7 +114,7 @@ class InternalBrowserWebChatBridge:
         first = self._wait_request(action, payload, timeout)
         if first.get("ok", True) or action != "chat":
             return first
-        error = str(first.get("error") or "").lower()
+        error = str(first.get("error") or "").lower().replace("’", "'")
         recoverable = any(
             marker in error
             for marker in (
@@ -124,6 +124,34 @@ class InternalBrowserWebChatBridge:
                 "webview2",
             )
         )
+        inaccessible_session = any(
+            marker in error
+            for marker in (
+                "don't have access to this conversation",
+                "do not have access to this conversation",
+                "nao tem acesso a esta conversa",
+                "não tem acesso a esta conversa",
+            )
+        )
+        if inaccessible_session:
+            try:
+                clear_session = getattr(self.app, "discard_internal_browser_chat_session", None)
+                if callable(clear_session):
+                    self._call_ui(lambda: clear_session(self.workspace_path))
+                entry_url = self._entry_url()
+                self._call_ui(
+                    lambda: self.app.open_internal_browser(entry_url, source="Chat Web")
+                )
+                ready = getattr(self.app, "internal_browser_ready_event", None)
+                if ready is not None and not ready.wait(timeout=35):
+                    raise TimeoutError("O navegador interno não abriu a página inicial do Chat Web.")
+                self.current_url = str(getattr(self.app, "internal_browser_url", "") or entry_url)
+            except Exception as exc:
+                return {"ok": False, "error": f"{first.get('error')} Recuperação da conversa falhou: {exc}"}
+            second = self._wait_request(action, payload, max(30.0, timeout))
+            if not second.get("ok", True):
+                second["first_error"] = first.get("error", "")
+            return second
         if not recoverable:
             return first
         try:
@@ -232,13 +260,15 @@ class InternalBrowserWebChatBridge:
         target = normalize_web_url(target or entry_url, entry_url)
 
         process = getattr(self.app, "internal_browser_process", None)
+        embedded_browser = getattr(self.app, "browser_view", None)
+        process_is_alive = process is not None and process.poll() is None
         current = str(
             getattr(self.app, "internal_browser_url", "")
             or self.current_url
             or ""
         )
 
-        if process is None or process.poll() is not None:
+        if not process_is_alive and embedded_browser is None:
             self._call_ui(
                 lambda: self.app.open_internal_browser(target, source="Chat Web")
             )
@@ -255,6 +285,14 @@ class InternalBrowserWebChatBridge:
             time.sleep(0.15)
         elif current:
             target = current
+
+        # No Qt, o WebEngine esta embutido na janela principal e nao possui o
+        # processo auxiliar usado pela interface Tk. Aguarde o carregamento
+        # antes de injetar a proxima acao JavaScript.
+        if embedded_browser is not None:
+            ready = getattr(self.app, "internal_browser_ready_event", None)
+            if ready is not None and not ready.wait(timeout=35):
+                raise TimeoutError("O navegador embutido nao ficou pronto para o Chat Web.")
 
         self.current_session_key = session_key
         self.current_url = str(getattr(self.app, "internal_browser_url", "") or target)

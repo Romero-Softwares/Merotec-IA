@@ -52,6 +52,7 @@ class RepositoryQualityTests(unittest.TestCase):
 
         self.assertTrue(callable(transport.unwrap_transport_code))
         self.assertTrue(callable(transport.validate_source_text))
+        self.assertTrue(callable(transport.validate_file))
         self.assertTrue(callable(transport.validate_source))
         self.assertTrue(callable(transport.fenced_transport_instruction))
         self.assertIsNone(transport.validate_source("app.py", "def main():\n    return 1\n"))
@@ -70,6 +71,13 @@ class RepositoryQualityTests(unittest.TestCase):
         self.assertIn("dialog.grid_rowconfigure(3, weight=1)", source)
         self.assertNotIn("dialog.grid_rowconfigure(2, weight=1)", source)
         self.assertIn('body.grid(row=3, column=0, sticky="nsew"', source)
+
+    def test_qt_settings_are_saved_before_the_ai_engine_is_recreated(self):
+        source = (ROOT / "pyside_app.py").read_text(encoding="utf-8")
+        method_start = source.index("def show_settings_hint")
+        settings_saved = source.index("self._save_settings()", method_start)
+        engine_recreated = source.index("self.engine = UniversalEngine()", method_start)
+        self.assertLess(settings_saved, engine_recreated)
 
     def test_plugin_manager_is_connected_to_app_startup(self):
         source = (ROOT / "main.py").read_text(encoding="utf-8")

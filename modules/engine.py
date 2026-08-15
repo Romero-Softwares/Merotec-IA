@@ -3363,17 +3363,35 @@ def _merotec_chat_generate_web(
             raise RuntimeError("ponte do Chat Web indisponível")
         bridge.managed_by_ide = True
 
+        direct_conversation = str(prompt or "").startswith("[MEROTEC_DIRECT_CHAT]")
+        if direct_conversation:
+            prompt = str(prompt).removeprefix("[MEROTEC_DIRECT_CHAT]").strip()
+
         include_project_context = bool(
             getattr(self, "web_chat_profile", {}).get(
                 "web_chat_include_project_context", True
             )
         )
-        compacted = _merotec_chat_compact_context(self, code_context) if include_project_context else ""
-        message = (
-            _merotec_chat_instruction(self)
-            + "\n\nTAREFA ATUAL:\n"
-            + str(prompt or "").strip()
+        compacted = (
+            _merotec_chat_compact_context(self, code_context)
+            if include_project_context and not direct_conversation
+            else ""
         )
+        if direct_conversation:
+            message = (
+                "Você é o assistente da Merotec IA IDE. Responda diretamente à "
+                "mensagem do usuário em português, de modo útil e natural. "
+                "Não leia arquivos, não use tags de ação e não tente alterar o "
+                "projeto, a menos que o usuário peça isso explicitamente.\n\n"
+                "MENSAGEM DO USUÁRIO:\n"
+                + str(prompt or "").strip()
+            )
+        else:
+            message = (
+                _merotec_chat_instruction(self)
+                + "\n\nTAREFA ATUAL:\n"
+                + str(prompt or "").strip()
+            )
         if compacted:
             message += "\n\nCONTEXTO OBJETIVO:\n" + compacted
 
@@ -3399,6 +3417,7 @@ def _merotec_chat_generate_web(
             attachments=attachments,
             timeout=self.web_chat_timeout_seconds,
             stream_callback=stream_callback,
+            direct_chat=direct_conversation,
         )
         if not isinstance(result, dict):
             result = {"ok": False, "error": "Resposta inválida do navegador interno."}
@@ -3772,15 +3791,22 @@ def _merotec_v10_chat_instruction(self):
         "A missao continua ate uma mudanca aplicada e uma validacao real, bloqueio externo explicito, cancelamento ou [FINAL] aceito.\n"
         "A TAREFA ATUAL tem prioridade sobre historico e missoes anteriores. Se o usuario pediu algo diferente agora, pare o ciclo antigo e obedeca ao pedido atual.\n"
         "Continue uma missao anterior somente quando o pedido atual for claramente de continuidade.\n"
-        "Responda com EXATAMENTE UMA acao da IDE, sem texto antes ou depois.\n"
-        "Acoes curtas: [READ: caminho], [SEARCH_TEXT: padrao | caminho], [EXECUTE: comando de teste real], "
+        "Escolha autonomamente a menor sequencia de acoes da IDE que conclua a tarefa. "
+        "Uma resposta pode incluir leitura, uma unica mutacao e a respectiva validacao quando isso for seguro; "
+        "nao use passos decorativos nem encerre enquanto ainda houver objetivo pendente.\n"
+        "Acoes curtas: [READ: caminho], [SEARCH_TEXT: padrao | caminho], [VALIDATE: caminho], [EXECUTE: comando de teste real], "
         "[HUMAN_TEST: auto], [OPEN_URL: url], [SCREENSHOT: tela], [FINAL: resumo].\n"
-        "Exemplos canonicos: [READ: main.py], [SEARCH_TEXT: def main | main.py], [EXECUTE: python -m unittest]. "
+        "Exemplos canonicos: [READ: main.py], [SEARCH_TEXT: def main | main.py], [VALIDATE: pagina.html], [EXECUTE: python -m unittest]. "
         "Nao use [READ] arquivo; use sempre [READ: arquivo]. Compatibilidade: Não use [READ] arquivo.\n"
-        "Fluxo de engenharia obrigatorio: entenda a tarefa atual, leia ou busque apenas o contexto necessario, aplique uma edicao pequena, "
-        "rode um teste real e corrija novamente se a IDE devolver erro. Nao peca o objetivo de novo enquanto houver missao ativa.\n"
-        "Para alterar arquivo existente, prefira REPLACE pequeno com trecho OLD exato copiado do arquivo atual. Use WRITE completo apenas para arquivo novo "
-        "ou quando uma reescrita inteira for realmente necessaria. PATCH tambem e aceito quando for o formato mais seguro para varias mudancas pequenas.\n"
+        "Fluxo de engenharia autonomo: entenda o objetivo, leia apenas o contexto necessario, escolha a mutacao menos arriscada, "
+        "valide o resultado salvo e corrija novamente se a IDE devolver erro. Nao peca o objetivo de novo enquanto houver missao ativa.\n"
+        "Para alterar arquivo existente, prefira REPLACE pequeno com trecho OLD exato copiado do arquivo atual. Use WRITE completo apenas para arquivo novo, "
+        "para uma reescrita realmente necessaria ou quando o arquivo atual estiver irrecuperavelmente incompleto. PATCH tambem e aceito quando for o formato mais seguro.\n"
+        "Se o usuario pedir explicitamente para sobrescrever, recriar, substituir ou gerar de novo um arquivo inteiro, use [WRITE: esse-arquivo] diretamente "
+        "com o novo conteúdo completo; não troque essa intenção por REPLACE.\n"
+        "Se o novo arquivo completo for longo demais para uma única resposta, envie partes consecutivas sem cerca Markdown: "
+        "[WRITE_PART: caminho/arquivo | 1/3]conteúdo[/WRITE_PART], depois 2/3 e 3/3. "
+        "A IDE só grava o arquivo depois de receber e validar todas as partes.\n"
         "Formato de edicao local preferencial:\n"
         "[REPLACE: caminho/arquivo.ext]\n"
         "[OLD]\n"
@@ -3794,6 +3820,12 @@ def _merotec_v10_chat_instruction(self):
         "```\n"
         "[/NEW]\n"
         "[/REPLACE]\n"
+        "Para acrescentar conteúdo sem depender de um trecho OLD, use uma inserção ancorada:\n"
+        "[INSERT_BEFORE: caminho/arquivo.html | </body>]\n"
+        "novo bloco completo\n"
+        "[/INSERT_BEFORE]\n"
+        "ou [INSERT_AFTER: caminho | marcador único]. Para CSS, use </style> como marcador; "
+        "para HTML, use </body>. O marcador deve existir uma única vez.\n"
         "Formato para criar arquivo ou reescrever de proposito:\n"
         "[WRITE: caminho/arquivo.ext]\n"
         "```linguagem\n"
@@ -3803,6 +3835,10 @@ def _merotec_v10_chat_instruction(self):
         "Antes de alterar um arquivo existente, use [READ: caminho] ou [SEARCH_TEXT: padrao | caminho] quando o conteudo atual nao estiver no contexto. "
         "Para arquivo grande, use [READ: caminho | linhas inicio-fim] ou SEARCH_TEXT e edite somente o intervalo necessario. "
         "Para Python, use quatro espacos por nivel, nunca tab. Preserve todos os espacos dentro da cerca Markdown.\n"
+        "Depois de criar ou alterar um arquivo, prefira [VALIDATE: caminho] para a IDE verificar o arquivo realmente salvo. "
+        "VALIDATE confere Python, JSON, HTML, XML, SVG e TOML localmente; use EXECUTE apenas quando a validacao exigir executar o projeto.\n"
+        "Quando uma acao for recusada, use o diagnostico e o arquivo atual devolvido pela IDE para decidir o proximo passo. "
+        "Um arquivo valido nao significa que a missao terminou: verifique se o pedido do usuario foi realmente aplicado antes de emitir [FINAL].\n"
         "Quando houver print/imagem anexada, analise a evidencia visual como parte obrigatoria da tarefa. "
         "Se a tela mostrar bug visual, sobreposicao, tela em branco, duplicidade ou erro, responda com a proxima acao executavel para corrigir ou validar. "
         "Nao peca outro print se o print atual ja estiver visivel.\n"

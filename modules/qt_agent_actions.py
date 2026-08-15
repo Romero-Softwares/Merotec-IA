@@ -10,14 +10,26 @@ import re
 from pathlib import Path
 
 from modules.app_constants import is_ignored_dir_name
+from modules.code_transport import unwrap_transport_code, validate_file, validate_source_text
 
 
 class QtAgentActions:
-    def __init__(self, workspace, on_message, on_command, on_changed):
+    def __init__(self, workspace, on_message, on_command, on_changed, task_objective="", write_staging=None):
         self.workspace = Path(workspace).resolve()
         self.on_message = on_message
         self.on_command = on_command
         self.on_changed = on_changed
+        self.task_objective = str(task_objective or "")
+        self.write_staging = write_staging if write_staging is not None else {}
+        self.last_observations = []
+        self.last_action_count = 0
+        self.last_followup_required = 0
+        self.last_validated_paths = []
+        self.last_command_requested = False
+
+    def _message(self, author, text):
+        self.last_observations.append(f"{author}: {text}")
+        self.on_message(author, text)
 
     def _path(self, raw):
         path = (self.workspace / str(raw).strip()).resolve()
@@ -25,24 +37,135 @@ class QtAgentActions:
             raise ValueError("A acao tentou sair do workspace.")
         return path
 
+    def _mutation_recovery(self, raw_path):
+        """Devolve o estado real após uma edição recusada ao Chat Web.
+
+        Sem esse contexto o modelo tende a procurar trechos que não existem em
+        um arquivo já truncado. Para arquivos pequenos, entregar o fonte atual
+        permite que ele escolha um WRITE completo seguro na próxima ação.
+        """
+        try:
+            path = self._path(raw_path)
+            if not path.is_file():
+                return
+            source = path.read_text(encoding="utf-8", errors="replace")
+            relative = path.relative_to(self.workspace).as_posix()
+            issue = validate_file(path)
+            explicit_full_write = bool(re.search(
+                r"(?i)\b(?:sobrescrev\w*|reescrev\w*|recri\w*|substitu\w*\s+(?:o\s+)?arquivo|"
+                r"arquivo\s+inteiro|arquivo\s+completo|ger(?:e|ar)\s+(?:um\s+)?novo)\b",
+                self.task_objective,
+            ))
+            if len(source) > 18000:
+                self._message(
+                    "Recuperação da IDE",
+                    f"{relative} permanece inalterado. Use [READ: {relative}] para obter o trecho atual antes de tentar nova edição.",
+                )
+                return
+            if issue is None:
+                if explicit_full_write:
+                    self._message(
+                        "Recuperação da IDE",
+                        f"A tarefa atual pede explicitamente sobrescrever {relative}. "
+                        f"Responda agora com [WRITE: {relative}] e o arquivo COMPLETO novo; "
+                        "não use REPLACE. A IDE salvará assim que o conteúdo estiver estruturalmente válido.",
+                    )
+                    return
+                self._message(
+                    "Recuperação da IDE",
+                    f"{relative} permanece válido, mas a alteração pedida AINDA NÃO foi aplicada. "
+                    f"Use [REPLACE: {relative}] com [OLD] copiado exatamente do ARQUIVO ATUAL abaixo e um [NEW] pequeno; "
+                    "não reescreva o arquivo inteiro e não conclua a tarefa antes de aplicar a mudança.\n"
+                    f"ARQUIVO ATUAL — {relative}:\n```\n{source}\n```",
+                )
+                return
+            self._message(
+                "Recuperação da IDE",
+                f"O arquivo {relative} permanece inalterado e este é seu conteúdo real. "
+                f"Se ele estiver incompleto, responda na próxima ação com [WRITE: {relative}] contendo o arquivo COMPLETO; "
+                "não repita REPLACE com um trecho OLD diferente.\n"
+                f"ARQUIVO ATUAL — {relative}:\n```\n{source}\n```",
+            )
+        except (OSError, ValueError):
+            return
+
     def apply(self, response):
         changed = []
+        self.last_observations = []
+        self.last_action_count = 0
+        self.last_followup_required = 0
+        self.last_validated_paths = []
+        self.last_command_requested = False
         for patch in re.findall(r"\[PATCH(?:\s*:[^\]]+)?\](.*?)\[/PATCH\]", response, re.I | re.S):
+            self.last_action_count += 1
+            self.last_followup_required += 1
             changed.extend(self._patch(patch))
         for request in re.findall(r"\[READ:\s*([^\]]+)\]", response, re.I):
+            self.last_action_count += 1
+            self.last_followup_required += 1
             self._read(request)
         for request in re.findall(r"\[SEARCH_TEXT:\s*([^\]]+)\]", response, re.I):
+            self.last_action_count += 1
+            self.last_followup_required += 1
             self._search(request)
-        for raw_path, content in re.findall(r"\[WRITE:\s*([^\]\r\n]+)\](.*?)\[/WRITE\]", response, re.I | re.S):
+        for raw_path, part, total, content in re.findall(
+            r"\[WRITE_PART:\s*([^|\]\r\n]+)\|\s*(\d+)\s*/\s*(\d+)\s*\](.*?)\[/WRITE_PART\]",
+            response, re.I | re.S,
+        ):
+            self.last_action_count += 1
+            self.last_followup_required += 1
             try:
                 path = self._path(raw_path)
+                part, total = int(part), int(total)
+                if not 1 <= part <= total <= 80:
+                    raise ValueError("numeração inválida")
+                key = str(path)
+                stage = self.write_staging.setdefault(key, {"total": total, "raw_path": raw_path.strip(), "parts": {}})
+                if stage["total"] != total:
+                    raise ValueError("o total de partes mudou")
+                fragment = content.strip("\r\n")
+                previous = stage["parts"].get(part)
+                if previous is not None and previous != fragment:
+                    raise ValueError(f"parte {part} conflitante")
+                stage["parts"][part] = fragment
+                if len(stage["parts"]) < total:
+                    self._message("Sistema", f"WRITE_PART recebido: {path.name} ({len(stage['parts'])}/{total}).")
+                    continue
+                source = "\n".join(stage["parts"][number] for number in range(1, total + 1))
+                del self.write_staging[key]
+                source = unwrap_transport_code(source, path)
+                issue = validate_source_text(path, source)
+                if issue:
+                    raise ValueError(f"Conteúdo inválido: {issue.get('message') or issue.get('kind')}")
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content.strip("\r\n") + "\n", encoding="utf-8")
+                path.write_text(source.rstrip("\n") + "\n", encoding="utf-8")
                 changed.append(path)
-                self.on_message("Sistema", f"Arquivo gravado pela IA: {path.relative_to(self.workspace)}")
+                self._message("Sistema", f"Arquivo gravado pela IA em {total} partes: {path.relative_to(self.workspace)}")
+            except (OSError, ValueError, KeyError) as exc:
+                self._message("Erro", f"WRITE_PART recusado: {exc}")
+                self._mutation_recovery(raw_path)
+        for raw_path, content in re.findall(r"\[WRITE:\s*([^\]\r\n]+)\](.*?)\[/WRITE\]", response, re.I | re.S):
+            self.last_action_count += 1
+            self.last_followup_required += 1
+            try:
+                path = self._path(raw_path)
+                source = unwrap_transport_code(content, path)
+                issue = validate_source_text(path, source)
+                if issue:
+                    raise ValueError(
+                        f"Conteúdo inválido para {path.name} na linha {issue.get('line') or '?'}: "
+                        f"{issue.get('message') or issue.get('kind')}."
+                    )
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source.rstrip("\n") + "\n", encoding="utf-8")
+                changed.append(path)
+                self._message("Sistema", f"Arquivo gravado pela IA: {path.relative_to(self.workspace)}")
             except (OSError, ValueError) as exc:
-                self.on_message("Erro", f"WRITE recusado: {exc}")
+                self._message("Erro", f"WRITE recusado: {exc}")
+                self._mutation_recovery(raw_path)
         for raw_path, body in re.findall(r"\[REPLACE:\s*([^\]]+)\](.*?)\[/REPLACE\]", response, re.I | re.S):
+            self.last_action_count += 1
+            self.last_followup_required += 1
             old = re.search(r"\[OLD\](.*?)\[/OLD\]", body, re.I | re.S)
             new = re.search(r"\[NEW\](.*?)\[/NEW\]", body, re.I | re.S)
             try:
@@ -50,16 +173,108 @@ class QtAgentActions:
                     raise ValueError("REPLACE precisa de OLD e NEW.")
                 path = self._path(raw_path)
                 source = path.read_text(encoding="utf-8")
-                old_text = old.group(1).strip("\r\n")
+                old_text = unwrap_transport_code(old.group(1), path).strip("\r\n")
                 if old_text not in source:
                     raise ValueError("Trecho OLD nao encontrado; arquivo preservado.")
-                path.write_text(source.replace(old_text, new.group(1).strip("\r\n"), 1), encoding="utf-8")
+                replacement = unwrap_transport_code(new.group(1), path).strip("\r\n")
+                issue = validate_source_text(path, source.replace(old_text, replacement, 1))
+                if issue:
+                    raise ValueError(
+                        f"Conteúdo inválido para {path.name} na linha {issue.get('line') or '?'}: "
+                        f"{issue.get('message') or issue.get('kind')}."
+                    )
+                path.write_text(source.replace(old_text, replacement, 1), encoding="utf-8")
                 changed.append(path)
-                self.on_message("Sistema", f"Arquivo atualizado pela IA: {path.relative_to(self.workspace)}")
+                self._message("Sistema", f"Arquivo atualizado pela IA: {path.relative_to(self.workspace)}")
             except (OSError, ValueError) as exc:
-                self.on_message("Erro", f"REPLACE recusado: {exc}")
-        for command in re.findall(r"\[EXECUTE:\s*([^\]\r\n]+)\]", response, re.I):
-            self.on_command(command.strip())
+                self._message("Erro", f"REPLACE recusado: {exc}")
+                self._mutation_recovery(raw_path)
+        for raw_path, marker, content in re.findall(
+            r"\[INSERT_BEFORE\s*:\s*([^|\]\r\n]+)\|\s*([^\]\r\n]+)\](.*?)\[/INSERT_BEFORE\]",
+            response, re.I | re.S,
+        ):
+            self.last_action_count += 1
+            self.last_followup_required += 1
+            try:
+                path = self._path(raw_path)
+                source = path.read_text(encoding="utf-8")
+                marker = marker.strip()
+                if not marker or source.count(marker) != 1:
+                    raise ValueError("Marcador ausente ou ambíguo; arquivo preservado.")
+                addition = unwrap_transport_code(content, path).strip("\r\n")
+                candidate = source.replace(marker, addition + "\n" + marker, 1)
+                issue = validate_source_text(path, candidate)
+                if issue:
+                    raise ValueError(f"Conteúdo inválido: {issue.get('message') or issue.get('kind')}")
+                path.write_text(candidate, encoding="utf-8")
+                changed.append(path)
+                self._message("Sistema", f"Conteúdo acrescentado antes de {marker}: {path.relative_to(self.workspace)}")
+            except (OSError, ValueError) as exc:
+                self._message("Erro", f"INSERT_BEFORE recusado: {exc}")
+                self._mutation_recovery(raw_path)
+        for raw_path, marker, content in re.findall(
+            r"\[INSERT_AFTER\s*:\s*([^|\]\r\n]+)\|\s*([^\]\r\n]+)\](.*?)\[/INSERT_AFTER\]",
+            response, re.I | re.S,
+        ):
+            self.last_action_count += 1
+            self.last_followup_required += 1
+            try:
+                path = self._path(raw_path)
+                source = path.read_text(encoding="utf-8")
+                marker = marker.strip()
+                if not marker or source.count(marker) != 1:
+                    raise ValueError("Marcador ausente ou ambíguo; arquivo preservado.")
+                addition = unwrap_transport_code(content, path).strip("\r\n")
+                candidate = source.replace(marker, marker + "\n" + addition, 1)
+                issue = validate_source_text(path, candidate)
+                if issue:
+                    raise ValueError(f"Conteúdo inválido: {issue.get('message') or issue.get('kind')}")
+                path.write_text(candidate, encoding="utf-8")
+                changed.append(path)
+                self._message("Sistema", f"Conteúdo acrescentado após {marker}: {path.relative_to(self.workspace)}")
+            except (OSError, ValueError) as exc:
+                self._message("Erro", f"INSERT_AFTER recusado: {exc}")
+                self._mutation_recovery(raw_path)
+        for raw_path in re.findall(r"\[VALIDATE\s*:\s*([^\]\r\n]+)\]", response, re.I):
+            self.last_action_count += 1
+            self.last_followup_required += 1
+            try:
+                path = self._path(raw_path)
+                if not path.is_file():
+                    raise ValueError("Arquivo não encontrado.")
+                issue = validate_file(path)
+                relative = path.relative_to(self.workspace)
+                if issue and issue.get("kind") == "TransportArtifact":
+                    source = path.read_text(encoding="utf-8")
+                    repaired = unwrap_transport_code(source, path)
+                    repair_issue = validate_source_text(path, repaired)
+                    if repair_issue is None and repaired != source:
+                        path.write_text(repaired.rstrip("\n") + "\n", encoding="utf-8")
+                        changed.append(path)
+                        issue = None
+                        self._message("Sistema", f"Artefatos de transporte removidos automaticamente: {relative}")
+                if issue:
+                    raise ValueError(
+                        f"Validação falhou ({issue.get('kind')}): {issue.get('message')}"
+                    )
+                self.last_validated_paths.append(path.resolve())
+                self._message("Validação da IDE", f"{relative}: arquivo válido.")
+            except (OSError, ValueError) as exc:
+                self._message("Erro", f"VALIDATE recusado: {exc}")
+        # A tag é de uma linha, mas o comando pode conter colchetes (listas
+        # Python, índices PowerShell etc.). Capture até o último ``]`` da linha.
+        for command in re.findall(r"(?im)^\s*\[EXECUTE\s*:\s*(.+)\]\s*$", response):
+            self.last_action_count += 1
+            command = command.strip()
+            if command:
+                started = self.on_command(command)
+                if started is False:
+                    self._message("Erro", f"EXECUTE não iniciado: {command}")
+                else:
+                    self.last_command_requested = True
+                    self._message("Sistema", f"EXECUTE encaminhado ao terminal: {command}")
+            else:
+                self._message("Erro", "EXECUTE recusado: comando vazio.")
         if changed:
             self.on_changed(changed)
         return changed
@@ -67,7 +282,7 @@ class QtAgentActions:
     def _patch(self, raw):
         raw = raw.strip().removeprefix("```diff").removeprefix("```patch").removesuffix("```").strip()
         if "*** Begin Patch" not in raw or "*** End Patch" not in raw:
-            self.on_message("Erro", "PATCH recusado: formato esperado ausente.")
+            self._message("Erro", "PATCH recusado: formato esperado ausente.")
             return []
         body = raw.split("*** Begin Patch", 1)[1].split("*** End Patch", 1)[0]
         sections, kind, path, lines = [], None, None, []
@@ -107,9 +322,9 @@ class QtAgentActions:
                         else: raise ValueError(f"Contexto nao encontrado: {raw_path}")
                     target.write_text("\n".join(source_lines) + ("\n" if final_newline else ""), encoding="utf-8")
                 changed.append(target)
-                self.on_message("Sistema", f"PATCH aplicado: {target.relative_to(self.workspace)}")
+                self._message("Sistema", f"PATCH aplicado: {target.relative_to(self.workspace)}")
         except (OSError, ValueError) as exc:
-            self.on_message("Erro", f"PATCH recusado: {exc}")
+            self._message("Erro", f"PATCH recusado: {exc}")
             return []
         return changed
 
@@ -125,15 +340,15 @@ class QtAgentActions:
             start = max(1, start)
             end = min(len(lines), max(start, end), start + 239)
             content = "\n".join(f"{number:>5}  {lines[number - 1]}" for number in range(start, end + 1))
-            self.on_message("Leitura da IDE", f"{path.relative_to(self.workspace)} (linhas {start}-{end})\n{content}")
+            self._message("Leitura da IDE", f"{path.relative_to(self.workspace)} (linhas {start}-{end})\n{content}")
         except (OSError, ValueError) as exc:
-            self.on_message("Erro", f"READ recusado: {exc}")
+            self._message("Erro", f"READ recusado: {exc}")
 
     def _search(self, request):
         term, separator, raw_path = request.partition("|")
         term = term.strip()
         if not term:
-            self.on_message("Erro", "SEARCH_TEXT precisa de um termo.")
+            self._message("Erro", "SEARCH_TEXT precisa de um termo.")
             return
         try:
             roots = [self._path(raw_path)] if separator and raw_path.strip() else list(self.workspace.rglob("*"))
@@ -156,6 +371,6 @@ class QtAgentActions:
                 if len(results) >= 80:
                     break
             message = "\n".join(results) if results else "Nenhuma ocorrencia encontrada."
-            self.on_message("Busca da IDE", f"SEARCH_TEXT: {term}\n{message}")
+            self._message("Busca da IDE", f"SEARCH_TEXT: {term}\n{message}")
         except ValueError as exc:
-            self.on_message("Erro", f"SEARCH_TEXT recusado: {exc}")
+            self._message("Erro", f"SEARCH_TEXT recusado: {exc}")
