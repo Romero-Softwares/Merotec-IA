@@ -25,13 +25,21 @@ def _emit(event: str, **payload: object) -> None:
 
 
 def _storage_path(scope: object = "chat-web") -> str:
-    """Retorna um perfil WebView separado por finalidade, sem aceitar paths arbitrários."""
-    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    """Retorna um perfil WebView isolado em um diretório gravável da IDE.
+
+    O perfil antigo em ``LOCALAPPDATA`` podia ficar bloqueado por outro
+    WebView2 (HRESULT 0x800700AA) ou negar escrita em instalações portáteis.
+    Manter os dados dentro do projeto evita esses dois casos e continua
+    separando as finalidades por ``scope``.
+    """
+    base = os.environ.get("MEROTEC_BROWSER_STORAGE_ROOT")
+    if not base:
+        base = str(Path(__file__).resolve().parent.parent / ".merotec_local_ai" / "webview2")
     safe_scope = "".join(
         char if char.isalnum() or char in {"-", "_"} else "-"
         for char in str(scope or "chat-web")
     ).strip(".-_") or "chat-web"
-    path = Path(base) / "MerotecIA" / "WebView2" / safe_scope[:80]
+    path = Path(base) / safe_scope[:80]
     path.mkdir(parents=True, exist_ok=True)
     return str(path)
 

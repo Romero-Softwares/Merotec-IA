@@ -80,3 +80,103 @@ class PySideTerminalTests(unittest.TestCase):
 
             self.assertEqual(external_file.resolve(), ide.opened_file)
             self.assertEqual(workspace, ide.workspace)
+
+    def test_browser_result_resumes_the_active_agent_task(self):
+        class FakeIDE:
+            _decode_web_javascript_result = staticmethod(MerotecIDE._decode_web_javascript_result)
+
+            def __init__(self):
+                self._agent_browser_action_pending = {
+                    "action": "inspect",
+                    "payload": {},
+                }
+                self.chat_busy = True
+                self._chat_waiting_for_browser = True
+                self.continuation = None
+
+            def _continue_agent_after_browser_action(self, action, payload, result):
+                self.continuation = (action, payload, result)
+
+        ide = FakeIDE()
+
+        MerotecIDE._finish_agent_browser_action(
+            ide,
+            {"result": '{"ok": true, "text": "Pagina carregada"}'},
+        )
+
+        self.assertEqual(
+            ide.continuation,
+            ("inspect", {}, {"ok": True, "text": "Pagina carregada"}),
+        )
+        self.assertFalse(ide._chat_waiting_for_browser)
+
+    def test_browser_request_is_queued_without_worker_thread_webengine_probe(self):
+        class SignalProbe:
+            def __init__(self):
+                self.args = None
+
+            def emit(self, *args):
+                self.args = args
+
+        class FakeIDE:
+            def __init__(self):
+                self.browser_action_requested = SignalProbe()
+
+            def _internal_browser_is_usable(self):
+                raise AssertionError("A thread do agente não deve consultar QWebEngineView.")
+
+        ide = FakeIDE()
+        callback = lambda _event: None
+
+        request_id = MerotecIDE.request_internal_browser_action(
+            ide,
+            "inspect",
+            {"scope": "pagina"},
+            callback,
+        )
+
+        self.assertTrue(request_id.startswith("qt-browser-"))
+        self.assertEqual(ide.browser_action_requested.args, ("inspect", {"scope": "pagina"}, callback))
+
+    def test_browser_actions_are_explicitly_queued_to_the_qt_event_loop(self):
+        source = (ROOT / "pyside_app.py").read_text(encoding="utf-8")
+        self.assertIn("Qt.ConnectionType.QueuedConnection", source)
+        self.assertIn("JSON.stringify({ok:true,url: location.href", source)
+
+    def test_changed_files_start_first_automatic_validation(self):
+        class FakeIDE:
+            def __init__(self, workspace):
+                self.workspace = Path(workspace)
+                self._chat_task_prompt = "corrija o arquivo"
+                self._chat_auto_validation_paths = set()
+                self._chat_waiting_for_command = False
+                self.command = ""
+                self.activity = []
+                self.messages = []
+
+            def validation_command_for_changed_paths(self, paths, objective):
+                self.validation_paths = paths
+                self.validation_objective = objective
+                return "python -m compileall -q app.py"
+
+            def run_agent_command(self, command):
+                self.command = command
+                return True
+
+            def _append_chat_activity(self, text):
+                self.activity.append(text)
+
+            def add_chat(self, author, text):
+                self.messages.append((author, text))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "app.py"
+            target.write_text("print('ok')\n", encoding="utf-8")
+            ide = FakeIDE(temp_dir)
+
+            started = MerotecIDE._start_automatic_validation(ide, [target])
+
+            self.assertTrue(started)
+            self.assertTrue(ide._chat_waiting_for_command)
+            self.assertEqual(ide.command, "python -m compileall -q app.py")
+            self.assertEqual(ide._chat_auto_validation_paths, {target.resolve()})

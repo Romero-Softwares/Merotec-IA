@@ -48,6 +48,58 @@ class QtAgentActionsTests(unittest.TestCase):
             self.assertEqual(commands, [command])
             self.assertTrue(any("EXECUTE encaminhado ao terminal" in text for _author, text in messages))
 
+    def test_human_test_is_forwarded_to_the_pyside_visual_runner(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            requests = []
+            actions = QtAgentActions(
+                temp_dir,
+                lambda *_args: None,
+                lambda _command: None,
+                lambda _paths: None,
+                on_human_test=requests.append,
+            )
+
+            actions.apply("[HUMAN_TEST: auto]")
+
+            self.assertEqual(requests, ["auto"])
+            self.assertTrue(actions.last_visual_test_requested)
+            self.assertEqual(actions.last_action_count, 1)
+
+    def test_browser_action_is_forwarded_one_step_at_a_time(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            requests = []
+            actions = QtAgentActions(
+                temp_dir,
+                lambda *_args: None,
+                lambda _command: None,
+                lambda _paths: None,
+                on_browser_action=lambda action, payload: requests.append((action, payload)),
+            )
+
+            actions.apply(
+                "[OPEN_URL: http://127.0.0.1:8765/]\n"
+                "[BROWSER_INSPECT: pagina]"
+            )
+
+            self.assertEqual(requests, [("open", {"url": "http://127.0.0.1:8765/"})])
+            self.assertTrue(actions.last_browser_action_requested)
+            self.assertEqual(actions.last_action_count, 1)
+
+    def test_browser_type_requires_element_and_text(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            messages = []
+            actions = QtAgentActions(
+                temp_dir,
+                lambda author, text: messages.append((author, text)),
+                lambda _command: None,
+                lambda _paths: None,
+            )
+
+            actions.apply("[BROWSER_TYPE: e1]")
+
+            self.assertFalse(actions.last_browser_action_requested)
+            self.assertTrue(any("BROWSER_TYPE precisa" in text for _author, text in messages))
+
     def test_write_unwraps_markdown_code_fence(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir)

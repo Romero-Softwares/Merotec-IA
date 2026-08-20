@@ -3310,6 +3310,31 @@ def _merotec_chat_compact_context(self, code_context, limit=9000):
     )
 
 
+def _merotec_direct_chat_context(code_context, limit=6000):
+    """Keep a small conversational window without injecting workspace details."""
+    text = str(code_context or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+
+    marker = "Conversa recente que deve ser preservada:"
+    start = text.find(marker)
+    if start >= 0:
+        text = text[start + len(marker):]
+        boundaries = (
+            "\n\nBRIEFING INTELIGENTE DA IDE:",
+            "\n\nArquivos do workspace:",
+            "\n\nCONTEXTO TECNICO PRIORITARIO",
+        )
+        positions = [text.find(item) for item in boundaries if text.find(item) >= 0]
+        if positions:
+            text = text[:min(positions)]
+
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return "[Inicio do historico recente omitido]\n" + text[-limit:].lstrip()
+
+
 def _merotec_chat_instruction(self):
     return (
         "PROTOCOLO ATIVO DA MEROTEC IA IDE — esta instrução substitui orientações anteriores desta conversa que peçam texto livre.\n"
@@ -3366,6 +3391,9 @@ def _merotec_chat_generate_web(
         direct_conversation = str(prompt or "").startswith("[MEROTEC_DIRECT_CHAT]")
         if direct_conversation:
             prompt = str(prompt).removeprefix("[MEROTEC_DIRECT_CHAT]").strip()
+        direct_conversation_context = (
+            _merotec_direct_chat_context(code_context) if direct_conversation else ""
+        )
 
         include_project_context = bool(
             getattr(self, "web_chat_profile", {}).get(
@@ -3394,6 +3422,12 @@ def _merotec_chat_generate_web(
             )
         if compacted:
             message += "\n\nCONTEXTO OBJETIVO:\n" + compacted
+        if direct_conversation_context:
+            message += (
+                "\n\nHISTORICO RECENTE DA CONVERSA (mantenha o assunto e as referencias "
+                "deste historico; responda a mensagem do usuario acima):\n"
+                + direct_conversation_context
+            )
 
         attachments = self._web_chat_attachment_payload(image_path)
         if requested_visual and not attachments:

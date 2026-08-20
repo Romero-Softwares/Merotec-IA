@@ -10,12 +10,17 @@ import locale
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import ctypes
+from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
+
+from PIL import ImageGrab
 
 from PySide6.QtCore import QDir, QFileInfo, QProcess, QProcessEnvironment, QSortFilterProxyModel, QStandardPaths, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap, QSyntaxHighlighter, QTextCharFormat, QTextDocument
@@ -32,6 +37,7 @@ from PySide6.QtCore import QUrl
 from modules.engine import UniversalEngine
 from modules.executor import CodeExecutor
 from modules.qt_ui_bridge import QtUiBridge
+from modules.ui_web_chat_bridge import InternalBrowserWebChatBridge
 from modules.app_constants import APP_CHANGE_HISTORY_FILE, APP_HISTORY_FILE, APP_SETTINGS_FILE, PROJECTS_DIR, IGNORED_SUFFIXES, is_ignored_dir_name
 from modules.app_state import AppStateMixin
 from modules.workspace_intelligence import WorkspaceIntelligenceMixin
@@ -68,6 +74,47 @@ class PythonHighlighter(QSyntaxHighlighter):
         function_format = QTextCharFormat()
         function_format.setForeground(QColor("#63b7ff"))
         self.rules.append((r"\b[A-Za-z_][A-Za-z0-9_]*(?=\s*\()", function_format))
+
+    def highlightBlock(self, text):
+        from re import finditer
+        for pattern, text_format in self.rules:
+            for match in finditer(pattern, text):
+                self.setFormat(match.start(), match.end() - match.start(), text_format)
+
+
+class GettingStartedHighlighter(QSyntaxHighlighter):
+    """Destaca orientacoes e comandos na aba informativa inicial."""
+
+    def __init__(self, document):
+        super().__init__(document)
+        self.rules = []
+
+        body_format = QTextCharFormat()
+        body_format.setForeground(QColor("#aebdcb"))
+        self.rules.append((r"^#.*$", body_format))
+
+        title_format = QTextCharFormat()
+        title_format.setForeground(QColor(ACCENT))
+        title_format.setFontWeight(QFont.Weight.Bold)
+        self.rules.append((r"^# Bem-vindo.*$", title_format))
+
+        section_format = QTextCharFormat()
+        section_format.setForeground(QColor("#7cc7ff"))
+        section_format.setFontWeight(QFont.Weight.Bold)
+        self.rules.append((r"^# (Como comecar|Teste visual de projetos|Terminal|Atalhos)$", section_format))
+
+        step_format = QTextCharFormat()
+        step_format.setForeground(QColor("#d8e6f2"))
+        self.rules.append((r"^# \d+\..*$", step_format))
+
+        command_format = QTextCharFormat()
+        command_format.setForeground(QColor("#ffc96b"))
+        command_format.setFontWeight(QFont.Weight.DemiBold)
+        self.rules.append((r"`[^`\n]+`", command_format))
+
+        url_format = QTextCharFormat()
+        url_format.setForeground(QColor("#57d9bf"))
+        self.rules.append((r"https?://[^\s`]+", url_format))
 
     def highlightBlock(self, text):
         from re import finditer
@@ -394,10 +441,13 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.activity_lines = []
         self._chat_task_prompt = ""
         self._chat_agent_round = 0
+        self._chat_waiting_for_browser = False
+        self._agent_browser_action_pending = None
         self.browser_view = None
         self.browser_profile = None
         self.internal_browser_url = "about:blank"
         self.internal_browser_ready_event = threading.Event()
+        self._last_internal_browser_load_ok = None
         self.paths_by_tab = {}
         self.attach_internal_web_chat_bridge()
         self._apply_brand_icon()
@@ -467,16 +517,42 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             self.refresh_quota_status()
 
     def attach_internal_web_chat_bridge(self):
-        """Usa o runtime WebView2 estável da interface anterior para o Chat Web.
+        """Conecta o Chat Web ao QWebEngine visível da janela principal.
 
-        O QWebEngine da nova janela continua disponível para navegação manual,
-        mas o ChatGPT pode recusar eventos de envio automatizados nesse widget.
-        Ao deixar a ponte vazia, ``UniversalEngine`` instancia
-        ``WebChatBridge``/``browser_runtime.py`` — o mesmo transporte WebView2
-        usado pela interface CustomTkinter, com o fluxo automático já validado.
+        A ponte abre a aba do navegador sob demanda e executa as ações nela.
+        Assim, uma tarefa do agente não depende de um segundo processo WebView2
+        nem conclui incorretamente que o navegador da sessão está indisponível.
         """
-        self.engine.web_chat_bridge = None
-        return None
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return None
+        profile = dict(getattr(engine, "web_chat_profile", {}) or {})
+        profile.update(
+            {
+                "web_chat_url": getattr(
+                    engine,
+                    "web_chat_url",
+                    profile.get("web_chat_url", "https://chatgpt.com/"),
+                ),
+                "web_chat_timeout_seconds": getattr(
+                    engine,
+                    "web_chat_timeout_seconds",
+                    profile.get("web_chat_timeout_seconds", 300),
+                ),
+                "web_chat_message_chars": getattr(
+                    engine,
+                    "web_chat_message_chars",
+                    profile.get("web_chat_message_chars", 28000),
+                ),
+                "web_chat_auto_attach_media": getattr(
+                    engine,
+                    "web_chat_auto_attach_media",
+                    profile.get("web_chat_auto_attach_media", True),
+                ),
+            }
+        )
+        engine.web_chat_bridge = InternalBrowserWebChatBridge(self, profile)
+        return engine.web_chat_bridge
 
     def refresh_quota_status(self):
         """Mantem a cota visivel sem alongar a mensagem principal de status."""
@@ -498,7 +574,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         detail = self.chat_last_activity or "Processando a tarefa"
         if len(detail) > 72:
             detail = detail[:69].rstrip() + "..."
-        self.status.setText(f"â—  IA: {detail} ({elapsed}s)")
+        self.status.setText(f"🤖  {detail} ({elapsed}s)")
 
     def log_agent(self, text):
         # Durante a migracao, o terminal e o registro visivel da atividade.
@@ -635,8 +711,10 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         layout.addStretch()
         settings = QPushButton()
         settings.setObjectName("activityButton")
-        settings.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView))
-        settings.setToolTip("Configuracoes")
+        settings.setText("⚙")
+        settings.setFont(QFont("Segoe UI Symbol", 20))
+        settings.setAccessibleName("Configurações da IA")
+        settings.setToolTip("Configurações da IA")
         settings.clicked.connect(self.show_settings_hint)
         layout.addWidget(settings)
         return bar
@@ -849,7 +927,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.quota_status.setObjectName("quotaStatus")
         self.quota_status.setMaximumWidth(420)
         layout.addWidget(self.quota_status)
-        agent = QLabel("◉  Agente IA: ativo")
+        agent = QLabel("🤖  Agente IA: ativo")
         agent.setObjectName("agentStatus")
         layout.addWidget(agent)
         self.language = QLabel("Python")
@@ -867,7 +945,12 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
     def _connect_signals(self):
         self.chat_reply.connect(self.finish_chat_reply)
         self.chat_stream.connect(self.append_chat_stream)
-        self.browser_action_requested.connect(self._run_browser_action)
+        # Ação emitida pelo worker do agente: sempre volte ao event loop Qt
+        # antes de consultar ou controlar o QWebEngineView.
+        self.browser_action_requested.connect(
+            self._run_browser_action,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
     # Contrato de agendamento usado pela migracao dos mixins para Qt.
     def after(self, milliseconds, callback):
@@ -876,10 +959,324 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
     def after_cancel(self, token):
         self.ui_bridge.after_cancel(token)
 
+    def start_human_test(self, request="auto"):
+        """Executa e captura um teste visual sem reutilizar o terminal da IDE."""
+        if getattr(self, "_visual_test_active", False):
+            self.add_chat("Sistema", "Ja existe um teste visual em andamento.")
+            return False
+        plan = self._build_visual_test_plan(request)
+        if not plan:
+            self.add_chat("Erro", "Nao encontrei um alvo visual seguro para testar neste projeto.")
+            return False
+        self._visual_test_active = True
+        self._append_chat_activity(f"Teste visual iniciado: {plan['display']}")
+        self.append_terminal(f"\n[teste visual] {plan['display']}\n")
+        threading.Thread(target=self._run_human_test, args=(plan,), daemon=True).start()
+        return True
+
+    def _build_visual_test_plan(self, request):
+        workspace = self.workspace.resolve()
+        html_target = workspace / "index.html"
+        if not html_target.exists():
+            html_target = next(workspace.glob("*.html"), None)
+        if html_target and html_target.is_file():
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            return {
+                "kind": "browser",
+                "command": [sys.executable, "-u", "-m", "http.server", str(port), "--bind", "127.0.0.1"],
+                "display": f"{Path(sys.executable).name} -m http.server {port} --bind 127.0.0.1",
+                "cwd": workspace,
+                "url": f"http://127.0.0.1:{port}/{html_target.name}",
+            }
+        target = workspace / "app.py"
+        if not target.exists():
+            target = workspace / "main.py"
+        if target.exists():
+            return {
+                "kind": "window",
+                "command": [sys.executable, "-u", target.name],
+                "display": f"{Path(sys.executable).name} -u {target.name}",
+                "cwd": workspace,
+                "url": "",
+            }
+        return None
+
+    def _run_human_test(self, plan):
+        process = None
+        try:
+            kwargs = {
+                "cwd": str(plan["cwd"]),
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+            }
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            process = subprocess.Popen(plan["command"], **kwargs)
+            if plan["kind"] == "browser":
+                if not self._wait_for_visual_url(plan["url"]):
+                    output = self._drain_visual_process_output(process)
+                    raise RuntimeError(output or "O servidor local nao respondeu.")
+                image_path = self._capture_qt_visual_browser(plan["url"])
+            else:
+                image_path = self._capture_visual_window(process.pid)
+                if image_path is None:
+                    output = self._drain_visual_process_output(process)
+                    raise RuntimeError(output or "A janela do aplicativo nao apareceu.")
+            self.ui_bridge.call_soon(lambda path=image_path: self._finish_human_test(path, ""))
+        except Exception as exc:
+            self.ui_bridge.call_soon(lambda detail=str(exc): self._finish_human_test(None, detail))
+        finally:
+            if process and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+
+    @staticmethod
+    def _drain_visual_process_output(process):
+        if not process or process.poll() is None:
+            return ""
+        try:
+            return (process.stdout.read() or "").strip()[-6000:]
+        except (OSError, ValueError):
+            return ""
+
+    @staticmethod
+    def _wait_for_visual_url(url, timeout=20.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=1.0) as response:
+                    if 200 <= getattr(response, "status", 200) < 500:
+                        return True
+            except OSError:
+                time.sleep(0.2)
+        return False
+
+    def _capture_qt_visual_browser(self, url, timeout=25.0):
+        """Abre uma página local em uma janela Qt e retorna sua captura real.
+
+        O executor anterior dependia de um processo ``pywebview`` separado. Em
+        algumas instalações do Windows esse processo criava filhos WebView2 sem
+        publicar a janela para captura, fazendo o teste terminar sem print. A
+        aplicação já usa QWebEngine; criar uma janela temporária nele deixa a
+        tela visível e mantém a captura no mesmo loop gráfico da IDE.
+        """
+        completed = threading.Event()
+        result = {"path": None, "error": ""}
+        holder = {"window": None}
+
+        def finish(path=None, error=""):
+            if completed.is_set():
+                return
+            result["path"] = path
+            result["error"] = error
+            completed.set()
+
+        def close_preview():
+            window = holder.get("window")
+            if window is not None:
+                window.close()
+
+        def open_preview():
+            try:
+                expected_url = QUrl.fromUserInput(str(url)).toString()
+                window = QMainWindow()
+                window.setWindowTitle(f"Merotec IA - Teste visual {time.time_ns()}")
+                window.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+                window.resize(1280, 820)
+                # O perfil padrão pode apontar para AppLocalDataLocation, que
+                # é bloqueado em instalações portáteis/sandbox. O navegador
+                # interno já usa um perfil local dedicado; o teste visual usa
+                # o mesmo padrão, isolado por execução.
+                profile_root = ROOT / ".merotec_local_ai" / "webengine" / f"visual-test-{time.time_ns()}"
+                profile_root.mkdir(parents=True, exist_ok=True)
+                profile = QWebEngineProfile(f"merotec-visual-{time.time_ns()}", window)
+                profile.setPersistentStoragePath(str(profile_root / "storage"))
+                profile.setCachePath(str(profile_root / "cache"))
+                view = QWebEngineView(window)
+                view.setPage(QWebEnginePage(profile, view))
+                # Mantém o perfil vivo durante a página e a captura.
+                window._visual_test_profile = profile
+                window.setCentralWidget(view)
+                holder["window"] = window
+                self._visual_test_browser_window = window
+                capture_scheduled = False
+
+                def capture():
+                    try:
+                        # ``QWebEngineView.grab()`` pode retornar um quadro
+                        # branco porque o WebView é composto em uma superfície
+                        # filha de GPU. A captura do handle nativo ocorre após
+                        # a composição e preserva o que o usuário realmente
+                        # vê na janela de teste.
+                        geometry = window.frameGeometry()
+                        bbox = (geometry.left(), geometry.top(), geometry.right() + 1, geometry.bottom() + 1)
+                        if bbox[2] - bbox[0] < 160 or bbox[3] - bbox[1] < 120:
+                            finish(error="A janela de teste não recebeu dimensões capturáveis.")
+                            return
+                        destination = self.workspace / ".merotec_attachments" / f"visual_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        try:
+                            ImageGrab.grab(bbox=bbox).save(destination, "PNG")
+                        except Exception:
+                            # Fallback para ambientes sem captura de desktop.
+                            pixmap = view.grab()
+                            if pixmap.isNull() or not pixmap.save(str(destination), "PNG"):
+                                finish(error="A página foi aberta, mas o QWebEngine não retornou uma captura.")
+                                return
+                        finish(path=destination)
+                    finally:
+                        QTimer.singleShot(250, close_preview)
+
+                def schedule_capture(delay):
+                    nonlocal capture_scheduled
+                    if capture_scheduled:
+                        return
+                    capture_scheduled = True
+                    QTimer.singleShot(delay, capture)
+
+                def page_loaded(success):
+                    # A criação de QWebEngineView pode finalizar o documento
+                    # inicial about:blank depois que o sinal já foi conectado.
+                    # Esse evento não pertence à página do teste e não deve
+                    # encerrar a captura antes da navegação solicitada.
+                    if view.url().toString() != expected_url:
+                        return
+                    if not success:
+                        # Em algumas versões do WebEngine, a troca inicial de
+                        # about:blank entrega ``False`` mesmo com a nova URL
+                        # já sendo pintada. Capture a tela resultante: se o
+                        # servidor realmente falhar, o print mostrará a página
+                        # de erro em vez de perder toda a evidência visual.
+                        schedule_capture(1400)
+                        return
+                    # Espera o primeiro paint completo do conteúdo, não apenas
+                    # o evento de navegação do QWebEngine.
+                    schedule_capture(850)
+
+                window.destroyed.connect(
+                    lambda *_args: setattr(self, "_visual_test_browser_window", None)
+                )
+                view.loadFinished.connect(page_loaded)
+                window.show()
+                window.raise_()
+                window.activateWindow()
+                view.setUrl(QUrl(expected_url))
+            except Exception as exc:
+                finish(error=f"Não consegui abrir a página do teste visual: {exc}")
+
+        self.ui_bridge.call_soon(open_preview)
+        if not completed.wait(timeout):
+            self.ui_bridge.call_soon(close_preview)
+            raise RuntimeError("A página do teste visual não ficou pronta para captura no tempo limite.")
+        if result["path"] is None:
+            raise RuntimeError(result["error"] or "O teste visual não gerou uma captura.")
+        return result["path"]
+
+    def _capture_visual_window(self, pid, timeout=14.0, title=""):
+        if os.name != "nt":
+            return None
+        user32 = ctypes.windll.user32
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            matches = []
+
+            def collect(hwnd, _lparam):
+                if not user32.IsWindowVisible(hwnd):
+                    return True
+                window_pid = ctypes.c_ulong()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
+                length = user32.GetWindowTextLengthW(hwnd)
+                window_title = ""
+                if length:
+                    buffer = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buffer, length + 1)
+                    window_title = buffer.value
+                if window_pid.value != pid and (not title or title not in window_title):
+                    return True
+                rect = wintypes.RECT()
+                if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    return True
+                width, height = rect.right - rect.left, rect.bottom - rect.top
+                if width >= 160 and height >= 120:
+                    matches.append((width * height, hwnd, (rect.left, rect.top, rect.right, rect.bottom)))
+                return True
+
+            callback = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)(collect)
+            user32.EnumWindows(callback, 0)
+            if matches:
+                _area, hwnd, bbox = max(matches)
+                if user32.IsIconic(hwnd):
+                    user32.ShowWindow(hwnd, 9)
+                user32.SetForegroundWindow(hwnd)
+                time.sleep(0.5)
+                destination = self.workspace / ".merotec_attachments" / f"visual_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.png"
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                ImageGrab.grab(bbox=bbox).save(destination, "PNG")
+                return destination
+            time.sleep(0.25)
+        return None
+
+    def _finish_human_test(self, image_path, error):
+        self._visual_test_active = False
+        if image_path:
+            self.add_chat("Teste visual", "Interface aberta e captura visual concluida.", attachments=[image_path])
+            self.append_terminal(f"[teste visual] captura salva em {image_path}\n")
+            # Capturar a janela e encerrar o processo de teste nao encerra a
+            # validacao: o proximo ciclo precisa receber o print para verificar
+            # erros visiveis, layout e o fluxo solicitado pelo usuario.
+            if self.chat_busy and self._chat_agent_round < 12:
+                self._chat_agent_round += 1
+                self._chat_waiting_for_command = False
+                self.streaming_bubble = None
+                self.streaming_text = ""
+                self._append_chat_activity(
+                    f"Captura pronta; inspecionando visualmente a interface ({self._chat_agent_round}/12)."
+                )
+                self.set_status("IA analisando a captura visual...")
+                observation = (
+                    "HUMAN_TEST concluido com captura real.\n"
+                    f"ARQUIVO DA CAPTURA: {image_path.name}\n\n"
+                    "Inspecione a imagem anexada antes de concluir. Procure por tela em branco, "
+                    "erros/tracebacks, dialogs inesperados, texto cortado, layout quebrado, "
+                    "controles inacessiveis ou fluxo incoerente. Se encontrar um problema, "
+                    "descreva a evidencia visivel e continue com a proxima acao da IDE; se "
+                    "estiver adequada, entregue uma conclusao objetiva dizendo exatamente o que viu."
+                )
+                continuation = (
+                    "[MEROTEC_AGENT_CONTINUATION]\n"
+                    f"Tarefa original: {self._chat_task_prompt}\n\n"
+                    "A IDE abriu a interface, capturou a tela e anexou a evidencia visual. "
+                    "Analise o print agora; nao finalize apenas porque a captura existe.\n\n"
+                    f"RESULTADO DA IDE:\n{observation}"
+                )
+                threading.Thread(
+                    target=self._generate_reply,
+                    args=(continuation, observation, image_path),
+                    daemon=True,
+                ).start()
+                return
+            self.set_status("Teste visual concluido")
+        else:
+            self.add_chat("Erro", f"Teste visual falhou: {error}")
+            self.append_terminal(f"[teste visual] falhou: {error}\n")
+            self.set_status("Teste visual com erro")
+        self._set_chat_busy(False)
+
     def _open_initial_file(self):
         """Exibe orientacoes iniciais sem expor o codigo-fonte da propria IDE."""
         editor = CodeEditor()
         editor.setReadOnly(True)
+        editor.highlighter.setDocument(None)
+        editor.highlighter = GettingStartedHighlighter(editor.document())
         editor.setPlainText(
             "# Bem-vindo ao Merotec IA IDE\n\n"
             "# Como comecar\n"
@@ -982,17 +1379,40 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.tabs.setCurrentIndex(tab)
         self.language.setText("Imagem")
 
+    def _internal_browser_is_usable(self):
+        """Retorna se a WebView de sessão ainda existe no lado nativo do Qt."""
+        view = self.browser_view
+        if view is None:
+            return False
+        try:
+            return view.page() is not None
+        except RuntimeError:
+            # Um QObject pode permanecer referenciado em Python depois de o Qt
+            # destruí-lo (por exemplo, depois do fechamento de uma aba). Não
+            # reutilize esse wrapper: a próxima abertura cria uma sessão nova.
+            return False
+
+    def _internal_browser_destroyed(self, *_args):
+        """Descarta referências Qt inválidas sem afetar a janela de teste visual."""
+        self.browser_view = None
+        self.browser_profile = None
+        self.internal_browser_url = "about:blank"
+        self._last_internal_browser_load_ok = None
+        self.internal_browser_ready_event.set()
+
     def open_internal_browser(self, url, source="usuario"):
-        if self.browser_view is None:
+        if not self._internal_browser_is_usable():
+            self.browser_view = None
+            self.browser_profile = None
             # O perfil padrão do Qt pode ser efêmero ou variar conforme o modo
             # de execução. Um perfil nomeado, com caminhos próprios da IDE,
             # preserva autenticação, cookies e armazenamento do Chat Web entre
             # reinicializações sem misturar dados com o navegador visual.
-            storage_root = Path(
-                QStandardPaths.writableLocation(
-                    QStandardPaths.StandardLocation.AppLocalDataLocation
-                )
-            ) / "MerotecIA" / "QWebEngine" / "chat-web"
+            # O sandbox do app-server e algumas instalacoes portaveis bloqueiam
+            # AppLocalDataLocation. Guardar o perfil junto da IDE mantem o
+            # navegador visual funcional e evita que a validacao pare antes da
+            # primeira pagina por erro de permissao.
+            storage_root = ROOT / ".merotec_local_ai" / "webengine" / "chat-web"
             storage_root.mkdir(parents=True, exist_ok=True)
             self.browser_profile = QWebEngineProfile("merotec-chat-web", self)
             self.browser_profile.setPersistentStoragePath(str(storage_root / "storage"))
@@ -1005,18 +1425,24 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             self.browser_view.setObjectName("internalBrowser")
             self.browser_view.urlChanged.connect(lambda value: setattr(self, "internal_browser_url", value.toString()))
             self.browser_view.loadFinished.connect(self._internal_browser_loaded)
+            self.browser_view.destroyed.connect(self._internal_browser_destroyed)
             index = self.tabs.addTab(self.browser_view, "Navegador")
             self.tabs.setCurrentIndex(index)
         else:
-            self.tabs.setCurrentWidget(self.browser_view)
+            index = self.tabs.indexOf(self.browser_view)
+            if index < 0:
+                index = self.tabs.addTab(self.browser_view, "Navegador")
+            self.tabs.setCurrentIndex(index)
         target = QUrl.fromUserInput(str(url))
         self.internal_browser_ready_event.clear()
+        self._last_internal_browser_load_ok = None
         self.browser_view.load(target)
         self.internal_browser_url = target.toString()
         self.set_status(f"Navegador: {source}")
         return self.internal_browser_url
 
     def _internal_browser_loaded(self, ok):
+        self._last_internal_browser_load_ok = bool(ok)
         if ok:
             self.internal_browser_ready_event.set()
             page = self.browser_view.page() if self.browser_view is not None else None
@@ -1036,11 +1462,119 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             self.set_status("O navegador interno nao conseguiu carregar a pagina", "error")
 
     def request_internal_browser_action(self, action, payload=None, callback=None):
-        if self.browser_view is None:
-            return None
+        """Enfileira uma ação do navegador para a thread Qt.
+
+        Esta função também é chamada pela thread que conversa com o provedor de
+        IA. Consultar ``QWebEngineView.page()`` nessa thread não é seguro e
+        fazia a ponte devolver "navegador interno não está disponível" mesmo
+        depois de a página ter sido aberta. O slot ``_run_browser_action``
+        recebe o sinal na thread da interface e é o único lugar que valida a
+        sessão nativa antes de usar o WebEngine.
+        """
         request_id = f"qt-browser-{time.time_ns()}"
         self.browser_action_requested.emit(str(action), dict(payload or {}), callback)
         return request_id
+
+    def run_agent_browser_action(self, action, payload=None):
+        """Executa uma etapa do navegador e preserva a tarefa ate o retorno real."""
+        if self._agent_browser_action_pending is not None:
+            self.add_chat("Erro", "A acao anterior do navegador ainda esta em andamento.")
+            return False
+        action = str(action or "").strip().lower()
+        payload = dict(payload or {})
+        self._agent_browser_action_pending = {"action": action, "payload": payload}
+
+        def complete(result):
+            self._finish_agent_browser_action(result)
+
+        if action == "open":
+            url = str(payload.get("url") or "").strip()
+            parsed = QUrl.fromUserInput(url)
+            if not url or not parsed.isValid() or parsed.scheme().lower() not in {"http", "https", "file"}:
+                self._agent_browser_action_pending = None
+                self.add_chat("Erro", "OPEN_URL precisa informar uma URL HTTP(S) ou arquivo local valida.")
+                return False
+            self.open_internal_browser(url, "IA")
+
+            def wait_for_page(remaining=60):
+                pending = self._agent_browser_action_pending
+                if pending is None or pending.get("action") != "open":
+                    return
+                if self.internal_browser_ready_event.is_set():
+                    complete({"result": {
+                        "ok": bool(self._last_internal_browser_load_ok),
+                        "url": self.internal_browser_url,
+                        "error": "A pagina nao carregou no navegador interno."
+                        if not self._last_internal_browser_load_ok else "",
+                    }})
+                elif remaining <= 0:
+                    complete({"result": {"ok": False, "error": "Tempo esgotado ao abrir a pagina.", "url": self.internal_browser_url}})
+                else:
+                    QTimer.singleShot(250, lambda: wait_for_page(remaining - 1))
+
+            # O callback precisa ocorrer depois de finish_chat_reply registrar a
+            # espera; caso contrario uma pagina em cache pode encerrar a tarefa
+            # antes de o resultado chegar ao agente.
+            QTimer.singleShot(0, wait_for_page)
+            return True
+
+        if not self._internal_browser_is_usable():
+            self._agent_browser_action_pending = None
+            self.add_chat("Erro", "Abra uma pagina com OPEN_URL antes de usar BROWSER_*.")
+            return False
+
+        QTimer.singleShot(
+            0,
+            lambda: self.request_internal_browser_action(action, payload, complete),
+        )
+        return True
+
+    def _finish_agent_browser_action(self, event):
+        pending = self._agent_browser_action_pending
+        self._agent_browser_action_pending = None
+        if pending is None or not self.chat_busy or not self._chat_waiting_for_browser:
+            return
+        self._chat_waiting_for_browser = False
+        result = event.get("result", event) if isinstance(event, dict) else event
+        if isinstance(result, str):
+            decoded = self._decode_web_javascript_result(result)
+            result = decoded if decoded is not None else {
+                "ok": False,
+                "error": "Resposta invalida do navegador interno.",
+            }
+        if not isinstance(result, dict):
+            result = {"ok": False, "error": "Resposta invalida do navegador interno."}
+        self._continue_agent_after_browser_action(pending["action"], pending["payload"], result)
+
+    def _continue_agent_after_browser_action(self, action, payload, result):
+        if self._chat_agent_round >= 12:
+            self._set_chat_busy(False)
+            self.add_chat("Erro", "Limite de ciclos do agente atingido apos acao no navegador.")
+            return
+        self._chat_agent_round += 1
+        serialized = json.dumps(result, ensure_ascii=False, indent=2)
+        observation = (
+            f"BROWSER_{action.upper()} concluido.\n"
+            f"SOLICITACAO: {json.dumps(payload, ensure_ascii=False)}\n"
+            f"RESULTADO REAL DO NAVEGADOR:\n{serialized}"
+        )
+        self._append_chat_activity(
+            f"Navegador respondeu; continuando a tarefa ({self._chat_agent_round}/12)."
+        )
+        self.streaming_bubble = None
+        self.streaming_text = ""
+        continuation = (
+            "[MEROTEC_AGENT_CONTINUATION]\n"
+            f"Tarefa original: {self._chat_task_prompt}\n\n"
+            "A IDE executou a acao no navegador. Use o resultado real para decidir a proxima "
+            "acao ou concluir a tarefa.\n\n"
+            f"RESULTADO DA IDE:\n{observation}"
+        )
+        threading.Thread(
+            target=self._generate_reply,
+            args=(continuation, observation, None),
+            daemon=True,
+        ).start()
 
     @staticmethod
     def _decode_web_javascript_result(result):
@@ -1215,7 +1749,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.browser_view.page().runJavaScript(prepare_script, prepared)
 
     def _run_browser_action(self, action, payload=None, callback=None):
-        if self.browser_view is None:
+        if not self._internal_browser_is_usable():
             if callback:
                 callback({"result": {"ok": False, "error": "O navegador interno nao esta disponivel."}})
             return
@@ -1223,9 +1757,9 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         target = str(payload.get("target", ""))
         value = str(payload.get("value", ""))
         if action == "inspect":
-            script = """(() => ({ok:true,url: location.href, title: document.title, text: document.body.innerText.slice(0,12000), elements: [...document.querySelectorAll('a,button,input,textarea,select')].slice(0,120).map((e,i)=>({ref:'e'+i,tag:e.tagName.toLowerCase(),label:e.innerText||e.getAttribute('aria-label')||e.name||e.placeholder||'',href:e.href||''}))}))()"""
+            script = """(() => JSON.stringify({ok:true,url: location.href, title: document.title, text: document.body.innerText.slice(0,12000), elements: [...document.querySelectorAll('a,button,input,textarea,select')].slice(0,120).map((e,i)=>({ref:'e'+i,tag:e.tagName.toLowerCase(),label:e.innerText||e.getAttribute('aria-label')||e.name||e.placeholder||'',href:e.href||''}))}))()"""
         elif action == "scroll":
-            script = f"(() => {{ window.scrollBy(0, {'-600' if target == 'up' else '600'}); return {{ok:true,url:location.href}}; }})()"
+            script = f"(() => JSON.stringify((window.scrollBy(0, {'-600' if target == 'up' else '600'}), {{ok:true,url:location.href}})))()"
         elif action == "chat":
             self._run_browser_chat_action(payload, callback)
             return
@@ -1233,9 +1767,9 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             ref = target.replace("e", "")
             selector = f"[...document.querySelectorAll('a,button,input,textarea,select')][{ref}]"
             if action == "click":
-                script = f"(() => {{ const e={selector}; if(!e) return {{ok:false,error:'elemento nao encontrado'}}; e.click(); return {{ok:true,url:location.href}}; }})()"
+                script = f"(() => {{ const e={selector}; if(!e) return JSON.stringify({{ok:false,error:'elemento nao encontrado'}}); e.click(); return JSON.stringify({{ok:true,url:location.href}}); }})()"
             elif action == "type":
-                script = f"(() => {{ const e={selector}; if(!e) return {{ok:false,error:'elemento nao encontrado'}}; e.focus(); e.value={json.dumps(value, ensure_ascii=False)}; e.dispatchEvent(new Event('input',{{bubbles:true}})); return {{ok:true,url:location.href}}; }})()"
+                script = f"(() => {{ const e={selector}; if(!e) return JSON.stringify({{ok:false,error:'elemento nao encontrado'}}); e.focus(); e.value={json.dumps(value, ensure_ascii=False)}; e.dispatchEvent(new Event('input',{{bubbles:true}})); return JSON.stringify({{ok:true,url:location.href}}); }})()"
             else:
                 if callback:
                     callback({"result": {"ok": False, "error": f"Acao nao suportada: {action}"}})
@@ -1278,6 +1812,14 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
 
     def close_tab(self, index):
         editor = self.tabs.widget(index)
+        if editor is self.browser_view:
+            # A aba mantém a sessão autenticada usada pelo Chat Web. Removê-la
+            # deixa um QObject órfão e as validações seguintes passam a ver o
+            # navegador como indisponível. Apenas oculte a aba; ela é reaberta
+            # sob demanda por open_internal_browser().
+            self.tabs.setCurrentIndex(max(0, index - 1))
+            self.tabs.removeTab(index)
+            return
         if editor and self.tabs.tabText(index).endswith(" *"):
             choice = QMessageBox.question(self, "Merotec IA", "Salvar alteracoes antes de fechar?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel)
             if choice == QMessageBox.StandardButton.Cancel:
@@ -2031,7 +2573,10 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self._chat_task_prompt = prompt
         self._chat_agent_round = 0
         self._chat_pending_validation_paths = set()
+        self._chat_auto_validation_paths = set()
         self._chat_waiting_for_command = False
+        self._chat_waiting_for_browser = False
+        self._agent_browser_action_pending = None
         self._chat_write_staging = {}
         self.chat_input.clear()
         self.add_chat("Voce", prompt, True, attachments)
@@ -2207,6 +2752,18 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
                 self._chat_waiting_for_command = True
                 self._append_chat_activity("Aguardando o resultado real do EXECUTE no terminal.")
                 return
+            if actions.last_visual_test_requested:
+                self._append_chat_activity("Aguardando a captura do teste visual.")
+                if self.streaming_bubble:
+                    self.streaming_bubble.label.setText("Teste visual em andamento...")
+                    self.streaming_bubble = None
+                return
+            if actions.last_browser_action_requested:
+                self._chat_waiting_for_browser = True
+                self._append_chat_activity("Aguardando o resultado real da acao no navegador.")
+                return
+            if actions.changed_paths and self._start_automatic_validation(actions.changed_paths):
+                return
         # READ/SEARCH/WRITE/PATCH são passos intermediários. A versão PySide
         # antes parava aqui, então a IA só conseguia ler arquivos. Reenviamos
         # o resultado à mesma conversa para ela concluir a tarefa.
@@ -2262,9 +2819,32 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             self.agent_changed_files,
             task_objective=getattr(self, "_chat_task_prompt", ""),
             write_staging=getattr(self, "_chat_write_staging", None),
+            on_human_test=self.start_human_test,
+            on_browser_action=self.run_agent_browser_action,
         )
         actions.changed_paths = actions.apply(reply)
         return actions
+
+    def _start_automatic_validation(self, changed_paths):
+        """Inicia a primeira validacao local apos uma alteracao do agente."""
+        paths = {Path(path).resolve() for path in changed_paths if path}
+        if not paths:
+            return False
+        command = self.validation_command_for_changed_paths(
+            [str(path) for path in sorted(paths)],
+            getattr(self, "_chat_task_prompt", ""),
+        )
+        if not command:
+            return False
+        self._chat_auto_validation_paths = paths
+        self._chat_waiting_for_command = True
+        self._append_chat_activity("Alteracao aplicada; iniciando a primeira validacao local automatica.")
+        if self.run_agent_command(command):
+            return True
+        self._chat_waiting_for_command = False
+        self._chat_auto_validation_paths = set()
+        self.add_chat("Erro", "A primeira validacao automatica nao conseguiu iniciar no Terminal Local.")
+        return False
 
     def toggle_voice_capture(self):
         if not self.voice_capture_active:
@@ -2381,11 +2961,20 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             return
         self._chat_waiting_for_command = False
         self._chat_agent_round += 1
+        automatic_paths = set(getattr(self, "_chat_auto_validation_paths", set()))
+        self._chat_auto_validation_paths = set()
+        if succeeded and automatic_paths:
+            self._chat_pending_validation_paths.difference_update(automatic_paths)
         status = "sucesso" if succeeded else f"falha (código {exit_code})"
         observation = (
             f"EXECUTE concluído com {status}.\nCOMANDO: {command}\n"
             f"SAÍDA:\n{str(output or '(sem saída)').strip()[-12000:]}"
         )
+        if automatic_paths:
+            if succeeded:
+                observation += "\n\nVALIDACAO AUTOMATICA APROVADA PARA OS ARQUIVOS ALTERADOS."
+            else:
+                observation += "\n\nA VALIDACAO AUTOMATICA FALHOU; corrija a causa antes de concluir."
         self._append_chat_activity(f"EXECUTE terminou; continuando a tarefa ({self._chat_agent_round}/12).")
         continuation = (
             "[MEROTEC_AGENT_CONTINUATION]\n"
@@ -2530,7 +3119,7 @@ QToolButton { color: #eef8ff; border: 1px solid #285a79; border-radius: 4px; bac
 QSplitter::handle { background: #223347; } QSplitter::handle:hover { background: #2f607a; }
 QFrame#activityBar, QFrame#explorer, QFrame#chatPanel { background: #0c1826; border-right: 1px solid #26384c; }
 QFrame#chatPanel { border-right: 0; border-left: 1px solid #26384c; }
-QPushButton#activityButton { min-width: 42px; max-width: 42px; min-height: 42px; border: 0; border-radius: 4px; background: transparent; } QPushButton#activityButton:hover { background: #183449; } QPushButton#activityButton:pressed, QPushButton#activityButton[active="true"], QPushButton#activityButton[busy="true"] { background: #1d5b78; color: #ffffff; }
+QPushButton#activityButton { min-width: 42px; max-width: 42px; min-height: 42px; border: 0; border-radius: 4px; background: transparent; color: #dce8f6; } QPushButton#activityButton:hover { background: #183449; color: #ffffff; } QPushButton#activityButton:pressed, QPushButton#activityButton[active="true"], QPushButton#activityButton[busy="true"] { background: #1d5b78; color: #ffffff; }
 QLabel#panelTitle, QLabel#terminalTitle { color: #dbe6f5; font-weight: 700; font-size: 15px; } QLabel#explorerRoot { color: #dbe6f5; background: #122235; border: 1px solid #2b4057; border-radius: 4px; padding: 6px 8px; font-weight: 600; } QLineEdit#search { background: #122235; border: 1px solid #2b4057; border-radius: 4px; padding: 7px; color: #dce8f6; }
 QTreeView#fileTree { background: transparent; border: 0; color: #c6d1df; padding: 3px; } QTreeView#fileTree::item { padding: 5px; border-radius: 4px; } QTreeView#fileTree::item:selected { background: #24344b; color: white; }
 QPushButton#tinyButton { background: transparent; border: 0; color: #c9d9ea; font-size: 21px; } QPushButton#tinyButton:hover { color: #27d7f0; }

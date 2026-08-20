@@ -722,6 +722,21 @@ class AdminExecutionGuardsTest(unittest.TestCase):
             self.assertIn("-m http.server", plan["display"])
             self.assertRegex(plan["url"], r"http://127\.0\.0\.1:\d+/index\.html$")
 
+    def test_nested_html_requires_automatic_visual_validation(self):
+        temp_root = os.environ.get("MEROTEC_TEST_TMP")
+        with tempfile.TemporaryDirectory(dir=temp_root) as temp_dir:
+            root = Path(temp_dir)
+            page = root / "public" / "preview.html"
+            page.parent.mkdir(parents=True)
+            page.write_text("<!doctype html><html><body>Preview</body></html>", encoding="utf-8")
+            self.app.current_workspace = str(root)
+
+            self.assertTrue(self.app.workspace_requires_visual_validation())
+
+            command = self.app.validation_command_for_changed_paths(["public/preview.html"])
+
+            self.assertIn("public/preview.html", command)
+
     def test_human_test_plan_relaunches_self_in_separate_test_instance(self):
         self.app.current_workspace = str(PROJECT_ROOT)
         self.app.active_ai_objective = "Analise o print do teste visual real da IDE"

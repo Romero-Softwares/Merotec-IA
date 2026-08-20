@@ -1486,7 +1486,9 @@ class WorkspaceIntelligenceMixin:
                         pass
             if py_targets:
                 quoted = " ".join(f'"{target}"' for target in py_targets[:10])
-                return f'"venv\\Scripts\\python.exe" -m compileall -q {quoted}'
+                local_python = workspace / "venv" / "Scripts" / "python.exe"
+                interpreter = "venv\\Scripts\\python.exe" if local_python.exists() else sys.executable
+                return f'"{interpreter}" -m compileall -q {quoted}'
         if any(suffix in suffixes for suffix in {".js", ".jsx", ".ts", ".tsx", ".css", ".html"}):
             package_json = workspace / "package.json"
             if package_json.exists():
@@ -1498,6 +1500,13 @@ class WorkspaceIntelligenceMixin:
                     if "build" in scripts:
                         return "npm run build"
                 except (OSError, json.JSONDecodeError):
+                    pass
+            html_targets = [path for path in paths if path.suffix.lower() in {".html", ".htm"}]
+            if html_targets:
+                try:
+                    relative_html = html_targets[0].relative_to(workspace).as_posix()
+                    return self.static_html_validation_command(relative_html)
+                except ValueError:
                     pass
             if (workspace / "index.html").exists():
                 return self.static_html_validation_command("index.html")

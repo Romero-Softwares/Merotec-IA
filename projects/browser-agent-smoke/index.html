@@ -18,15 +18,18 @@
   <main>
     <h1>Teste de comunicação</h1>
     <p>Projeto mínimo para validar uma interação completa pelo navegador.</p>
-    <label for="name">Seu nome</label>
-    <input id="name" name="name" autocomplete="off" placeholder="Digite seu nome">
-    <button id="confirm" type="button">Confirmar</button>
+    <form id="confirmation-form">
+      <label for="name">Seu nome</label>
+      <input id="name" name="name" autocomplete="off" placeholder="Digite seu nome">
+      <button id="confirm" type="submit">Confirmar</button>
+    </form>
     <p id="result" role="status" aria-live="polite">Aguardando interação.</p>
   </main>
   <script>
     const nameInput = document.querySelector('#name');
     const result = document.querySelector('#result');
-    document.querySelector('#confirm').addEventListener('click', () => {
+    document.querySelector('#confirmation-form').addEventListener('submit', (event) => {
+      event.preventDefault();
       const name = nameInput.value.trim();
       result.textContent = name ? `Comunicação concluída: olá, ${name}!` : 'Informe um nome para concluir o teste.';
     });

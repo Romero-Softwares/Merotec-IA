@@ -26,7 +26,7 @@ from modules.ui_web_chat_bridge import InternalBrowserWebChatBridge
 from modules.web_chat_bridge import WebChatBridge
 from modules.browser_runtime import _decoded_dom_text
 from modules.agent_actions import AgentActionsMixin
-from modules.engine import UniversalEngine
+from modules.engine import UniversalEngine, _merotec_direct_chat_context
 
 
 class _RunningProcess:
@@ -344,6 +344,17 @@ class ProfileAndSessionTests(unittest.TestCase):
 
 
 class BrowserRuntimeTests(unittest.TestCase):
+    def test_internal_browser_session_recovers_after_qt_widget_is_destroyed(self):
+        source = (ROOT / "pyside_app.py").read_text(encoding="utf-8")
+        bridge_source = (ROOT / "modules" / "ui_web_chat_bridge.py").read_text(encoding="utf-8")
+
+        self.assertIn("def _internal_browser_is_usable(self)", source)
+        self.assertIn("def _internal_browser_destroyed(self, *_args)", source)
+        self.assertIn("self.browser_view.destroyed.connect(self._internal_browser_destroyed)", source)
+        self.assertIn("if editor is self.browser_view:", source)
+        self.assertIn("if index < 0:\n                index = self.tabs.addTab(self.browser_view, \"Navegador\")", source)
+        self.assertIn("browser_is_usable = getattr(self.app, \"_internal_browser_is_usable\", None)", bridge_source)
+
     def test_visual_runtime_arguments_reach_run(self):
         runtime = importlib.import_module("modules.browser_runtime")
         with patch.object(runtime, "run", return_value=23) as run:
@@ -372,6 +383,14 @@ class BrowserRuntimeTests(unittest.TestCase):
         self.assertIn('"attachment_error"', source)
         self.assertIn('"attachment_count"', source)
         self.assertIn('"artifacts"', source)
+
+    def test_runtime_uses_a_workspace_local_webview_profile(self):
+        runtime = importlib.import_module("modules.browser_runtime")
+        with patch.dict("os.environ", {}, clear=True):
+            profile = Path(runtime._storage_path("smoke-profile")).resolve()
+        self.assertEqual(profile.parent.name, "webview2")
+        self.assertEqual(profile.name, "smoke-profile")
+        self.assertIn(".merotec_local_ai", str(profile))
 
     def test_visual_delivery_never_silently_claims_attachment_success(self):
         engine_source = (ROOT / "modules" / "engine.py").read_text(encoding="utf-8")
@@ -442,6 +461,23 @@ class _ActionHarness(AgentActionsMixin):
 
 
 class WebChatActionProtocolTests(unittest.TestCase):
+    def test_direct_chat_keeps_recent_conversation_context_only(self):
+        context = (
+            "Workspace atual: C:/Projeto\n\n"
+            "Conversa recente que deve ser preservada:\n"
+            "- Voce: Estamos corrigindo o login.\n"
+            "- Merotec AI: O erro esta no formulario.\n\n"
+            "BRIEFING INTELIGENTE DA IDE:\n"
+            "Mapa tecnico que nao pertence ao chat direto."
+        )
+
+        direct_context = _merotec_direct_chat_context(context)
+
+        self.assertIn("Estamos corrigindo o login", direct_context)
+        self.assertIn("O erro esta no formulario", direct_context)
+        self.assertNotIn("Workspace atual", direct_context)
+        self.assertNotIn("Mapa tecnico", direct_context)
+
     def test_gemini_bracket_then_path_is_executed(self):
         app = _ActionHarness()
         app.parse_and_execute_agent_actions("[READ] main.py", task_objective="corrigir o projeto")

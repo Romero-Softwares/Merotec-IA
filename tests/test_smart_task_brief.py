@@ -99,6 +99,7 @@ class SmartTaskBriefTest(unittest.TestCase):
             self.assertIn("-m compileall -q", command)
             self.assertIn('"feature.py"', command)
             self.assertNotIn('"main.py"', command)
+            self.assertIn(sys.executable, command)
 
     def test_quality_report_and_failure_classifier_are_available(self):
         with tempfile.TemporaryDirectory() as temp_dir:

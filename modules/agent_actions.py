@@ -526,8 +526,16 @@ class AgentActionsMixin:
         if not self.autonomous_visual_validation_enabled():
             return False
         workspace = Path(self.current_workspace).resolve()
-        if (workspace / "index.html").exists():
-            return True
+        # HTML pode viver em subpastas (por exemplo, builds exportados ou uma
+        # pagina em ``public/``). A validacao visual nao pode depender apenas
+        # de um index.html na raiz, pois isso deixaria essas telas sem render.
+        try:
+            for directory, names, files in os.walk(workspace):
+                names[:] = [name for name in names if not is_ignored_dir_name(name)]
+                if any(Path(name).suffix.lower() in {".html", ".htm"} for name in files):
+                    return True
+        except OSError:
+            pass
         package_json = workspace / "package.json"
         if package_json.exists():
             try:

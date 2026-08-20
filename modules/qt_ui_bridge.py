@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from itertools import count
 
-from PySide6.QtCore import QObject, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QTimer, Signal, Slot, Qt
 
 
 class QtUiBridge(QObject):
@@ -24,9 +24,13 @@ class QtUiBridge(QObject):
         super().__init__(parent)
         self._sequence = count(1)
         self._timers = {}
-        self._invoke_requested.connect(self._invoke)
-        self._schedule_requested.connect(self._schedule)
-        self._cancel_requested.connect(self._cancel)
+        # ``emit`` pode ser chamado por workers Python que não possuem
+        # afinidade Qt. A conexão automática considera os QObjects (ambos
+        # vivem na thread principal), podendo executar o slot no worker. Forçar
+        # fila garante que widgets e QWebEngine só sejam tocados pelo loop Qt.
+        self._invoke_requested.connect(self._invoke, Qt.ConnectionType.QueuedConnection)
+        self._schedule_requested.connect(self._schedule, Qt.ConnectionType.QueuedConnection)
+        self._cancel_requested.connect(self._cancel, Qt.ConnectionType.QueuedConnection)
 
     def call_soon(self, callback):
         self._invoke_requested.emit(callback)

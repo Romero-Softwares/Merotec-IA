@@ -14,7 +14,17 @@ from modules.code_transport import unwrap_transport_code, validate_file, validat
 
 
 class QtAgentActions:
-    def __init__(self, workspace, on_message, on_command, on_changed, task_objective="", write_staging=None):
+    def __init__(
+        self,
+        workspace,
+        on_message,
+        on_command,
+        on_changed,
+        task_objective="",
+        write_staging=None,
+        on_human_test=None,
+        on_browser_action=None,
+    ):
         self.workspace = Path(workspace).resolve()
         self.on_message = on_message
         self.on_command = on_command
@@ -26,6 +36,10 @@ class QtAgentActions:
         self.last_followup_required = 0
         self.last_validated_paths = []
         self.last_command_requested = False
+        self.last_visual_test_requested = False
+        self.last_browser_action_requested = False
+        self.on_human_test = on_human_test
+        self.on_browser_action = on_browser_action
 
     def _message(self, author, text):
         self.last_observations.append(f"{author}: {text}")
@@ -96,6 +110,8 @@ class QtAgentActions:
         self.last_followup_required = 0
         self.last_validated_paths = []
         self.last_command_requested = False
+        self.last_visual_test_requested = False
+        self.last_browser_action_requested = False
         for patch in re.findall(r"\[PATCH(?:\s*:[^\]]+)?\](.*?)\[/PATCH\]", response, re.I | re.S):
             self.last_action_count += 1
             self.last_followup_required += 1
@@ -263,6 +279,65 @@ class QtAgentActions:
                 self._message("Erro", f"VALIDATE recusado: {exc}")
         # A tag é de uma linha, mas o comando pode conter colchetes (listas
         # Python, índices PowerShell etc.). Capture até o último ``]`` da linha.
+        for request in re.findall(r"\[HUMAN_TEST\s*:\s*([^\]\r\n]*)\]", response, re.I):
+            self.last_action_count += 1
+            request = request.strip() or "auto"
+            if not callable(self.on_human_test):
+                self._message("Erro", "HUMAN_TEST indisponivel nesta interface.")
+                continue
+            try:
+                started = self.on_human_test(request)
+            except Exception as exc:
+                self._message("Erro", f"HUMAN_TEST nao iniciado: {exc}")
+                continue
+            if started is False:
+                self._message("Erro", "HUMAN_TEST nao iniciado.")
+                continue
+            self.last_visual_test_requested = True
+            self._message("Sistema", "Teste visual iniciado; aguardando abertura e captura da interface.")
+        browser_requests = []
+        for match in re.finditer(
+            r"\[(OPEN_URL|BROWSER_INSPECT|BROWSER_CLICK|BROWSER_TYPE|BROWSER_SCROLL)\s*:\s*([^\]\r\n]+)\]",
+            response,
+            re.I,
+        ):
+            action = match.group(1).upper()
+            value = match.group(2).strip()
+            if action == "OPEN_URL":
+                browser_requests.append(("open", {"url": value}, match.start()))
+            elif action == "BROWSER_INSPECT":
+                browser_requests.append(("inspect", {}, match.start()))
+            elif action == "BROWSER_CLICK":
+                browser_requests.append(("click", {"target": value}, match.start()))
+            elif action == "BROWSER_SCROLL":
+                browser_requests.append(("scroll", {"target": value.lower()}, match.start()))
+            else:
+                target, separator, typed = value.partition("|")
+                if not separator or not target.strip():
+                    self._message("Erro", "BROWSER_TYPE precisa usar: elemento | texto.")
+                    continue
+                browser_requests.append(
+                    ("type", {"target": target.strip(), "value": typed.strip()}, match.start())
+                )
+        if browser_requests:
+            # Uma acao por resposta preserva a ordem do protocolo: abrir, ler a
+            # pagina e interagir sao etapas assincronas que precisam devolver o
+            # DOM real ao agente antes da proxima decisao.
+            action, payload, _position = min(browser_requests, key=lambda item: item[2])
+            self.last_action_count += 1
+            if not callable(self.on_browser_action):
+                self._message("Erro", "Navegador interno indisponivel nesta interface.")
+            else:
+                try:
+                    started = self.on_browser_action(action, payload)
+                except Exception as exc:
+                    self._message("Erro", f"Acao do navegador nao iniciada: {exc}")
+                else:
+                    if started is False:
+                        self._message("Erro", "Acao do navegador nao iniciada.")
+                    else:
+                        self.last_browser_action_requested = True
+                        self._message("Sistema", f"Acao do navegador iniciada: {action}.")
         for command in re.findall(r"(?im)^\s*\[EXECUTE\s*:\s*(.+)\]\s*$", response):
             self.last_action_count += 1
             command = command.strip()

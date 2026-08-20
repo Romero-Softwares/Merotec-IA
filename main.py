@@ -203,6 +203,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.last_response = ""
         self.last_failed_ai_task = None
         self.active_ai_objective = None
+        self.suspended_ai_objectives = []
         self.ai_context_memory = []
         self.command_failure_signatures = {}
         self.ai_read_history = {}
@@ -4698,7 +4699,11 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         answer_only = self.is_answer_only_question(command, normalized)
         continuation_context = None
         task_objective = None
-        if not answer_only and self.should_continue_active_ai_task(command, normalized):
+        if not answer_only and self.should_resume_suspended_ai_task(normalized):
+            task_objective = self.take_suspended_ai_objective(project_first="projeto" in normalized)
+            continuation_context = self.build_active_task_continuation_context(command, objective=task_objective)
+            self.add_chat_message("Sistema", "Retomando a missao do projeto preservada antes do desvio de assunto.")
+        elif not answer_only and self.should_continue_active_ai_task(command, normalized):
             task_objective = self.active_ai_objective
             continuation_context = self.build_active_task_continuation_context(command)
             self.add_chat_message("Sistema", "Continuando a missao anterior com memoria recente da IDE.")
@@ -4835,8 +4840,41 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             )
         )
 
-    def build_active_task_continuation_context(self, command):
-        objective = self.active_ai_objective or ""
+    def should_resume_suspended_ai_task(self, normalized):
+        if not getattr(self, "suspended_ai_objectives", []):
+            return False
+        return normalized in {
+            "retome a missao anterior",
+            "retome o projeto",
+            "retomar o projeto",
+            "volte ao projeto",
+            "voltar ao projeto",
+            "continue o projeto",
+            "continue a missao do projeto",
+        }
+
+    def preserve_active_ai_objective(self, replacement):
+        """Guarda uma missao interrompida sem torna-la a tarefa atual."""
+        objective = str(getattr(self, "active_ai_objective", "") or "").strip()
+        replacement = str(replacement or "").strip()
+        if not objective or objective == replacement:
+            return
+        suspended = list(getattr(self, "suspended_ai_objectives", []))
+        if objective not in suspended:
+            suspended.append(objective)
+        self.suspended_ai_objectives = suspended[-6:]
+
+    def take_suspended_ai_objective(self, project_first=False):
+        suspended = list(getattr(self, "suspended_ai_objectives", []))
+        if not suspended:
+            return ""
+        index = 0 if project_first else len(suspended) - 1
+        objective = suspended.pop(index)
+        self.suspended_ai_objectives = suspended
+        return objective
+
+    def build_active_task_continuation_context(self, command, objective=None):
+        objective = objective or self.active_ai_objective or ""
         last_response = self.strip_agent_action_markup(self.last_response or "").strip()
         pieces = [
             "CONTINUIDADE DA MISSAO NA IDE:",
@@ -5496,6 +5534,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 self.current_task_id += 1
                 current_task_id = self.current_task_id
                 if not answer_only:
+                    self.preserve_active_ai_objective(command)
                     self.active_ai_objective = command
                     self.ai_read_history = {}
                     self.ai_search_history = {}
@@ -5579,6 +5618,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                     "Se o comando realmente exigir administrador no Windows, use uma tag EXECUTE_ADMIN ja preenchida, por exemplo [EXECUTE_ADMIN: whoami /groups]; nao escreva 'como administrador' dentro do comando. "
                     "Nunca use reticencias, 'comando', 'comando real', texto entre sinais de menor/maior ou qualquer texto demonstrativo como se fosse comando real. "
                     "Nunca copie literalmente 'comando concreto' nas tags [EXECUTE] ou [EXECUTE_ADMIN]; se ainda nao houver comando real, entregue uma conclusao em texto. "
+                    "Para alterar HTML/HTM, a validacao e obrigatoriamente dupla: execute a verificacao estrutural e depois use [HUMAN_TEST: auto] para renderizar a pagina, abrir a tela, capturar o print e analisa-lo. Nao conclua uma alteracao HTML apenas com EXECUTE ou validacao estatica. "
                     "Para testar projeto HTML/Web, use [EXECUTE: python -m http.server 8000]; a IDE troca pelo Python real, escolhe porta livre e valida a URL. "
                     "Para abrir uma pagina validada no navegador interno da IDE, use [OPEN_URL: http://127.0.0.1:porta/]. "
                     "Para controlar a pagina, comece com [BROWSER_INSPECT: pagina]; use os refs retornados em [BROWSER_CLICK: e1] e [BROWSER_TYPE: e2 | texto], ou role com [BROWSER_SCROLL: down]. "

@@ -13,6 +13,7 @@ def bare_app():
     app = UniversalApp.__new__(UniversalApp)
     app.current_task_id = 7
     app.active_ai_objective = "Corrigir a IDE para preservar contexto entre rodadas"
+    app.suspended_ai_objectives = []
     app.last_response = "Vou continuar com [READ: main.py]"
     app.ai_context_memory = []
     app.format_recent_changes_for_agent = lambda limit=10: "- main.py alterado"
@@ -50,6 +51,19 @@ class AiContextMemoryTest(unittest.TestCase):
         self.assertIn("Ultima resposta visivel da IA", context)
         self.assertIn("A ultima acao foi revisar main.py.", context)
         self.assertIn("nao trate o pedido atual como tarefa isolada", context)
+
+    def test_unrelated_task_can_preserve_and_resume_project_objective(self):
+        app = bare_app()
+
+        app.preserve_active_ai_objective("explique astronomia")
+        app.active_ai_objective = "explique astronomia"
+
+        self.assertTrue(app.should_resume_suspended_ai_task("retome o projeto"))
+        self.assertEqual(
+            app.take_suspended_ai_objective(project_first=True),
+            "Corrigir a IDE para preservar contexto entre rodadas",
+        )
+        self.assertEqual(app.suspended_ai_objectives, [])
 
 
 if __name__ == "__main__":

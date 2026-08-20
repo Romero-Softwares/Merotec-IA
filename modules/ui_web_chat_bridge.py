@@ -260,7 +260,10 @@ class InternalBrowserWebChatBridge:
         target = normalize_web_url(target or entry_url, entry_url)
 
         process = getattr(self.app, "internal_browser_process", None)
+        browser_is_usable = getattr(self.app, "_internal_browser_is_usable", None)
         embedded_browser = getattr(self.app, "browser_view", None)
+        if callable(browser_is_usable) and not browser_is_usable():
+            embedded_browser = None
         process_is_alive = process is not None and process.poll() is None
         current = str(
             getattr(self.app, "internal_browser_url", "")
