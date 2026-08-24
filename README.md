@@ -27,6 +27,22 @@ gerenciamento de projetos, execucao de comandos, navegador interno e recursos de
 - `Ctrl+/`: comentar ou descomentar a selecao.
 - Indentacao inteligente, pares automaticos, busca, zoom, numeros de linha e marcadores de alteracao.
 
+## Geração de imagens
+
+No chat, abra o menu de anexo e escolha **Gerar imagem com IA...**, ou envie uma
+mensagem como `Gere uma imagem: uma cidade futurista ao entardecer`. A imagem é
+gerada pelo provedor de IA selecionado e aparece no chat com prévia, além dos
+botões **Abrir** e **Salvar como...**.
+
+- Com o provedor **Codex** conectado, a IDE usa a sessão autenticada atual, sem
+  exigir uma chave de API adicional.
+- Com um provedor compatível com a API OpenAI, informe uma `OPENAI_API_KEY` nas
+  **Configurações da IA**. A IDE envia a solicitação para o endpoint
+  `/images/generations` configurado no perfil.
+
+As imagens são copiadas para `.merotec_system_ai/generated_images/` dentro do
+workspace ativo. Essa pasta é local e fica ignorada pelo Git.
+
 ## Geração local de vídeo
 
 A conversa pode gerar vídeo pelo menu de anexo, em **Gerar vídeo com IA...**,
