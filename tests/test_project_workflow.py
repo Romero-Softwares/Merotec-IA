@@ -128,6 +128,27 @@ class WorkspaceRestoreTests(unittest.TestCase):
 
             self.assertEqual(root.resolve(), selected)
 
+    def test_closed_project_does_not_restore_a_recent_workspace(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "ide"
+            projects = root / "projects"
+            recent = Path(temp_dir) / "projeto-recente"
+            projects.mkdir(parents=True)
+            recent.mkdir()
+            state = self.DummyState(
+                {
+                    "last_workspace": str(recent),
+                    "recent_projects": [str(recent)],
+                    "start_without_project": True,
+                }
+            )
+
+            with patch("modules.app_state.PROJECT_ROOT", root), patch("modules.app_state.DEFAULT_WORKSPACE", projects):
+                selected = state._initial_workspace()
+
+            self.assertEqual(projects.resolve(), selected)
+            self.assertEqual("", state.settings["last_workspace"])
+
     def test_codex_profile_does_not_associate_workspace_with_web_chat(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir) / "Projeto"
@@ -152,6 +173,64 @@ class WorkspaceRestoreTests(unittest.TestCase):
             self.assertEqual("", state.web_chat_restore_url)
             self.assertEqual("", state.web_chat_workspace_key)
             self.assertEqual([], state.opened)
+
+
+class ProjectClosingTests(unittest.TestCase):
+    class DummyState(AppStateMixin):
+        def __init__(self, workspace):
+            self.current_workspace = str(workspace)
+            self.settings = ensure_ai_profiles({"recent_projects": [str(workspace)]})
+            self.open_editors = {
+                "main.py": {"path": str(workspace / "main.py"), "dirty": False},
+                "externo.py": {"path": str(workspace.parent / "externo.py"), "dirty": False},
+            }
+            self.closed_tabs = []
+            self.messages = []
+            self.status = None
+            self.reloaded = False
+            self.web_chat_restore_url = "projeto-antigo"
+            self.web_chat_workspace_key = str(workspace)
+
+        def close_specific_tab(self, tab_name):
+            self.closed_tabs.append(tab_name)
+            self.open_editors.pop(tab_name, None)
+
+        def _save_settings(self):
+            pass
+
+        def load_workspace_files(self):
+            self.reloaded = True
+
+        def add_chat_message(self, sender, text):
+            self.messages.append((sender, text))
+
+        def log_agent(self, _message):
+            pass
+
+        def set_status(self, text, kind):
+            self.status = (text, kind)
+
+    def test_close_project_returns_to_neutral_workspace_and_keeps_external_tabs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "projeto"
+            neutral_workspace = root / "projects"
+            workspace.mkdir()
+            neutral_workspace.mkdir()
+            (workspace / "main.py").touch()
+
+            state = self.DummyState(workspace)
+            with patch("modules.app_state.DEFAULT_WORKSPACE", neutral_workspace), patch("modules.app_state.os.chdir"):
+                result = state.close_project()
+
+            self.assertEqual("break", result)
+            self.assertEqual(["main.py"], state.closed_tabs)
+            self.assertIn("externo.py", state.open_editors)
+            self.assertEqual(str(neutral_workspace.resolve()), state.current_workspace)
+            self.assertEqual(str(neutral_workspace.resolve()), state.settings["last_workspace"])
+            self.assertEqual("", state.web_chat_restore_url)
+            self.assertEqual("", state.web_chat_workspace_key)
+            self.assertTrue(state.reloaded)
 
 
 if __name__ == "__main__":

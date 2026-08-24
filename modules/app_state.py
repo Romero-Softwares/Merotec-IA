@@ -109,6 +109,61 @@ class AppStateMixin:
             )
         return "\n".join(lines)
 
+    def ai_context_memory_file(self, workspace=None):
+        """Local durável, porém privado ao workspace, do contexto útil do chat."""
+        root_value = workspace or self.__dict__.get("current_workspace")
+        if not root_value:
+            return None
+        root = Path(root_value).resolve()
+        return root / ".merotec_system_ai" / "chat_context_memory.json"
+
+    def restore_workspace_ai_context_memory(self, workspace=None):
+        """Reidrata a última missão ao abrir novamente o mesmo projeto."""
+        path = self.ai_context_memory_file(workspace)
+        if path is None:
+            return False
+        payload = load_json_file(path, {}, dict)
+        messages = payload.get("messages", []) if isinstance(payload, dict) else []
+        if not isinstance(messages, list):
+            messages = []
+        cleaned = []
+        for item in messages[-80:]:
+            if not isinstance(item, dict):
+                continue
+            sender = str(item.get("sender") or item.get("author") or "Mensagem").strip()
+            text = str(item.get("text") or "").strip()
+            if sender and text:
+                cleaned.append({
+                    "sender": sender,
+                    "author": sender,
+                    "text": text[:2400],
+                    "task_id": item.get("task_id", 0),
+                    "objective": str(item.get("objective") or "")[:1200],
+                    "timestamp": str(item.get("timestamp") or ""),
+                })
+        self.ai_context_memory = cleaned
+        self.active_ai_objective = str(payload.get("active_objective") or "").strip()
+        self.last_response = str(payload.get("last_response") or "").strip()[-2400:]
+        return bool(cleaned or self.active_ai_objective or self.last_response)
+
+    def persist_workspace_ai_context_memory(self):
+        """Salva apenas a janela compacta que a próxima rodada realmente usa."""
+        path = self.ai_context_memory_file()
+        if path is None:
+            return False
+        payload = {
+            "version": 1,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "active_objective": str(getattr(self, "active_ai_objective", "") or "")[:1200],
+            "last_response": str(getattr(self, "last_response", "") or "")[-2400:],
+            "messages": list(getattr(self, "ai_context_memory", [])[-80:]),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not atomic_write_json(path, payload, indent=2, ensure_ascii=False):
+            self.log_agent("Não consegui salvar a memória local da conversa.")
+            return False
+        return True
+
     def _apply_settings_to_environment(self):
         ensure_ai_profiles(self.settings)
         activate_profile(self.settings, self.settings.get("active_ai_profile") or self.settings.get("ai_provider"))
@@ -257,6 +312,12 @@ class AppStateMixin:
 
     def _initial_workspace(self):
         DEFAULT_WORKSPACE.mkdir(parents=True, exist_ok=True)
+        # Depois de "Fechar projeto", a IDE deve voltar ao estado neutro e
+        # nao escolher silenciosamente o primeiro item de projetos recentes.
+        if self.settings.get("start_without_project", False):
+            self.settings["last_workspace"] = ""
+            self._save_settings()
+            return DEFAULT_WORKSPACE.resolve()
         last_workspace = self.settings.get("last_workspace", "")
         recent_projects = [
             path for path in self.settings.get("recent_projects", [])
@@ -305,6 +366,61 @@ class AppStateMixin:
         folder = filedialog.askdirectory(title="Abrir projeto ou pasta", initialdir=self.current_workspace)
         if folder:
             self.set_workspace(folder)
+
+    def close_project(self):
+        """Fecha o projeto ativo e retorna ao diretório neutro de projetos."""
+        workspace = Path(getattr(self, "current_workspace", "")).resolve()
+        default_workspace = DEFAULT_WORKSPACE.resolve()
+        if workspace == default_workspace:
+            self.set_status("Nenhum projeto aberto.", "ready")
+            return "break"
+
+        project_tabs = []
+        for tab_name, info in list(getattr(self, "open_editors", {}).items()):
+            path = info.get("path") if info else None
+            if not path:
+                continue
+            try:
+                Path(path).resolve().relative_to(workspace)
+            except ValueError:
+                continue
+            project_tabs.append((tab_name, info))
+
+        dirty_tabs = [tab_name for tab_name, info in project_tabs if info.get("dirty")]
+        if dirty_tabs:
+            names = ", ".join(dirty_tabs[:4])
+            if len(dirty_tabs) > 4:
+                names += f" e mais {len(dirty_tabs) - 4}"
+            if not messagebox.askyesno(
+                APP_NAME,
+                f"Fechar o projeto sem salvar as abas alteradas?\n{names}",
+                parent=self,
+            ):
+                return "break"
+
+        for tab_name, info in project_tabs:
+            # A confirmação acima cobre todas as abas; evita uma pergunta por arquivo.
+            info["dirty"] = False
+            self.close_specific_tab(tab_name)
+
+        default_workspace.mkdir(parents=True, exist_ok=True)
+        self.current_workspace = str(default_workspace)
+        os.chdir(self.current_workspace)
+        if hasattr(self, "memory_subnet"):
+            self.memory_subnet.reset_workspace(default_workspace)
+        if hasattr(self, "ai_context_memory"):
+            self.restore_workspace_ai_context_memory(default_workspace)
+        if hasattr(self, "workspace_label"):
+            self.workspace_label.configure(text=self._workspace_title())
+        self.settings["last_workspace"] = self.current_workspace
+        self._save_settings()
+        self.web_chat_restore_url = ""
+        self.web_chat_workspace_key = ""
+        self.load_workspace_files()
+        self.add_chat_message("Sistema", f"Projeto fechado: {workspace.name}. Abra um projeto para continuar.")
+        self.log_agent(f"Projeto fechado: {workspace}")
+        self.set_status("Projeto fechado. Selecione um projeto para continuar.", "ready")
+        return "break"
 
     def create_new_project(self):
         project_name = simpledialog.askstring("Novo projeto", "Nome do projeto:", parent=self)
@@ -355,6 +471,8 @@ class AppStateMixin:
         os.chdir(self.current_workspace)
         if hasattr(self, "memory_subnet"):
             self.memory_subnet.reset_workspace(resolved)
+        if hasattr(self, "ai_context_memory"):
+            self.restore_workspace_ai_context_memory(resolved)
         self.workspace_label.configure(text=self._workspace_title())
         self.load_workspace_files()
         self._write_history(self.current_workspace)

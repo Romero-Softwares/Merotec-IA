@@ -25,6 +25,10 @@ OPENAI_BASE_URL = os.getenv(
     "OPENAI_BASE_URL",
     _SETTINGS.get("openai_base_url", "https://api.openai.com/v1"),
 ).strip()
+OPENAI_IMAGE_MODEL_NAME = os.getenv(
+    "OPENAI_IMAGE_MODEL_NAME",
+    _SETTINGS.get("openai_image_model_name", "gpt-image-1"),
+).strip()
 LM_STUDIO_BASE_URL = os.getenv(
     "LM_STUDIO_BASE_URL",
     _SETTINGS.get("lm_studio_base_url", "http://127.0.0.1:1234/v1"),

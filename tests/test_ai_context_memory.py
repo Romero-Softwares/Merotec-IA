@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -64,6 +65,25 @@ class AiContextMemoryTest(unittest.TestCase):
             "Corrigir a IDE para preservar contexto entre rodadas",
         )
         self.assertEqual(app.suspended_ai_objectives, [])
+
+    def test_context_memory_is_restored_for_the_same_workspace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            app = bare_app()
+            app.current_workspace = str(workspace)
+            app.log_agent = lambda _message: None
+            app.active_ai_objective = "Concluir o fluxo principal"
+            app.last_response = "Validação local aprovada."
+            app.remember_ai_context_message("Voce", "Continue a tarefa.")
+
+            restored = bare_app()
+            restored.current_workspace = str(workspace)
+            restored.log_agent = lambda _message: None
+
+            self.assertTrue(restored.restore_workspace_ai_context_memory())
+            self.assertEqual(restored.active_ai_objective, "Concluir o fluxo principal")
+            self.assertEqual(restored.last_response, "Validação local aprovada.")
+            self.assertIn("Continue a tarefa.", restored.build_recent_ai_context_memory())
 
 
 if __name__ == "__main__":

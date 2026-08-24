@@ -392,6 +392,22 @@ class BrowserRuntimeTests(unittest.TestCase):
         self.assertEqual(profile.name, "smoke-profile")
         self.assertIn(".merotec_local_ai", str(profile))
 
+    def test_runtime_starts_command_handshake_before_waiting_for_dom_loaded(self):
+        source = (ROOT / "modules" / "browser_runtime.py").read_text(encoding="utf-8")
+        self.assertIn("window.events.initialized += _window_initialized", source)
+        self.assertIn("window.events.shown += _window_shown", source)
+        self.assertIn("window_initialized.wait(timeout=20)", source)
+        self.assertIn("threading.Thread(target=command_loop, daemon=True).start()", source)
+        self.assertIn("webview.start(**start_kwargs)", source)
+        self.assertIn("page_loaded.wait(timeout=20)", source)
+
+    def test_visual_test_runtime_uses_qt_webengine_fallback(self):
+        source = (ROOT / "modules" / "browser_runtime.py").read_text(encoding="utf-8")
+        self.assertIn("def _run_qt_visual_browser", source)
+        self.assertIn("from PySide6.QtWebEngineWidgets import QWebEngineView", source)
+        self.assertIn('os.environ.get("MEROTEC_VISUAL_TEST_BROWSER") == "1"', source)
+        self.assertIn("return _run_qt_visual_browser(", source)
+
     def test_visual_delivery_never_silently_claims_attachment_success(self):
         engine_source = (ROOT / "modules" / "engine.py").read_text(encoding="utf-8")
         main_source = (ROOT / "main.py").read_text(encoding="utf-8")

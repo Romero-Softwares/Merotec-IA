@@ -27,6 +27,20 @@ gerenciamento de projetos, execucao de comandos, navegador interno e recursos de
 - `Ctrl+/`: comentar ou descomentar a selecao.
 - Indentacao inteligente, pares automaticos, busca, zoom, numeros de linha e marcadores de alteracao.
 
+## Geração local de vídeo
+
+A conversa pode gerar vídeo pelo menu de anexo, em **Gerar vídeo com IA...**,
+ou pela mensagem `Gere um vídeo: ...`. A primeira versão usa um ComfyUI local:
+
+1. Inicie o ComfyUI com a API em `http://127.0.0.1:8188`.
+2. Em **Configurações da IA**, informe a URL e o caminho do workflow JSON de vídeo exportado pelo ComfyUI.
+3. Inclua `$PROMPT` no campo de texto do workflow. Os tokens opcionais são `$WIDTH`, `$HEIGHT`, `$DURATION_SECONDS`, `$QUALITY` e `$REFERENCE_IMAGE`.
+
+O resultado é salvo em `.merotec_system_ai/generated_videos/`, aparece no chat
+com controles de reprodução e pode ser aberto ou salvo em outro local. Anexe uma
+imagem antes de gerar para usá-la como referência; nesse caso o workflow precisa
+conter `$REFERENCE_IMAGE`.
+
 ## Requisitos
 
 - Python 3.11 ou superior

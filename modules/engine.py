@@ -41,6 +41,11 @@ class UniversalEngine:
 
     def __init__(self):
         self.configuration_warnings = []
+        # O app-server pode devolver uma ou mais imagens por rodada.  A UI
+        # consome a lista para publicar cada artefato, enquanto o atributo
+        # singular continua disponivel para os fluxos legados.
+        self.latest_generated_image_path = ""
+        self.latest_generated_image_paths = []
         # Estado da última entrega pelo navegador. A interface usa isto para
         # não fingir que um print de teste chegou ao chat quando o site recusou
         # o upload ou o botão de envio ficou bloqueado.
@@ -83,6 +88,12 @@ class UniversalEngine:
         self.openai_base_url = str(
             settings.get("openai_base_url", os.getenv("OPENAI_BASE_URL", app_config.OPENAI_BASE_URL))
         ).strip().rstrip("/") or "https://api.openai.com/v1"
+        self.openai_image_model_name = str(
+            settings.get(
+                "openai_image_model_name",
+                os.getenv("OPENAI_IMAGE_MODEL_NAME", app_config.OPENAI_IMAGE_MODEL_NAME),
+            )
+        ).strip() or "gpt-image-1"
         self.lm_studio_base_url = self.normalize_lm_studio_base_url(
             settings.get("lm_studio_base_url", os.getenv("LM_STUDIO_BASE_URL", app_config.LM_STUDIO_BASE_URL))
         )
@@ -2125,6 +2136,7 @@ except Exception as exc:
         reasoning_effort=None,
         workspace_path=None,
         approval_callback=None,
+        image_result_callback=None,
     ):
         workspace = Path(workspace_path).resolve() if workspace_path else Path.cwd()
         selected_model = model_override or self.codex_model_name or "gpt-5.5"
@@ -2365,6 +2377,28 @@ except Exception as exc:
             final_from_items = ""
             last_error = ""
             completed = False
+            reported_image_paths = set()
+
+            def publish_generated_images(payload):
+                paths = self._extract_app_server_generated_image_paths(payload)
+                if not paths:
+                    return
+                fresh_paths = []
+                for path in paths:
+                    key = str(Path(path).resolve()).casefold()
+                    if key in reported_image_paths:
+                        continue
+                    reported_image_paths.add(key)
+                    fresh_paths.append(path)
+                if not fresh_paths:
+                    return
+                current_paths = list(getattr(self, "latest_generated_image_paths", []) or [])
+                current_paths.extend(fresh_paths)
+                self.latest_generated_image_paths = current_paths
+                self.latest_generated_image_path = current_paths[-1]
+                if image_result_callback:
+                    for path in fresh_paths:
+                        image_result_callback(path)
             task_timeout = self._positive_int_env(
                 "MEROTEC_CODEX_TASK_TIMEOUT_SECONDS",
                 3600,
@@ -2408,6 +2442,11 @@ except Exception as exc:
 
                 if handle_server_request(message):
                     continue
+
+                # Algumas versoes do app-server anunciam a imagem antes de
+                # concluir a rodada; outras a colocam somente no turno final.
+                # Nos dois casos a publicacao fica vinculada ao mesmo turno.
+                publish_generated_images(params)
 
                 if self._app_server_message_has_placeholder_command(method, params):
                     last_error = (
@@ -2454,6 +2493,7 @@ except Exception as exc:
                         last_error = error.get("message") or str(error)
                     else:
                         final_from_items = self._extract_app_server_final_message(turn)
+                        publish_generated_images(turn)
                     break
 
                 if method == "processClosed":
@@ -2484,6 +2524,69 @@ except Exception as exc:
                     pass
             if self.active_process is process:
                 self.active_process = None
+
+    @staticmethod
+    def _extract_app_server_generated_image_paths(payload):
+        """Localiza os arquivos de imagens emitidos pelo app-server no turno atual.
+
+        O protocolo ja usou ``imageGeneration.savedPath`` e tambem pode
+        entregar o item em notificacoes intermediarias, com nomes de campos em
+        ``snake_case``. So aceita arquivos de imagem que existam localmente,
+        evitando transformar anexos de entrada ou texto comum em uma previa.
+        """
+        image_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+        path_fields = ("savedPath", "saved_path", "filePath", "file_path", "localPath", "local_path", "path")
+        found = []
+        seen = set()
+
+        def remember(value):
+            if not isinstance(value, (str, os.PathLike)):
+                return
+            try:
+                candidate = Path(value)
+                resolved = candidate.resolve()
+            except (OSError, RuntimeError, TypeError):
+                return
+            if not resolved.is_file() or resolved.suffix.lower() not in image_suffixes:
+                return
+            key = str(resolved).casefold()
+            if key not in seen:
+                seen.add(key)
+                found.append(str(resolved))
+
+        def walk(value, generated_context=False):
+            if isinstance(value, list):
+                for item in value:
+                    walk(item, generated_context)
+                return
+            if not isinstance(value, dict):
+                return
+            item_type = str(value.get("type") or value.get("kind") or "").casefold()
+            tool_name = str(
+                value.get("tool") or value.get("toolName") or value.get("tool_name") or value.get("name") or ""
+            ).casefold()
+            is_generation = generated_context or (
+                "image" in item_type
+                and ("generat" in item_type or "imagegen" in item_type)
+            ) or (
+                "image" in tool_name
+                and ("generat" in tool_name or "imagegen" in tool_name)
+            )
+            if is_generation:
+                for field in path_fields:
+                    remember(value.get(field))
+            for child in value.values():
+                if isinstance(child, (dict, list)):
+                    walk(child, is_generation)
+
+        walk(payload)
+        return found
+
+    @staticmethod
+    def _extract_app_server_generated_image_path(turn):
+        """Mantem compatibilidade com consumidores que esperam uma unica imagem."""
+        paths = UniversalEngine._extract_app_server_generated_image_paths(turn)
+        return paths[-1] if paths else None
 
     def _extract_app_server_progress(self, method, params):
         lower_method = (method or "").lower()
@@ -2948,6 +3051,118 @@ except Exception as exc:
             return self._format_openai_http_error(exc.code, body)
         except Exception as exc:
             return f"Erro no motor OpenAI usando modelo `{self.model_id}`: {exc}"
+
+    def generate_image(self, prompt, output_dir):
+        """Gera uma imagem e salva uma cópia local pronta para a interface exibir."""
+        text = str(prompt or "").strip()
+        if not text:
+            raise ValueError("Descreva a imagem que deseja gerar.")
+        if self.provider == "codex":
+            return self._generate_codex_image(text, output_dir)
+        if not self.openai_api_key:
+            raise RuntimeError(
+                "Configure uma OPENAI_API_KEY no perfil API compatível com OpenAI para gerar imagens."
+            )
+
+        base_url = str(getattr(self, "openai_base_url", "") or "").rstrip("/")
+        if not base_url or "openrouter.ai" in base_url.lower() or self.openai_api_key.startswith("sk-or-"):
+            raise RuntimeError(
+                "A geração de imagens requer uma chave da OpenAI Platform; chaves OpenRouter não são usadas neste fluxo."
+            )
+
+        payload = {
+            "model": str(getattr(self, "openai_image_model_name", "") or "gpt-image-1"),
+            "prompt": text,
+            "n": 1,
+            "size": "1024x1024",
+            "quality": "medium",
+            "output_format": "png",
+        }
+        request = urllib.request.Request(
+            f"{base_url}/images/generations",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.openai_api_key.strip()}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=180) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(self._format_openai_http_error(exc.code, body)) from exc
+        except Exception as exc:
+            raise RuntimeError(f"Falha ao gerar a imagem: {exc}") from exc
+
+        item = next(iter(data.get("data") or []), {})
+        raw_image = item.get("b64_json")
+        if raw_image:
+            try:
+                image_bytes = base64.b64decode(raw_image, validate=True)
+            except (ValueError, TypeError) as exc:
+                raise RuntimeError("A API retornou uma imagem inválida.") from exc
+        elif item.get("url"):
+            try:
+                with urllib.request.urlopen(str(item["url"]), timeout=120) as response:
+                    image_bytes = response.read()
+            except Exception as exc:
+                raise RuntimeError(f"Não foi possível baixar a imagem gerada: {exc}") from exc
+        else:
+            raise RuntimeError("A API não retornou uma imagem para este pedido.")
+        if not image_bytes:
+            raise RuntimeError("A API retornou uma imagem vazia.")
+
+        target_dir = Path(output_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"imagem_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns() % 1_000_000:06d}.png"
+        target = target_dir / filename
+        target.write_bytes(image_bytes)
+        return target
+
+    def _generate_codex_image(self, prompt, output_dir):
+        """Usa a sessão atual do Codex para gerar uma imagem sem exigir chave de API."""
+        executable = self._find_codex_executable()
+        if not executable:
+            raise RuntimeError(
+                "Codex não foi encontrado no Windows. Instale ou abra o Codex e tente novamente."
+            )
+        if not self._codex_is_logged_in(executable):
+            raise RuntimeError(
+                "A conta do Codex não está conectada. Clique em `Entrar Codex` e conclua o login."
+            )
+
+        target_dir = Path(output_dir)
+        workspace = target_dir.parents[1] if len(target_dir.parents) > 1 else Path.cwd()
+        generated = {"path": None}
+
+        def remember_generated_image(path):
+            candidate = Path(path)
+            if candidate.is_file():
+                generated["path"] = candidate
+
+        response = self._generate_codex_app_server_solution(
+            executable,
+            f"$imagegen\n\n{prompt}",
+            workspace_path=workspace,
+            image_result_callback=remember_generated_image,
+        )
+        source = generated["path"]
+        if source is None:
+            detail = str(response or "").strip()
+            if detail and self._is_codex_error_message(detail):
+                raise RuntimeError(self._format_codex_app_server_error(detail))
+            raise RuntimeError(
+                "O Codex não retornou uma imagem. Verifique a disponibilidade de geração de imagens na conta atual."
+            )
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / (
+            f"imagem_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns() % 1_000_000:06d}{source.suffix or '.png'}"
+        )
+        shutil.copyfile(source, target)
+        return target
 
     def _generate_lm_studio_solution(
         self,
@@ -3590,6 +3805,9 @@ def _merotec_locked_generate_solution(
     approval_callback=None,
 ):
     self.cancel_requested = False
+    # Evita que uma imagem de uma rodada anterior seja repetida na conversa.
+    self.latest_generated_image_path = ""
+    self.latest_generated_image_paths = []
     response = self._generate_solution_with_provider(
         self.provider,
         prompt,

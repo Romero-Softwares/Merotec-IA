@@ -1,5 +1,7 @@
 import json
+import base64
 import sys
+import tempfile
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -20,6 +22,7 @@ class EngineConfigTest(unittest.TestCase):
             "CODEX_REASONING_EFFORT",
             "OPENAI_API_KEY",
             "OPENAI_MODEL_NAME",
+            "OPENAI_IMAGE_MODEL_NAME",
             "LM_STUDIO_BASE_URL",
             "LM_STUDIO_MODEL_NAME",
             "LM_STUDIO_API_KEY",
@@ -188,6 +191,99 @@ class EngineConfigTest(unittest.TestCase):
             ]
         }
         self.assertEqual("[READ: src/app.py]", engine._extract_openai_text(data))
+
+    def test_image_generation_saves_openai_base64_response(self):
+        engine = UniversalEngine.__new__(UniversalEngine)
+        engine.provider = "openai"
+        engine.openai_api_key = "sk-test"
+        engine.openai_base_url = "https://api.openai.com/v1"
+        engine.openai_image_model_name = "gpt-image-1"
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps({
+            "data": [{"b64_json": base64.b64encode(b"png-data").decode("ascii")}]
+        }).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with mock.patch("urllib.request.urlopen", return_value=response) as urlopen:
+                target = engine.generate_image("retrato ficticio", temp_dir)
+
+            self.assertEqual(b"png-data", target.read_bytes())
+            request = urlopen.call_args.args[0]
+            self.assertEqual("https://api.openai.com/v1/images/generations", request.full_url)
+            self.assertEqual("gpt-image-1", json.loads(request.data.decode("utf-8"))["model"])
+
+    def test_codex_image_uses_current_session_and_copies_generated_file(self):
+        engine = UniversalEngine.__new__(UniversalEngine)
+        engine._find_codex_executable = lambda: "codex"
+        engine._codex_is_logged_in = lambda executable: True
+        engine._is_codex_error_message = lambda message: False
+        engine.provider = "codex"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "workspace"
+            output_dir = workspace / ".merotec_system_ai" / "generated_images"
+            source = Path(temp_dir) / "codex-image.png"
+            source.write_bytes(b"codex-png")
+
+            def generate(executable, prompt, **kwargs):
+                self.assertEqual("codex", executable)
+                self.assertEqual("$imagegen\n\nretrato ficticio", prompt)
+                self.assertEqual(workspace, kwargs["workspace_path"])
+                kwargs["image_result_callback"](str(source))
+                return "Imagem pronta"
+
+            engine._generate_codex_app_server_solution = generate
+            target = engine.generate_image("retrato ficticio", output_dir)
+
+            self.assertEqual(b"codex-png", target.read_bytes())
+            self.assertEqual(output_dir, target.parent)
+
+    def test_extracts_codex_generated_image_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "image.png"
+            image.write_bytes(b"png")
+            turn = {
+                "items": [
+                    {"type": "agentMessage", "text": "Imagem pronta"},
+                    {"type": "imageGeneration", "savedPath": str(image)},
+                ]
+            }
+            self.assertEqual(str(image), UniversalEngine._extract_app_server_generated_image_path(turn))
+
+    def test_extracts_every_codex_image_from_new_and_legacy_item_shapes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first = Path(temp_dir) / "primeira.png"
+            second = Path(temp_dir) / "segunda.webp"
+            first.write_bytes(b"png")
+            second.write_bytes(b"webp")
+            payload = {
+                "item": {
+                    "type": "image_generation",
+                    "output": {"saved_path": str(first)},
+                    "result": {
+                        "type": "tool_result",
+                        "toolName": "imagegen",
+                        "localPath": str(second),
+                    },
+                }
+            }
+
+            self.assertEqual(
+                [str(first.resolve()), str(second.resolve())],
+                UniversalEngine._extract_app_server_generated_image_paths(payload),
+            )
+
+    def test_new_solution_clears_the_previous_generated_image_path(self):
+        engine = UniversalEngine.__new__(UniversalEngine)
+        engine.provider = "local_gguf"
+        engine.local_gguf_allow_external_fallback = False
+        engine.latest_generated_image_path = "imagem-antiga.png"
+        engine._generate_solution_with_provider = lambda *args, **kwargs: "Resposta pronta."
+
+        self.assertEqual("Resposta pronta.", engine.generate_solution("teste"))
+        self.assertEqual("", engine.latest_generated_image_path)
+        self.assertEqual([], engine.latest_generated_image_paths)
 
     def test_openrouter_keeps_exact_configured_model(self):
         engine = UniversalEngine.__new__(UniversalEngine)

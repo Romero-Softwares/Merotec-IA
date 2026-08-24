@@ -17,6 +17,7 @@ MEROTEC_SYSTEM_AI_DIR = PROJECT_ROOT / ".merotec_system_ai"
 
 DEFAULT_APP_SETTINGS = {
     "last_workspace": "",
+    "start_without_project": False,
     "recent_projects": [],
     "ai_provider": "web_chat",
     "active_ai_profile": "web_chat",
@@ -62,6 +63,12 @@ DEFAULT_APP_SETTINGS = {
     "web_chat_timeout_seconds": 300,
     "web_chat_message_chars": 28000,
     "web_chat_auto_attach_media": True,
+    # Geração de vídeo local: o workflow JSON é exportado pelo ComfyUI e
+    # recebe os tokens $PROMPT, $WIDTH, $HEIGHT e opcionais da IDE.
+    "video_provider": "comfyui",
+    "comfyui_base_url": "http://127.0.0.1:8188",
+    "comfyui_video_workflow_path": "",
+    "video_timeout_seconds": 900,
     "web_chat_allow_remote_actions": False,
     "web_chat_restore_project_session": True,
     "web_chat_include_project_context": True,

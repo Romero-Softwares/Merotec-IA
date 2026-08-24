@@ -209,6 +209,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.ai_read_history = {}
         self.ai_search_history = {}
         self.memory_subnet = MemorySubnet(self.current_workspace)
+        self.restore_workspace_ai_context_memory()
         self.ai_task_metrics = {}
         self.ai_passive_action_count = 0
         self.max_ai_passive_actions = 18
@@ -435,6 +436,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         file_menu = self._native_menu()
         file_menu.add_command(label="Novo projeto...", accelerator="Ctrl+Shift+N", command=self.create_new_project)
         file_menu.add_command(label="Abrir projeto/pasta...", command=self.open_project)
+        file_menu.add_command(label="Fechar projeto", accelerator="Ctrl+Shift+W", command=self.close_project)
         file_menu.add_command(label="Abrir arquivo externo...", accelerator="Ctrl+O", command=self.open_external_file)
         self.recent_menu = self._native_menu()
         file_menu.add_cascade(label="Projetos recentes", menu=self.recent_menu)
@@ -2483,6 +2485,8 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
     def _bind_shortcuts(self):
         self.bind_all("<Control-Shift-N>", lambda _event: self.create_new_project())
         self.bind_all("<Control-Shift-n>", lambda _event: self.create_new_project())
+        self.bind_all("<Control-Shift-W>", lambda _event: self.close_project())
+        self.bind_all("<Control-Shift-w>", lambda _event: self.close_project())
         self.bind_all("<Control-o>", lambda _event: self.open_external_file())
         self.bind_all("<Control-O>", lambda _event: self.open_external_file())
         self.bind_all("<Control-s>", self.save_current_tab)
@@ -4258,6 +4262,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
             }
         )
         self.ai_context_memory = self.ai_context_memory[-80:]
+        self.persist_workspace_ai_context_memory()
 
     def build_recent_ai_context_memory(self, limit=16, max_chars=6000):
         messages = getattr(self, "ai_context_memory", [])[-limit:]
@@ -5536,6 +5541,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
                 if not answer_only:
                     self.preserve_active_ai_objective(command)
                     self.active_ai_objective = command
+                    self.persist_workspace_ai_context_memory()
                     self.ai_read_history = {}
                     self.ai_search_history = {}
                 self.ai_task_metrics[current_task_id] = {
@@ -6386,7 +6392,15 @@ UniversalApp.is_external_model_failure_response = _merotec_locked_is_external_mo
 UniversalApp.local_llm_fallback_reply = _merotec_locked_local_llm_fallback_reply
 
 # Inicialize somente depois de registrar todos os patches da aplicação.
+# A interface principal usa PySide6 e QWebEngine, que mantém o navegador dentro
+# da própria janela da IDE. O modo Tk continua disponível somente para
+# compatibilidade explícita, pois depende de um processo WebView2 auxiliar.
 if __name__ == "__main__":
+    if "--legacy-tk" not in sys.argv:
+        from pyside_app import run as run_pyside_app
+
+        raise SystemExit(run_pyside_app())
+    sys.argv.remove("--legacy-tk")
     if not _activate_existing_instance():
         app = UniversalApp()
         app.mainloop()

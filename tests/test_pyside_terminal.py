@@ -20,6 +20,105 @@ else:
 
 @unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6 nao esta instalado neste interpretador")
 class PySideTerminalTests(unittest.TestCase):
+    def test_chat_context_is_preserved_for_ephemeral_provider_threads(self):
+        ide = MerotecIDE.__new__(MerotecIDE)
+        ide.active_ai_objective = "Corrigir a memoria da conversa"
+        ide.ai_context_memory = []
+        ide.last_response = "Vou verificar o estado atual do projeto."
+
+        ide._remember_ai_context_message("Voce", "Investigue por que a IA esquece a conversa.")
+        ide._remember_ai_context_message("Merotec IA", ide.last_response)
+        context = ide.build_chat_continuity_context("continue de onde parou")
+
+        self.assertIn("Missao ativa mais recente: Corrigir a memoria da conversa", context)
+        self.assertIn("Investigue por que a IA esquece a conversa.", context)
+        self.assertIn("Nunca alegue que nao ha conversa anterior", context)
+
+    def test_short_continuation_does_not_replace_active_objective(self):
+        self.assertTrue(MerotecIDE._is_chat_continuation_request("continue de onde parou"))
+        self.assertTrue(MerotecIDE._is_chat_continuation_request("faça isso"))
+        self.assertFalse(MerotecIDE._is_chat_continuation_request("crie um projeto novo"))
+
+    def test_image_generation_request_is_detected_without_hijacking_regular_chat(self):
+        self.assertTrue(MerotecIDE._is_image_generation_request("Gere uma imagem de pessoas ficticias"))
+        self.assertTrue(MerotecIDE._is_image_generation_request("crie imagem: uma cidade futurista"))
+        self.assertFalse(MerotecIDE._is_image_generation_request("consegue criar imagem de pessoas?"))
+
+    def test_agent_image_message_is_forwarded_to_chat_as_attachment(self):
+        class ImmediateBridge:
+            @staticmethod
+            def call_soon(callback):
+                callback()
+
+        class FakeIDE:
+            _is_image_attachment = MerotecIDE._is_image_attachment
+
+            def __init__(self):
+                self.ui_bridge = ImmediateBridge()
+                self.remembered = []
+                self.messages = []
+
+            def _remember_ai_context_message(self, sender, text):
+                self.remembered.append((sender, text))
+
+            def add_chat(self, sender, text, outgoing=False, attachments=None):
+                self.messages.append((sender, text, outgoing, attachments))
+
+        ide = FakeIDE()
+        MerotecIDE.add_chat_image_message(ide, "Merotec IA", Path("imagem_teste.png"), "Imagem pronta")
+
+        self.assertEqual(ide.messages, [("Merotec IA", "Imagem pronta", False, [Path("imagem_teste.png")])])
+        self.assertIn("[imagem anexada: imagem_teste.png]", ide.remembered[0][1])
+
+    def test_codex_generated_artifact_is_delivered_to_chat(self):
+        class FakeIDE:
+            _is_image_attachment = MerotecIDE._is_image_attachment
+
+            def __init__(self):
+                self.delivered = []
+
+            def add_chat_image_message(self, sender, path, text):
+                self.delivered.append((sender, path, text))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "gerada.png"
+            image.write_bytes(b"png")
+            ide = FakeIDE()
+
+            MerotecIDE._deliver_generated_chat_image(ide, image)
+
+        self.assertEqual(
+            ide.delivered,
+            [("Merotec IA", image, "Imagem gerada pelo Codex.")],
+        )
+
+    def test_all_codex_generated_artifacts_are_delivered_once(self):
+        class FakeIDE:
+            _is_image_attachment = MerotecIDE._is_image_attachment
+
+            def __init__(self):
+                self.delivered = []
+
+            def add_chat_image_message(self, sender, path, text):
+                self.delivered.append((sender, path, text))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "gerada.png"
+            other = Path(temp_dir) / "variacao.webp"
+            image.write_bytes(b"png")
+            other.write_bytes(b"webp")
+            ide = FakeIDE()
+
+            MerotecIDE._deliver_generated_chat_image(ide, [image, other, image])
+
+        self.assertEqual(
+            ide.delivered,
+            [
+                ("Merotec IA", image, "Imagem gerada pelo Codex."),
+                ("Merotec IA", other, "Imagem gerada pelo Codex."),
+            ],
+        )
+
     def test_webengine_json_result_is_accepted_for_chat_actions(self):
         result = MerotecIDE._decode_web_javascript_result(
             '{"ok": true, "before": "resposta anterior"}'
@@ -142,6 +241,73 @@ class PySideTerminalTests(unittest.TestCase):
         source = (ROOT / "pyside_app.py").read_text(encoding="utf-8")
         self.assertIn("Qt.ConnectionType.QueuedConnection", source)
         self.assertIn("JSON.stringify({ok:true,url: location.href", source)
+
+    def test_browser_fallback_preamble_is_recovered_with_local_visual_test(self):
+        reply = (
+            "Vou usar o recurso de controle do navegador para executar e inspecionar "
+            "visualmente o primeiro subprojeto. O navegador interno não está disponível "
+            "nesta sessão. Vou validar a renderização com o navegador instalado localmente."
+        )
+
+        self.assertTrue(MerotecIDE._is_unactionable_browser_preamble(reply))
+        self.assertFalse(MerotecIDE._is_unactionable_browser_preamble("[HUMAN_TEST: auto]"))
+
+    def test_non_browser_reply_is_not_converted_to_visual_test(self):
+        self.assertFalse(
+            MerotecIDE._is_unactionable_browser_preamble(
+                "A validação está pendente porque o servidor local não iniciou."
+            )
+        )
+
+    def test_visual_test_uses_flask_server_before_template_as_static_html(self):
+        class FakeIDE:
+            _requested_local_visual_url = staticmethod(MerotecIDE._requested_local_visual_url)
+            _find_visual_server_target = staticmethod(MerotecIDE._find_visual_server_target)
+            _allocate_visual_test_port = staticmethod(MerotecIDE._allocate_visual_test_port)
+
+            def __init__(self, workspace):
+                self.workspace = Path(workspace)
+                self._chat_task_prompt = "Teste visual completo"
+
+            def _build_visual_server_plan(self, workspace, request):
+                return MerotecIDE._build_visual_server_plan(self, workspace, request)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "templates").mkdir()
+            (root / "templates" / "index.html").write_text("<h1>{{ title }}</h1>", encoding="utf-8")
+            (root / "app.py").write_text(
+                "from flask import Flask\napp = Flask(__name__)\n",
+                encoding="utf-8",
+            )
+            plan = MerotecIDE._build_visual_test_plan(FakeIDE(root), "auto")
+
+        self.assertEqual("browser", plan["kind"])
+        self.assertIn("flask", plan["display"])
+        self.assertIn("-m", plan["command"])
+        self.assertIn("flask", plan["command"])
+        self.assertTrue(plan["url"].endswith("/"))
+
+    def test_visual_test_reuses_explicit_local_server_without_starting_another(self):
+        class FakeIDE:
+            _requested_local_visual_url = staticmethod(MerotecIDE._requested_local_visual_url)
+
+            def __init__(self, workspace):
+                self.workspace = Path(workspace)
+                self._chat_task_prompt = ""
+
+            def _build_visual_server_plan(self, workspace, request):
+                return MerotecIDE._build_visual_server_plan(self, workspace, request)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plan = MerotecIDE._build_visual_server_plan(
+                FakeIDE(temp_dir),
+                Path(temp_dir),
+                "Abra http://127.0.0.1:4173/dashboard para validar a tela",
+            )
+
+        self.assertEqual("http://127.0.0.1:4173/dashboard", plan["url"])
+        self.assertIsNone(plan["command"])
 
     def test_changed_files_start_first_automatic_validation(self):
         class FakeIDE:

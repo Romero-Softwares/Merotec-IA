@@ -10,6 +10,7 @@ import locale
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -19,11 +20,12 @@ import ctypes
 from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from PIL import ImageGrab
 
-from PySide6.QtCore import QDir, QFileInfo, QProcess, QProcessEnvironment, QSortFilterProxyModel, QStandardPaths, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap, QSyntaxHighlighter, QTextCharFormat, QTextDocument
+from PySide6.QtCore import QModelIndex, QDir, QFileInfo, QProcess, QProcessEnvironment, QSortFilterProxyModel, QStandardPaths, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPixmap, QSyntaxHighlighter, QTextCharFormat, QTextDocument
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
@@ -32,6 +34,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
 from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtCore import QUrl
 
 from modules.engine import UniversalEngine
@@ -47,6 +51,7 @@ from modules.qt_agent_actions import QtAgentActions
 from modules.project_manager import ProjectManager
 from modules.voice import VoiceModule
 from modules.plugin_manager import build_plugin_report_messages, initialize_plugins
+from modules.video_generation import VIDEO_SUFFIXES, VideoGenerationRequest, VideoGenerationService
 
 
 ROOT = Path(__file__).resolve().parent
@@ -366,6 +371,7 @@ class ChatBubble(QFrame):
         self.label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.label.setObjectName("chatText")
         layout.addWidget(self.label)
+        self.video_players = []
         for path in attachments or []:
             path = Path(path)
             if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
@@ -384,7 +390,46 @@ class ChatBubble(QFrame):
                     )
                     preview.setToolTip(path.name)
                     layout.addWidget(preview)
+                    actions = QHBoxLayout()
+                    open_button = QPushButton("Abrir")
+                    open_button.setObjectName("chatImageAction")
+                    open_button.clicked.connect(lambda _checked=False, image_path=path: self._open_image(image_path))
+                    actions.addWidget(open_button)
+                    save_button = QPushButton("Salvar como...")
+                    save_button.setObjectName("chatImageAction")
+                    save_button.clicked.connect(lambda _checked=False, image_path=path: self._save_image_as(image_path))
+                    actions.addWidget(save_button)
+                    actions.addStretch()
+                    layout.addLayout(actions)
                     continue
+            if path.suffix.lower() in VIDEO_SUFFIXES:
+                player = QMediaPlayer(self)
+                audio = QAudioOutput(self)
+                player.setAudioOutput(audio)
+                preview = QVideoWidget(self)
+                preview.setObjectName("chatVideoPreview")
+                preview.setMinimumSize(260, 180)
+                preview.setMaximumSize(520, 330)
+                player.setVideoOutput(preview)
+                player.setSource(QUrl.fromLocalFile(str(path.resolve())))
+                self.video_players.append((player, audio))
+                layout.addWidget(preview)
+                actions = QHBoxLayout()
+                play_button = QPushButton("Reproduzir")
+                play_button.setObjectName("chatImageAction")
+                play_button.clicked.connect(lambda _checked=False, media_player=player: self._toggle_video(media_player))
+                actions.addWidget(play_button)
+                open_button = QPushButton("Abrir")
+                open_button.setObjectName("chatImageAction")
+                open_button.clicked.connect(lambda _checked=False, video_path=path: self._open_media(video_path))
+                actions.addWidget(open_button)
+                save_button = QPushButton("Salvar como...")
+                save_button.setObjectName("chatImageAction")
+                save_button.clicked.connect(lambda _checked=False, video_path=path: self._save_media_as(video_path))
+                actions.addWidget(save_button)
+                actions.addStretch()
+                layout.addLayout(actions)
+                continue
             attachment_name = QLabel(f"Anexo: {path.name}")
             attachment_name.setObjectName("chatAttachmentName")
             attachment_name.setWordWrap(True)
@@ -393,10 +438,43 @@ class ChatBubble(QFrame):
         sender.setObjectName("chatMeta")
         layout.addWidget(sender)
 
+    def _open_image(self, path: Path):
+        self._open_media(path)
+
+    def _open_media(self, path: Path):
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve()))):
+            QMessageBox.warning(self, "Merotec IA", "Não foi possível abrir a mídia.")
+
+    def _save_image_as(self, path: Path):
+        self._save_media_as(path, "Salvar imagem gerada", "Imagens PNG (*.png);;Todos os arquivos (*.*)")
+
+    def _save_media_as(self, path: Path, title="Salvar vídeo gerado", filters="Vídeos (*.mp4 *.webm *.mov *.mkv *.avi);;Todos os arquivos (*.*)"):
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            title,
+            str(Path.home() / path.name),
+            filters,
+        )
+        if not filename:
+            return
+        try:
+            shutil.copy2(path, filename)
+        except OSError as exc:
+            QMessageBox.warning(self, "Merotec IA", f"Não foi possível salvar a mídia.\n{exc}")
+
+    @staticmethod
+    def _toggle_video(player):
+        if player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            player.pause()
+        else:
+            player.play()
+
 
 class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
     chat_reply = Signal(str)
     chat_stream = Signal(str)
+    image_generation_finished = Signal(str, str)
+    video_generation_finished = Signal(str, str)
     browser_action_requested = Signal(str, object, object)
 
     def __init__(self):
@@ -410,6 +488,9 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self._apply_settings_to_environment()
         self.current_workspace = str(self._initial_workspace())
         self.workspace = Path(self.current_workspace)
+        # ``projects`` e a pasta que abriga projetos, nao um projeto aberto.
+        # O estado separado evita que o explorer pareca reabrir um projeto ao fecha-lo.
+        self.project_open = self.workspace.resolve() != PROJECTS_DIR.resolve()
         self.terminal_working_directory = self.workspace
         self.memory_subnet = MemorySubnet(self.current_workspace)
         self.engine = UniversalEngine()
@@ -431,9 +512,19 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self._terminal_session_queue = []
         self._terminal_session_interactive = False
         self.pending_attachments = []
+        self.video_cancel_event = threading.Event()
+        self._next_video_generation_options = {}
         self.chat_busy = False
+        self.codex_login_started = False
         self.chat_started_at = None
         self.chat_last_activity = ""
+        # O app-server do Codex usa uma thread efemera por rodada. Sem uma
+        # janela de contexto local, a proxima mensagem chegava como se fosse
+        # uma conversa nova, mesmo com a IDE ainda aberta.
+        self.active_ai_objective = ""
+        self.ai_context_memory = []
+        self.last_response = ""
+        self.restore_workspace_ai_context_memory()
         self.speech_active = False
         self.streaming_bubble = None
         self.streaming_text = ""
@@ -584,6 +675,34 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
     def add_chat_message(self, sender, text):
         self.ui_bridge.call_soon(lambda: self.add_chat(sender, text, sender.lower() in {"voce", "você"}))
 
+    def add_chat_image_message(self, sender, image_path, text=""):
+        """Publica uma imagem produzida pelo agente como anexo visível no chat.
+
+        O fluxo de ações do agente chama este contrato para screenshots e
+        imagens geradas. A versão Qt tinha somente ``add_chat_message``, por
+        isso o callback terminava sem entregar o arquivo ao ``ChatBubble``.
+        """
+        path = Path(image_path)
+        if not self._is_image_attachment(path):
+            self.add_chat_attachment_message(sender, path, text)
+            return
+        note = f"{text}\n[imagem anexada: {path.name}]" if text else f"[imagem anexada: {path.name}]"
+        self._remember_ai_context_message(sender, note)
+        outgoing = str(sender or "").lower() in {"voce", "você"}
+        self.ui_bridge.call_soon(
+            lambda: self.add_chat(sender, text, outgoing, attachments=[path])
+        )
+
+    def add_chat_attachment_message(self, sender, file_path, text=""):
+        """Mantém anexos não visuais rastreáveis no mesmo fluxo do chat."""
+        path = Path(file_path)
+        note = f"{text}\n[arquivo anexado: {path.name}]" if text else f"[arquivo anexado: {path.name}]"
+        self._remember_ai_context_message(sender, note)
+        outgoing = str(sender or "").lower() in {"voce", "você"}
+        self.ui_bridge.call_soon(
+            lambda: self.add_chat(sender, text or f"Anexo: {path.name}", outgoing, attachments=[path])
+        )
+
     def plugin_services(self):
         return {"app": self, "settings": self.settings, "workspace": self.current_workspace, "engine": self.engine, "voice": self.voice, "project_manager": self.pm, "executor": self.executor}
 
@@ -638,6 +757,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
                 current.addAction("Abrir pasta...", self.choose_workspace)
                 current.addAction("Abrir arquivo...", self.open_external_file, QKeySequence.StandardKey.Open)
                 current.addAction("Novo projeto...", self.create_project, "Ctrl+Shift+N")
+                current.addAction("Fechar projeto", self.close_project, "Ctrl+Shift+W")
                 self.recent_menu = current.addMenu("Projetos recentes")
                 self.update_recent_menu()
                 current.addAction("Novo arquivo", self.new_file)
@@ -761,11 +881,16 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.tree.doubleClicked.connect(self.open_index)
         for column in range(1, 4):
             self.tree.hideColumn(column)
+        self.tree.setVisible(self.project_open)
         layout.addWidget(self.tree, 1)
         return panel
 
     def _update_workspace_root_label(self):
         if not hasattr(self, "workspace_root_label"):
+            return
+        if not getattr(self, "project_open", True):
+            self.workspace_root_label.setText("Nenhum projeto aberto")
+            self.workspace_root_label.setToolTip("Use Arquivo > Abrir projeto para selecionar uma pasta.")
             return
         self.workspace_root_label.setText(f"📁  {self.workspace.name or str(self.workspace)}")
         self.workspace_root_label.setToolTip(str(self.workspace))
@@ -877,8 +1002,8 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.attach_button = QPushButton()
         self.attach_button.setObjectName("attachButton")
         self.attach_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogStart))
-        self.attach_button.setToolTip("Anexar arquivos")
-        self.attach_button.clicked.connect(self.add_attachments)
+        self.attach_button.setToolTip("Adicionar arquivo ou gerar imagem")
+        self.attach_button.clicked.connect(self.show_attachment_menu)
         composer.addWidget(self.attach_button)
         self.voice_button = QPushButton()
         self.voice_button.setObjectName("attachButton")
@@ -945,6 +1070,8 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
     def _connect_signals(self):
         self.chat_reply.connect(self.finish_chat_reply)
         self.chat_stream.connect(self.append_chat_stream)
+        self.image_generation_finished.connect(self.finish_image_generation)
+        self.video_generation_finished.connect(self.finish_video_generation)
         # Ação emitida pelo worker do agente: sempre volte ao event loop Qt
         # antes de consultar ou controlar o QWebEngineView.
         self.browser_action_requested.connect(
@@ -964,6 +1091,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         if getattr(self, "_visual_test_active", False):
             self.add_chat("Sistema", "Ja existe um teste visual em andamento.")
             return False
+        self._close_visual_test_preview()
         plan = self._build_visual_test_plan(request)
         if not plan:
             self.add_chat("Erro", "Nao encontrei um alvo visual seguro para testar neste projeto.")
@@ -974,22 +1102,209 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         threading.Thread(target=self._run_human_test, args=(plan,), daemon=True).start()
         return True
 
+    def _close_visual_test_preview(self):
+        """Fecha a prévia anterior e seu servidor antes de iniciar outro teste."""
+        window = getattr(self, "_visual_test_browser_window", None)
+        if window is not None:
+            self.ui_bridge.call_soon(window.close)
+        process = getattr(self, "_visual_test_server_process", None)
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        self._visual_test_server_process = None
+
+    def _find_visual_html_target(self, workspace, request=""):
+        """Encontra a página HTML mais adequada, inclusive em subprojetos.
+
+        O workspace da IDE pode ser um repositório Python que contém vários
+        exemplos web. O teste visual deve abrir a página do subprojeto, nunca
+        uma página incidental de cache, perfil do navegador ou dependência.
+        """
+        workspace = Path(workspace).resolve()
+        objective = " ".join((str(request or ""), str(getattr(self, "_chat_task_prompt", "") or ""))).lower()
+        requested_files = re.findall(r"[^\s\"']+\.html?\b", objective)
+        candidates = []
+
+        for root, directories, filenames in os.walk(workspace):
+            directories[:] = [
+                name for name in directories
+                if not is_ignored_dir_name(name)
+                and name not in {".visual-profile", ".merotec_attachments", ".merotec_backups"}
+            ]
+            base = Path(root)
+            for filename in filenames:
+                if Path(filename).suffix.lower() not in {".html", ".htm"}:
+                    continue
+                path = base / filename
+                try:
+                    relative = path.relative_to(workspace).as_posix().lower()
+                except ValueError:
+                    continue
+                score = 0
+                if path.name.lower() == "index.html":
+                    score += 100
+                if path.parent == workspace:
+                    score += 30
+                if any(relative.endswith(name.replace("\\", "/")) for name in requested_files):
+                    score += 300
+                for term in re.findall(r"[a-z0-9_-]{3,}", objective):
+                    if term in relative:
+                        score += 12
+                score -= len(path.relative_to(workspace).parts)
+                candidates.append((score, relative, path))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        return candidates[0][2]
+
+    @staticmethod
+    def _allocate_visual_test_port():
+        """Reserva uma porta livre apenas para montar o comando de teste."""
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+    @staticmethod
+    def _requested_local_visual_url(request, objective=""):
+        """Retorna uma URL loopback já informada para um servidor em execução."""
+        text = " ".join((str(request or ""), str(objective or "")))
+        match = re.search(
+            r"https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?(?:/[^\s\]>)},;]*)?",
+            text,
+            re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        url = match.group(0).rstrip(".,;:!?")
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"}:
+            return ""
+        if (parsed.hostname or "").lower() not in {"localhost", "127.0.0.1", "::1"}:
+            return ""
+        return url
+
+    @staticmethod
+    def _find_visual_server_target(workspace):
+        """Identifica o entrypoint de um servidor web local do projeto.
+
+        A preferência por um servidor real evita renderizar templates Flask ou
+        Django como HTML estático, o que ocultava rotas, dados e erros visuais.
+        """
+        workspace = Path(workspace).resolve()
+        candidates = []
+        for root, directories, filenames in os.walk(workspace):
+            directories[:] = [
+                name for name in directories
+                if not is_ignored_dir_name(name)
+                and name not in {".visual-profile", ".merotec_attachments", ".merotec_backups"}
+            ]
+            base = Path(root)
+            for filename in filenames:
+                path = base / filename
+                if path.name == "manage.py":
+                    candidates.append((320, path, "django", ""))
+                    continue
+                if path.suffix.lower() != ".py" or path.name.startswith("test_"):
+                    continue
+                try:
+                    source = path.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                score = 80 if path.parent == workspace else 0
+                if path.name in {"app.py", "main.py", "server.py"}:
+                    score += 40
+                flask = re.search(
+                    r"^\s*([A-Za-z_]\w*)\s*=\s*(?:flask\.)?Flask\s*\(",
+                    source,
+                    re.MULTILINE,
+                )
+                if flask and re.search(r"(?:^|\n)\s*(?:from\s+flask\s+import|import\s+flask\b)", source):
+                    candidates.append((score + 180, path, "flask", flask.group(1)))
+                    continue
+                fastapi = re.search(
+                    r"^\s*([A-Za-z_]\w*)\s*=\s*FastAPI\s*\(",
+                    source,
+                    re.MULTILINE,
+                )
+                if fastapi and re.search(r"(?:^|\n)\s*(?:from\s+fastapi\s+import|import\s+fastapi\b)", source):
+                    candidates.append((score + 180, path, "fastapi", fastapi.group(1)))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (-item[0], item[1].as_posix().lower()))
+        _score, path, framework, application = candidates[0]
+        return {"path": path, "framework": framework, "application": application}
+
+    def _build_visual_server_plan(self, workspace, request):
+        """Cria um plano de navegador para servidor existente ou detectado."""
+        existing_url = self._requested_local_visual_url(
+            request,
+            getattr(self, "_chat_task_prompt", ""),
+        )
+        if existing_url:
+            return {
+                "kind": "browser",
+                "command": None,
+                "display": f"navegador interno em servidor local já ativo ({existing_url})",
+                "cwd": workspace,
+                "url": existing_url,
+                "keep_open": True,
+            }
+
+        target = self._find_visual_server_target(workspace)
+        if target is None:
+            return None
+        port = self._allocate_visual_test_port()
+        path = target["path"]
+        framework = target["framework"]
+        if framework == "django":
+            command = [sys.executable, "-u", path.name, "runserver", f"127.0.0.1:{port}", "--noreload"]
+            url = f"http://127.0.0.1:{port}/"
+        elif framework == "flask":
+            module = path.relative_to(workspace).with_suffix("").as_posix().replace("/", ".")
+            command = [
+                sys.executable, "-u", "-m", "flask", "--app", f"{module}:{target['application']}",
+                "run", "--host", "127.0.0.1", "--port", str(port),
+            ]
+            url = f"http://127.0.0.1:{port}/"
+        else:
+            module = path.relative_to(workspace).with_suffix("").as_posix().replace("/", ".")
+            command = [
+                sys.executable, "-u", "-m", "uvicorn", f"{module}:{target['application']}",
+                "--host", "127.0.0.1", "--port", str(port),
+            ]
+            url = f"http://127.0.0.1:{port}/docs"
+        return {
+            "kind": "browser",
+            "command": command,
+            "display": f"{framework} em 127.0.0.1:{port} ({path.relative_to(workspace).as_posix()})",
+            "cwd": workspace,
+            "url": url,
+            "keep_open": True,
+        }
+
     def _build_visual_test_plan(self, request):
         workspace = self.workspace.resolve()
-        html_target = workspace / "index.html"
-        if not html_target.exists():
-            html_target = next(workspace.glob("*.html"), None)
+        server_plan = self._build_visual_server_plan(workspace, request)
+        if server_plan is not None:
+            return server_plan
+        html_target = self._find_visual_html_target(workspace, request)
         if html_target and html_target.is_file():
-            import socket
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.bind(("127.0.0.1", 0))
-                port = sock.getsockname()[1]
+            port = self._allocate_visual_test_port()
+            html_workspace = html_target.parent
             return {
                 "kind": "browser",
                 "command": [sys.executable, "-u", "-m", "http.server", str(port), "--bind", "127.0.0.1"],
-                "display": f"{Path(sys.executable).name} -m http.server {port} --bind 127.0.0.1",
-                "cwd": workspace,
+                "display": f"{Path(sys.executable).name} -m http.server {port} --bind 127.0.0.1 ({html_target.relative_to(workspace).as_posix()})",
+                "cwd": html_workspace,
                 "url": f"http://127.0.0.1:{port}/{html_target.name}",
+                "keep_open": True,
             }
         target = workspace / "app.py"
         if not target.exists():
@@ -1007,22 +1322,27 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
     def _run_human_test(self, plan):
         process = None
         try:
-            kwargs = {
-                "cwd": str(plan["cwd"]),
-                "stdout": subprocess.PIPE,
-                "stderr": subprocess.STDOUT,
-                "text": True,
-                "encoding": "utf-8",
-                "errors": "replace",
-            }
-            if os.name == "nt":
-                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-            process = subprocess.Popen(plan["command"], **kwargs)
+            if plan.get("command"):
+                kwargs = {
+                    "cwd": str(plan["cwd"]),
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.STDOUT,
+                    "text": True,
+                    "encoding": "utf-8",
+                    "errors": "replace",
+                }
+                if os.name == "nt":
+                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                process = subprocess.Popen(plan["command"], **kwargs)
+            keep_process = False
             if plan["kind"] == "browser":
                 if not self._wait_for_visual_url(plan["url"]):
                     output = self._drain_visual_process_output(process)
                     raise RuntimeError(output or "O servidor local nao respondeu.")
-                image_path = self._capture_qt_visual_browser(plan["url"])
+                image_path = self._capture_qt_visual_browser(plan["url"], keep_open=plan.get("keep_open", False))
+                if plan.get("keep_open"):
+                    self._visual_test_server_process = process
+                    keep_process = True
             else:
                 image_path = self._capture_visual_window(process.pid)
                 if image_path is None:
@@ -1032,7 +1352,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         except Exception as exc:
             self.ui_bridge.call_soon(lambda detail=str(exc): self._finish_human_test(None, detail))
         finally:
-            if process and process.poll() is None:
+            if process and process.poll() is None and not locals().get("keep_process", False):
                 process.terminate()
                 try:
                     process.wait(timeout=3)
@@ -1060,7 +1380,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
                 time.sleep(0.2)
         return False
 
-    def _capture_qt_visual_browser(self, url, timeout=25.0):
+    def _capture_qt_visual_browser(self, url, timeout=25.0, keep_open=False):
         """Abre uma página local em uma janela Qt e retorna sua captura real.
 
         O executor anterior dependia de um processo ``pywebview`` separado. Em
@@ -1134,7 +1454,8 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
                                 return
                         finish(path=destination)
                     finally:
-                        QTimer.singleShot(250, close_preview)
+                        if not keep_open:
+                            QTimer.singleShot(250, close_preview)
 
                 def schedule_capture(delay):
                     nonlocal capture_scheduled
@@ -1162,9 +1483,16 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
                     # o evento de navegação do QWebEngine.
                     schedule_capture(850)
 
-                window.destroyed.connect(
-                    lambda *_args: setattr(self, "_visual_test_browser_window", None)
-                )
+                def preview_closed(*_args):
+                    if getattr(self, "_visual_test_browser_window", None) is not window:
+                        return
+                    self._visual_test_browser_window = None
+                    process = getattr(self, "_visual_test_server_process", None)
+                    if process is not None and process.poll() is None:
+                        process.terminate()
+                    self._visual_test_server_process = None
+
+                window.destroyed.connect(preview_closed)
                 view.loadFinished.connect(page_loaded)
                 window.show()
                 window.raise_()
@@ -1842,6 +2170,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             if choice != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+        self._close_visual_test_preview()
         self._shutdown_terminal_processes()
         try:
             self.voice.stop()
@@ -1918,22 +2247,94 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.open_workspace(project)
         self.add_chat("Sistema", f"Projeto criado e aberto: {project}")
 
+    def close_project(self):
+        """Fecha as abas pertencentes ao projeto e retorna à pasta neutra."""
+        workspace = self.workspace.resolve()
+        neutral_workspace = PROJECTS_DIR.resolve()
+        if workspace == neutral_workspace:
+            self.set_status("Nenhum projeto aberto.")
+            return
+
+        project_tabs = []
+        for index, path in self.paths_by_tab.items():
+            try:
+                Path(path).resolve().relative_to(workspace)
+            except ValueError:
+                continue
+            project_tabs.append(index)
+
+        dirty_tabs = [
+            self.tabs.tabText(index).removesuffix(" *")
+            for index in project_tabs
+            if self.tabs.tabText(index).endswith(" *")
+        ]
+        if dirty_tabs:
+            names = ", ".join(dirty_tabs[:4])
+            if len(dirty_tabs) > 4:
+                names += f" e mais {len(dirty_tabs) - 4}"
+            choice = QMessageBox.question(
+                self,
+                "Merotec IA",
+                f"Fechar o projeto sem salvar as abas alteradas?\n{names}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if choice != QMessageBox.StandardButton.Yes:
+                return
+
+        removed = set(project_tabs)
+        for index in sorted(removed, reverse=True):
+            self.tabs.removeTab(index)
+        self.paths_by_tab = {
+            index - sum(1 for removed_index in removed if removed_index < index): path
+            for index, path in self.paths_by_tab.items()
+            if index not in removed
+        }
+
+        neutral_workspace.mkdir(parents=True, exist_ok=True)
+        self.workspace = neutral_workspace
+        self.current_workspace = str(neutral_workspace)
+        self.project_open = False
+        self.terminal_working_directory = neutral_workspace
+        self.memory_subnet.reset_workspace(neutral_workspace)
+        self.restore_workspace_ai_context_memory(neutral_workspace)
+        # O usuario fechou o projeto explicitamente: nao restaure um projeto
+        # automaticamente na proxima abertura da IDE.
+        self.settings["last_workspace"] = ""
+        self.settings["start_without_project"] = True
+        self._save_settings()
+        self.update_recent_menu()
+        self._update_workspace_root_label()
+        self.refresh_tree()
+        self.append_terminal(f"\nProjeto fechado: {workspace.name}\n")
+        self._terminal_prompt()
+        self.add_chat("Sistema", f"Projeto fechado: {workspace.name}. Abra um projeto para continuar.")
+        self.set_status("Projeto fechado. Selecione um projeto para continuar.")
+
     def open_workspace(self, folder):
         self.workspace = Path(folder).resolve()
+        self.project_open = True
         self.terminal_working_directory = self.workspace
         self.current_workspace = str(self.workspace)
         self.memory_subnet.reset_workspace(self.workspace)
+        self.restore_workspace_ai_context_memory(self.workspace)
+        self.settings["start_without_project"] = False
         self.settings["last_workspace"] = self.current_workspace
         self.settings["recent_projects"] = [self.current_workspace, *[item for item in self.settings.get("recent_projects", []) if item != self.current_workspace]][:10]
         self._save_settings()
         self.update_recent_menu()
         self._update_workspace_root_label()
         self.model.setRootPath(self.current_workspace)
+        self.tree.setVisible(True)
         self.tree.setRootIndex(self.file_filter.mapFromSource(self.model.index(self.current_workspace)))
         self.append_terminal(f"\nPasta aberta: {self.workspace}\n")
         self._terminal_prompt()
 
     def refresh_tree(self):
+        if not getattr(self, "project_open", True):
+            self.tree.setVisible(False)
+            self.tree.setRootIndex(QModelIndex())
+            return
+        self.tree.setVisible(True)
         self.model.setRootPath("")
         self.model.setRootPath(str(self.workspace))
         self.tree.setRootIndex(self.file_filter.mapFromSource(self.model.index(str(self.workspace))))
@@ -2442,6 +2843,8 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.chat_input.setEnabled(not busy)
         self.send_button.setEnabled(not busy)
         self.attach_button.setEnabled(not busy)
+        if hasattr(self, "image_button"):
+            self.image_button.setEnabled(not busy)
         self._set_button_state(self.send_button, busy=busy)
         self._set_button_state(self.cancel_button, active=busy)
         self.cancel_button.setVisible(busy)
@@ -2527,6 +2930,27 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
                 queued.add(key)
         self.render_attachments()
 
+    def show_attachment_menu(self):
+        """Exibe as ações de anexo em uma lista vertical junto ao compositor."""
+        menu = QMenu(self)
+        menu.setObjectName("attachmentMenu")
+        attach_action = menu.addAction(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon),
+            "Anexar arquivo...",
+        )
+        image_action = menu.addAction(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView),
+            "Gerar imagem com IA...",
+        )
+        video_action = menu.addAction(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay),
+            "Gerar vídeo com IA...",
+        )
+        attach_action.triggered.connect(self.add_attachments)
+        image_action.triggered.connect(self.request_image_generation)
+        video_action.triggered.connect(self.request_video_generation)
+        menu.exec(self.attach_button.mapToGlobal(self.attach_button.rect().topLeft()))
+
     def clear_attachments(self):
         self.pending_attachments = []
         self.render_attachments()
@@ -2580,9 +3004,35 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self._chat_write_staging = {}
         self.chat_input.clear()
         self.add_chat("Voce", prompt, True, attachments)
+        self._remember_ai_context_message("Voce", prompt)
+        if not self._is_direct_chat_request(prompt) and not self._is_chat_continuation_request(prompt):
+            self.active_ai_objective = prompt
+            self.persist_workspace_ai_context_memory()
         if attachments:
             self.clear_attachments()
         self.set_status("Merotec IA pensando...")
+        if self._is_image_generation_request(prompt):
+            self.streaming_text = ""
+            self.streaming_bubble = None
+            self.activity_bubble = self.add_chat("Atividade da IA", "• Gerando imagem...")
+            self.activity_lines = ["• Gerando imagem..."]
+            threading.Thread(target=self._generate_image, args=(prompt,), daemon=True).start()
+            return
+        if self._is_video_generation_request(prompt):
+            self.streaming_text = ""
+            self.streaming_bubble = None
+            reference_image = next((path for path in attachments if self._is_image_attachment(path)), None)
+            self.video_cancel_event = threading.Event()
+            video_options = dict(getattr(self, "_next_video_generation_options", {}) or {})
+            self._next_video_generation_options = {}
+            self.activity_bubble = self.add_chat("Atividade da IA", "• Preparando geração de vídeo...")
+            self.activity_lines = ["• Preparando geração de vídeo..."]
+            threading.Thread(
+                target=self._generate_video,
+                args=(prompt, reference_image, video_options, self.video_cancel_event),
+                daemon=True,
+            ).start()
+            return
         editor = self.current_editor()
         direct_conversation = self._is_direct_chat_request(prompt)
         # Perguntas comuns não precisam copiar o documento inteiro antes de
@@ -2601,15 +3051,140 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.activity_lines = ["• Preparando a tarefa..."]
         threading.Thread(target=self._generate_reply, args=(prompt, "\n\n".join(context_parts), image), daemon=True).start()
 
+    def request_image_generation(self):
+        prompt, accepted = QInputDialog.getMultiLineText(
+            self,
+            "Gerar imagem",
+            "Descreva a imagem que deseja criar:",
+        )
+        if not accepted or not prompt.strip() or self.chat_busy:
+            return
+        self.chat_input.setPlainText(f"Gere uma imagem: {prompt.strip()}")
+        self.send_chat()
+
+    def request_video_generation(self):
+        prompt, accepted = QInputDialog.getMultiLineText(
+            self,
+            "Gerar vídeo",
+            "Descreva o vídeo. Anexe uma imagem antes para usá-la como referência:",
+        )
+        if not accepted or not prompt.strip() or self.chat_busy:
+            return
+        aspect_ratio, accepted = QInputDialog.getItem(
+            self, "Gerar vídeo", "Formato:", ["16:9", "9:16", "1:1"], 0, False
+        )
+        if not accepted:
+            return
+        duration_seconds, accepted = QInputDialog.getInt(
+            self, "Gerar vídeo", "Duração (segundos):", 5, 1, 30
+        )
+        if not accepted:
+            return
+        quality, accepted = QInputDialog.getItem(
+            self, "Gerar vídeo", "Qualidade (o workflow decide como aplicar):", ["standard", "high"], 0, False
+        )
+        if not accepted:
+            return
+        self._next_video_generation_options = {
+            "aspect_ratio": aspect_ratio,
+            "duration_seconds": duration_seconds,
+            "quality": quality,
+        }
+        self.chat_input.setPlainText(f"Gere um vídeo: {prompt.strip()}")
+        self.send_chat()
+
+    @staticmethod
+    def _is_image_generation_request(prompt):
+        text = " ".join(str(prompt or "").casefold().split())
+        return bool(re.match(
+            r"^(?:gere|gerar|crie|criar|faça|faca|produza|desenhe|imagine)\s+(?:uma\s+)?imagem(?:\s|:|$)",
+            text,
+        ))
+
+    @staticmethod
+    def _is_video_generation_request(prompt):
+        text = " ".join(str(prompt or "").casefold().split())
+        return bool(re.match(
+            r"^(?:gere|gerar|crie|criar|faça|faca|produza|anime|renderize)\s+(?:um\s+)?v[ií]deo(?:\s|:|$)",
+            text,
+        ))
+
+    def _generate_image(self, prompt):
+        try:
+            output_dir = self.workspace / ".merotec_system_ai" / "generated_images"
+            path = self.engine.generate_image(prompt, output_dir)
+            self.image_generation_finished.emit(str(path), "")
+        except Exception as exc:
+            self.image_generation_finished.emit("", str(exc))
+
+    def finish_image_generation(self, image_path, error):
+        self._set_chat_busy(False)
+        if error:
+            self._append_chat_activity("Geração de imagem indisponível.")
+            self.add_chat("Erro", error)
+            self.set_status("Pronto")
+            return
+        path = Path(image_path)
+        self._append_chat_activity("Imagem pronta no chat.")
+        self.last_response = "Imagem gerada. Use Abrir ou Salvar como... abaixo da prévia."
+        self._remember_ai_context_message("Merotec IA", self.last_response)
+        self.add_chat("Merotec IA", self.last_response, attachments=[path])
+        self.set_status("Imagem gerada.")
+
+    def _generate_video(self, prompt, reference_image, options, cancel_event):
+        try:
+            clean_prompt = re.sub(
+                r"^(?:gere|gerar|crie|criar|faça|faca|produza|anime|renderize)\s+(?:um\s+)?v[ií]deo\s*:\s*",
+                "",
+                prompt.strip(),
+                flags=re.IGNORECASE,
+            ).strip() or prompt.strip()
+            service = VideoGenerationService(self.settings)
+            request = VideoGenerationRequest(
+                prompt=clean_prompt,
+                reference_image=reference_image,
+                aspect_ratio=str(options.get("aspect_ratio") or "16:9"),
+                duration_seconds=int(options.get("duration_seconds") or 5),
+                quality=str(options.get("quality") or "standard"),
+            )
+            output_dir = self.workspace / ".merotec_system_ai" / "generated_videos"
+            path = service.generate(
+                request,
+                output_dir,
+                progress_callback=lambda message: self.chat_stream.emit(f"[ATIVIDADE] {message}"),
+                cancel_event=cancel_event,
+            )
+            self.video_generation_finished.emit(str(path), "")
+        except Exception as exc:
+            self.video_generation_finished.emit("", str(exc))
+
+    def finish_video_generation(self, video_path, error):
+        self._set_chat_busy(False)
+        if error:
+            if self.video_cancel_event.is_set() or "cancelada" in error.casefold():
+                self._append_chat_activity("Geração de vídeo cancelada.")
+            else:
+                self._append_chat_activity("Geração de vídeo indisponível.")
+                self.add_chat("Erro", error)
+            self.set_status("Pronto")
+            return
+        path = Path(video_path)
+        self._append_chat_activity("Vídeo pronto no chat.")
+        self.last_response = "Vídeo gerado. Use Reproduzir, Abrir ou Salvar como... abaixo da prévia."
+        self._remember_ai_context_message("Merotec IA", self.last_response)
+        self.add_chat("Merotec IA", self.last_response, attachments=[path])
+        self.set_status("Vídeo gerado.")
+
     def _generate_reply(self, prompt, context, image_path=None):
         try:
             direct_conversation = self._is_direct_chat_request(prompt)
+            continuity_context = self.build_chat_continuity_context(prompt)
             if direct_conversation:
                 self.chat_stream.emit("[ATIVIDADE] Preparando conversa direta...")
                 # Perguntas e mensagens comuns não devem receber uma árvore de
                 # arquivos nem o protocolo de agente; isso fazia o modelo ler
                 # o projeto antes de simplesmente responder ao usuário.
-                smart_context = context
+                smart_context = "\n\n".join(part for part in (context, continuity_context) if part)
                 provider_prompt = "[MEROTEC_DIRECT_CHAT]\n" + prompt
             else:
                 self.chat_stream.emit("[ATIVIDADE] Montando o contexto do editor e do projeto...")
@@ -2618,13 +3193,33 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
                     self.build_smart_task_brief(prompt, objective=prompt),
                     self.build_project_intelligence_context(),
                     f"Arquivos do workspace:\n{self.get_workspace_tree()}",
+                    continuity_context,
                 ] if part)
                 provider_prompt = prompt
             self.chat_stream.emit("[ATIVIDADE] Enviando a tarefa para o provedor de IA...")
             reply = self.engine.generate_solution(provider_prompt, image_path=str(image_path) if image_path else None, code_context=smart_context, stream_callback=self.chat_stream.emit, workspace_path=self.current_workspace)
+            self._deliver_generated_chat_image(
+                getattr(self.engine, "latest_generated_image_paths", None)
+                or getattr(self.engine, "latest_generated_image_path", "")
+            )
         except Exception as exc:
             reply = f"Nao foi possivel consultar o provedor configurado: {exc}"
         self.chat_reply.emit(reply or "Nao recebi uma resposta do provedor configurado.")
+
+    def _deliver_generated_chat_image(self, image_paths):
+        """Entrega no chat cada artefato imagegen retornado na resposta atual."""
+        if isinstance(image_paths, (str, Path)):
+            image_paths = [image_paths]
+        delivered = set()
+        for image_path in image_paths or []:
+            path = Path(image_path) if image_path else None
+            if path is None or not path.is_file() or not self._is_image_attachment(path):
+                continue
+            key = str(path.resolve()).casefold()
+            if key in delivered:
+                continue
+            delivered.add(key)
+            self.add_chat_image_message("Merotec IA", path, "Imagem gerada pelo Codex.")
 
     @staticmethod
     def _is_direct_chat_request(prompt):
@@ -2639,6 +3234,67 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             ".py", ".js", ".ts", ".html", ".css", ".json", "/", "\\",
         )
         return not any(marker in text for marker in project_markers)
+
+    @staticmethod
+    def _is_chat_continuation_request(prompt):
+        """Reconhece pedidos curtos que dependem da tarefa em andamento."""
+        normalized = " ".join(str(prompt or "").casefold().split())
+        if normalized in {
+            "continue", "continua", "continuar", "prossiga", "segue", "siga",
+            "continue dai", "continue daqui", "continue de onde parou",
+            "termine", "finalize", "conclua", "faca isso", "faça isso", "faz isso",
+            "corrija isso", "aplique isso", "tente novamente", "repetir",
+        }:
+            return True
+        return any(marker in normalized for marker in (
+            "continue de onde", "continua de onde", "termine a tarefa",
+            "finalize a tarefa", "conclua a tarefa", "retome a missao",
+            "retome o projeto", "volte ao projeto",
+        ))
+
+    def _remember_ai_context_message(self, author, message, max_chars=2200):
+        """Mantem somente o historico util que precisa atravessar rodadas."""
+        text = " ".join(str(message or "").split()).strip()
+        if not text:
+            return
+        if len(text) > max_chars:
+            text = text[: max_chars - 3].rstrip() + "..."
+        self.ai_context_memory.append({"author": str(author or "Mensagem"), "text": text})
+        self.ai_context_memory = self.ai_context_memory[-24:]
+        self.persist_workspace_ai_context_memory()
+
+    def build_chat_continuity_context(self, current_prompt, limit=12, max_chars=6000):
+        """Reconstrui o contexto para provedores que nao mantem a thread viva."""
+        messages = self.ai_context_memory[-limit:]
+        lines = []
+        used = 0
+        for item in messages:
+            line = f"- {item.get('author', 'Mensagem')}: {item.get('text', '')}"
+            if not item.get("text"):
+                continue
+            if used + len(line) > max_chars:
+                lines.append("- Historico anterior reduzido pela IDE para caber no contexto.")
+                break
+            lines.append(line)
+            used += len(line)
+        if not lines and not self.active_ai_objective:
+            return ""
+        sections = [
+            "CONTINUIDADE DA CONVERSA NA MESMA SESSAO:",
+            "A thread do provedor pode ser efemera; trate este bloco como o historico confiavel da conversa atual.",
+        ]
+        if self.active_ai_objective:
+            sections.append(f"Missao ativa mais recente: {self.active_ai_objective}")
+        if self.last_response:
+            sections.append(f"Ultima resposta da IA: {self.last_response[-1600:]}")
+        if lines:
+            sections.append("Mensagens recentes:\n" + "\n".join(lines))
+        sections.append(
+            f"Pedido atual: {current_prompt}\n"
+            "Priorize o pedido atual quando ele mudar de assunto; se ele for uma continuidade, use a missao e o historico acima. "
+            "Nunca alegue que nao ha conversa anterior sem antes considerar este bloco."
+        )
+        return "\n\n".join(sections)
 
     def get_workspace_tree(self, limit=220):
         paths = []
@@ -2670,6 +3326,8 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
     def cancel_ai_task(self):
         if not self.chat_busy:
             return
+        if hasattr(self, "video_cancel_event"):
+            self.video_cancel_event.set()
         self.engine.cancel_generation()
         self.streaming_bubble = None
         self._set_chat_busy(False)
@@ -2738,8 +3396,58 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.activity_bubble.label.setText("\n".join(self.activity_lines))
         self._follow_chat_scroll_if_needed(should_follow)
 
+    @staticmethod
+    def _is_unactionable_browser_preamble(reply):
+        """Identifica o fallback narrado que nao emite uma acao da IDE."""
+        text = " ".join(str(reply or "").casefold().split())
+        if not text:
+            return False
+        has_action = bool(re.search(
+            r"\[(?:read|search_text|write|replace|patch|execute|open_url|browser_inspect|"
+            r"browser_click|browser_type|browser_scroll|screenshot|human_test)\s*:",
+            text,
+            re.IGNORECASE,
+        ))
+        if has_action:
+            return False
+        mentions_browser = "navegador" in text and (
+            "controle do navegador" in text
+            or "navegador interno" in text
+            or "browser control" in text
+        )
+        unavailable = any(marker in text for marker in (
+            "nao esta disponivel",
+            "não está disponível",
+            "indisponivel nesta sessao",
+            "indisponível nesta sessão",
+        ))
+        fallback = any(marker in text for marker in (
+            "navegador instalado localmente",
+            "browser installed locally",
+            "validar a renderizacao",
+            "validar a renderização",
+        ))
+        return mentions_browser and (unavailable or fallback)
+
+    def _recover_unactionable_browser_preamble(self, reply):
+        """Converte a narracao de fallback em um teste visual local real."""
+        if not self._is_unactionable_browser_preamble(reply):
+            return False
+        if self._chat_agent_round >= 12 or getattr(self, "_visual_test_active", False):
+            return False
+        self._append_chat_activity(
+            "Resposta sem acao de navegador ignorada; iniciando teste visual local."
+        )
+        if not self.start_human_test("auto"):
+            return False
+        if self.streaming_bubble:
+            self.streaming_bubble.label.setText("Teste visual local em andamento...")
+            self.streaming_bubble = None
+        return True
+
     def finish_chat_reply(self, reply):
         self.last_response = reply
+        self._remember_ai_context_message("Merotec IA", reply)
         actions = self._apply_agent_reply_actions(reply)
         if actions is not None:
             self._chat_pending_validation_paths.update(
@@ -2764,6 +3472,8 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
                 return
             if actions.changed_paths and self._start_automatic_validation(actions.changed_paths):
                 return
+        if self._recover_unactionable_browser_preamble(reply):
+            return
         # READ/SEARCH/WRITE/PATCH são passos intermediários. A versão PySide
         # antes parava aqui, então a IA só conseguia ler arquivos. Reenviamos
         # o resultado à mesma conversa para ela concluir a tarefa.
@@ -3098,6 +3808,59 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             self.provider_label.setText(self.engine.provider)
             self.set_status("Configuracoes salvas.")
 
+    def launch_codex_login(self):
+        """Abre a autenticacao da conta Codex selecionada no Windows."""
+        if self.codex_login_started:
+            self.set_status("Login do Codex ja esta aberto.")
+            return
+
+        executable = self.engine._find_codex_executable()
+        if not executable:
+            QMessageBox.warning(
+                self,
+                "Codex nao encontrado",
+                "Instale o Codex CLI para entrar nesta sessao e tente novamente.",
+            )
+            return
+
+        if self.engine._codex_is_logged_in(executable):
+            self.set_status("A conta Codex ja esta conectada.")
+            return
+
+        escaped_executable = str(executable).replace("'", "''")
+        command = (
+            f"& '{escaped_executable}' login; "
+            f"& '{escaped_executable}' login status; "
+            "Write-Host ''; "
+            "Write-Host 'Quando o login terminar, feche esta janela e volte para a Merotec IA IDE.'"
+        )
+        try:
+            subprocess.Popen(
+                ["powershell", "-NoProfile", "-NoExit", "-Command", command],
+                cwd=self.current_workspace,
+                creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0,
+            )
+        except OSError as exc:
+            QMessageBox.warning(self, "Merotec IA", f"Nao foi possivel abrir o login do Codex.\n{exc}")
+            return
+
+        self.codex_login_started = True
+        self.set_status("Login do Codex aberto.")
+        self.add_chat("Sistema", "Conclua o login do Codex na janela aberta. A sessao sera usada pela IDE.")
+        QTimer.singleShot(4000, self._refresh_codex_session_after_login)
+
+    def _refresh_codex_session_after_login(self):
+        executable = self.engine._find_codex_executable()
+        if executable and self.engine._codex_is_logged_in(executable):
+            self.engine = UniversalEngine()
+            self.attach_internal_web_chat_bridge()
+            self.provider_label.setText(self.engine.provider)
+            self.codex_login_started = False
+            self.set_status("Codex conectado.")
+            self.add_chat("Sistema", "Sessao Codex conectada e pronta para uso.")
+            return
+        self.set_status("Conclua o login do Codex na janela aberta.")
+
 
 STYLE = """
 QMainWindow, QWidget#root { background: #0a1421; color: #d5deeb; font-family: 'Segoe UI'; font-size: 14px; }
@@ -3128,6 +3891,7 @@ QPlainTextEdit#editor { background: #0c1725; color: #d9e2ed; border: 0; padding:
 QFrame#terminalPanel { background: #0a1420; border-top: 1px solid #26384c; } QLabel#terminalProgress { color: #79d8e9; padding-left: 12px; } QProgressBar#terminalProgressBar { background: #11263a; border: 0; } QProgressBar#terminalProgressBar::chunk { background: #20cbe8; } QPlainTextEdit#terminal { background: #09131f; border: 0; border-top: 1px solid #203349; color: #bdc9d9; padding: 10px; } QLineEdit#terminalInput { background: #0b1725; border: 1px solid #203349; color: #dce8f6; padding: 8px 12px; } QPushButton#terminalAction { background: transparent; border: 0; color: #a5b8cc; padding: 4px 9px; } QPushButton#terminalAction:hover { color: #21d0eb; }
 QLabel#chatTitle { font-weight: 700; font-size: 17px; color: #eef5ff; } QLabel#provider { color: #68cfea; font-size: 11px; } QScrollArea#chatScroll, QScrollArea#chatScroll > QWidget > QWidget { border: 0; background: #0c1826; } QScrollArea#chatScroll QScrollBar:vertical { background: #0c1826; width: 10px; } QScrollArea#chatScroll QScrollBar::handle:vertical { background: #365d79; border: 2px solid #0c1826; border-radius: 5px; min-height: 38px; } QScrollArea#chatScroll QScrollBar::handle:vertical:hover { background: #4f8caf; } QFrame#chatIncoming, QFrame#chatOutgoing { border-radius: 8px; max-width: 300px; } QFrame#chatIncoming { background: #182637; } QFrame#chatOutgoing { background: #164a75; } QLabel#chatText { color: #e1ebf6; } QLabel#chatMeta { color: #8fa2b7; font-size: 11px; }
 QFrame#attachmentPanel { background: #102238; border: 1px solid #2e5e7b; border-radius: 6px; }
+QLabel#chatImagePreview { background: #091522; border: 1px solid #355d78; border-radius: 5px; padding: 3px; } QPushButton#chatImageAction { background: #214963; border: 1px solid #3b7597; border-radius: 4px; color: #edf8ff; padding: 4px 8px; } QPushButton#chatImageAction:hover { background: #2c6d90; border-color: #94dff1; } QPushButton#imageButton { min-width: 55px; min-height: 36px; border: 1px solid #2f6687; border-radius: 4px; background: #24536f; color: #eef8ff; padding: 0 7px; } QPushButton#imageButton:hover { background: #31749a; border-color: #79cdeb; } QPushButton#imageButton:disabled { background: #1d3446; border-color: #2a4a61; color: #8298ac; }
 QLabel#attachmentLabel { color: #9be7f6; font-weight: 600; }
 QFrame#attachmentItem { background: #0d1b2c; border: 1px solid #264863; border-radius: 5px; }
 QLabel#attachmentPreview { background: #081421; border: 1px solid #345b78; border-radius: 4px; color: #9bc4d8; font-size: 10px; font-weight: 700; }

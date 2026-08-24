@@ -78,6 +78,7 @@ PROFILE_DEFAULTS = {
         "openai_api_key": "",
         "openai_model_name": "gpt-5.5",
         "openai_base_url": "https://api.openai.com/v1",
+        "openai_image_model_name": "gpt-image-1",
     },
     "google": {
         "google_api_key": "",

@@ -249,12 +249,140 @@ def _paste_windows_clipboard_image(window, attachment: dict) -> tuple[bool, str]
         return False, str(exc)
 
 
+def _run_qt_visual_browser(initial_url: str, *, title: str, storage_scope: str) -> int:
+    """Executa o navegador dedicado de teste com o WebEngine já usado pela IDE.
+
+    O backend ``pywebview`` usa WebView2 via pythonnet. Em algumas sessões do
+    Windows ele fica bloqueado antes de disparar o primeiro evento de janela,
+    o que inviabiliza a captura visual mesmo com o WebView2 instalado. Testes
+    visuais não precisam da ponte de Chat Web; usar QWebEngine nesse caso evita
+    essa dependência e mantém a janela capturável pelo mesmo backend da UI
+    principal.
+    """
+    try:
+        from PySide6.QtCore import QTimer, QUrl
+        from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+        from PySide6.QtWidgets import QApplication, QMainWindow
+    except Exception as exc:
+        _emit("error", message=f"QWebEngine indisponivel para teste visual: {exc}")
+        return 2
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    window = QMainWindow()
+    window.setWindowTitle(str(title or "Merotec IA - Teste Visual"))
+    window.resize(1280, 820)
+    profile_root = Path(_storage_path(storage_scope)) / "qt-webengine"
+    profile_root.mkdir(parents=True, exist_ok=True)
+    profile = QWebEngineProfile(f"merotec-visual-{time.time_ns()}", window)
+    profile.setPersistentStoragePath(str(profile_root / "storage"))
+    profile.setCachePath(str(profile_root / "cache"))
+    view = QWebEngineView(window)
+    view.setPage(QWebEnginePage(profile, view))
+    window.setCentralWidget(view)
+    commands: list[dict] = []
+    commands_lock = threading.Lock()
+    ready_sent = False
+    navigation_request = ""
+
+    def info(url: str = "") -> dict:
+        return {
+            "url": str(view.url().toString() or url or initial_url),
+            "title": str(view.title() or ""),
+            "http_error": "",
+        }
+
+    def emit_ready() -> None:
+        nonlocal ready_sent
+        if ready_sent:
+            return
+        ready_sent = True
+        _emit("ready", window_initialized=True, window_shown=True, page_loaded=True, **info())
+
+    def page_loaded(_ok: bool) -> None:
+        nonlocal navigation_request
+        if not ready_sent:
+            emit_ready()
+            return
+        if navigation_request:
+            request_id = navigation_request
+            navigation_request = ""
+            _emit("navigated", request_id=request_id, action="navigate", **info())
+
+    def read_commands() -> None:
+        for raw_line in sys.stdin:
+            try:
+                command = json.loads(raw_line)
+            except json.JSONDecodeError:
+                _emit("command_error", message="Comando de navegador invalido.")
+                continue
+            if isinstance(command, dict):
+                with commands_lock:
+                    commands.append(command)
+
+    def process_commands() -> None:
+        nonlocal navigation_request
+        with commands_lock:
+            pending = commands[:]
+            commands.clear()
+        for command in pending:
+            action = str(command.get("action") or "")
+            request_id = str(command.get("request_id") or "")
+            if action == "navigate":
+                url = str(command.get("url") or "").strip()
+                if url:
+                    navigation_request = request_id
+                    view.load(QUrl.fromUserInput(url))
+            elif action == "focus":
+                window.show()
+                window.raise_()
+                window.activateWindow()
+            elif action == "close":
+                window.close()
+            else:
+                _emit(
+                    "command_error",
+                    request_id=request_id,
+                    action=action,
+                    message="Acao indisponivel no navegador dedicado de teste visual.",
+                )
+
+    def closed(*_args) -> None:
+        _emit("closed")
+        app.quit()
+
+    view.loadFinished.connect(page_loaded)
+    window.destroyed.connect(closed)
+    threading.Thread(target=read_commands, daemon=True).start()
+    timer = QTimer()
+    timer.timeout.connect(process_commands)
+    timer.start(50)
+    window.show()
+    window.raise_()
+    window.activateWindow()
+    # ``about:blank`` pode não emitir loadFinished em todas as versões do Qt.
+    # A janela já está visível, portanto é segura para a captura do teste.
+    QTimer.singleShot(700, emit_ready)
+    view.load(QUrl.fromUserInput(str(initial_url or "about:blank")))
+    try:
+        return int(app.exec())
+    except Exception as exc:
+        _emit("error", message=f"falha ao iniciar QWebEngine visual: {exc}")
+        return 1
+
+
 def run(
     initial_url: str,
     *,
     title: str = "Merotec IA - Navegador",
     storage_scope: str = "chat-web",
 ) -> int:
+    if os.environ.get("MEROTEC_VISUAL_TEST_BROWSER") == "1":
+        return _run_qt_visual_browser(
+            initial_url,
+            title=title,
+            storage_scope=storage_scope,
+        )
     try:
         import webview
     except Exception as exc:
@@ -275,15 +403,51 @@ def run(
         text_select=True,
         zoomable=True,
     )
+    # A janela pode estar pronta para ser exibida antes de o DOM disparar
+    # ``loaded``. Usar somente esse último evento bloqueava a IDE em
+    # ``about:blank``, páginas que falham durante a navegação e alguns
+    # WebView2 que atrasam o primeiro documento. ``shown`` confirma que há
+    # uma janela real para o teste visual capturar; ``page_loaded`` continua
+    # reservado às operações que dependem do DOM.
+    window_initialized = threading.Event()
+    window_shown = threading.Event()
     page_loaded = threading.Event()
-    window.events.loaded += lambda: page_loaded.set()
+
+    def _window_initialized(*_args) -> None:
+        window_initialized.set()
+
+    def _window_shown(*_args) -> None:
+        window_shown.set()
+
+    def _page_loaded(*_args) -> None:
+        page_loaded.set()
+
+    window.events.initialized += _window_initialized
+    window.events.shown += _window_shown
+    window.events.loaded += _page_loaded
 
     def command_loop() -> None:
-        page_loaded.wait(timeout=20)
+        # ``webview.start(func)`` só chama ``func`` depois de a janela ser
+        # exibida. Em alguns WebView2 essa exibição depende da navegação
+        # inicial e cria uma espera circular: a IDE aguarda o handshake e o
+        # callback que o publica nunca começa. O loop é iniciado antes do GUI
+        # e espera apenas ``initialized``, evento que confirma o backend.
+        if not window_initialized.wait(timeout=20):
+            _emit(
+                "error",
+                message="WebView2 nao concluiu a inicializacao em 20 segundos.",
+            )
+            return
         initial_info = _page_info(window, initial_url)
         if initial_info.get("http_error") == "431":
             initial_info = _recover_http_431(window, initial_url)
-        _emit("ready", **initial_info)
+        _emit(
+            "ready",
+            window_initialized=True,
+            window_shown=window_shown.is_set(),
+            page_loaded=page_loaded.is_set(),
+            **initial_info,
+        )
         for raw_line in sys.stdin:
             try:
                 command = json.loads(raw_line)
@@ -1274,7 +1438,11 @@ def run(
         }
         if sys.platform == "win32":
             start_kwargs["gui"] = "edgechromium"
-        webview.start(command_loop, **start_kwargs)
+        # Veja o comentário no início de ``command_loop``: iniciar a thread
+        # antes de ``webview.start`` evita depender do callback tardio do
+        # pywebview para publicar o estado que a IDE usa no teste visual.
+        threading.Thread(target=command_loop, daemon=True).start()
+        webview.start(**start_kwargs)
         _emit("closed")
         # O callback do pywebview fica bloqueado lendo stdin. Ao fechar a
         # janela, finalize-o junto com o processo para a IDE nunca reutilizar
