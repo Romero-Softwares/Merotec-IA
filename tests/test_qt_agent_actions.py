@@ -100,6 +100,66 @@ class QtAgentActionsTests(unittest.TestCase):
             self.assertFalse(actions.last_browser_action_requested)
             self.assertTrue(any("BROWSER_TYPE precisa" in text for _author, text in messages))
 
+    def test_read_only_specialist_blocks_write_and_returns_observation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            target = workspace / "app.py"
+            target.write_text("print('original')\n", encoding="utf-8")
+            messages = []
+            actions = QtAgentActions(
+                workspace,
+                lambda author, text: messages.append((author, text)),
+                lambda _command: None,
+                lambda _paths: None,
+                allowed_actions={"READ", "SEARCH_TEXT"},
+                skill_label="Revisão de segurança",
+            )
+
+            actions.apply("[WRITE: app.py]\nprint('alterado')\n[/WRITE]")
+
+            self.assertEqual("print('original')\n", target.read_text(encoding="utf-8"))
+            self.assertGreater(actions.last_followup_required, 0)
+            self.assertTrue(any("bloqueado pelo Revisão de segurança" in text for _author, text in messages))
+
+    def test_command_start_failure_keeps_agent_alive_for_a_new_decision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            messages = []
+            actions = QtAgentActions(
+                temp_dir,
+                lambda author, text: messages.append((author, text)),
+                lambda _command: False,
+                lambda _paths: None,
+            )
+
+            actions.apply("[EXECUTE: python -m unittest]")
+
+            self.assertFalse(actions.last_command_requested)
+            self.assertGreater(actions.last_followup_required, 0)
+            self.assertTrue(any("EXECUTE não iniciado" in text for _author, text in messages))
+
+    def test_write_records_snapshot_before_mutating_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            target = workspace / "app.py"
+            target.write_text("print('original')\n", encoding="utf-8")
+            snapshots = []
+            actions = QtAgentActions(
+                workspace,
+                lambda *_args: None,
+                lambda _command: None,
+                lambda _paths: None,
+                on_before_change=lambda path, action, summary: snapshots.append(
+                    (path, action, summary, path.read_text(encoding="utf-8"))
+                ),
+            )
+
+            actions.apply("[WRITE: app.py]\nprint('novo')\n[/WRITE]")
+
+            self.assertEqual(1, len(snapshots))
+            self.assertEqual("WRITE", snapshots[0][1])
+            self.assertEqual("print('original')\n", snapshots[0][3])
+            self.assertEqual("print('novo')\n", target.read_text(encoding="utf-8"))
+
     def test_write_unwraps_markdown_code_fence(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir)

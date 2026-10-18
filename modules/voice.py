@@ -36,7 +36,11 @@ import unicodedata
 import re
 import difflib
 import asyncio
+import base64
 import ctypes
+import json
+import subprocess
+from pathlib import Path
 from queue import Empty, Queue
 
 
@@ -47,7 +51,10 @@ TTS_ENGINE_EDGE = "edge"
 TTS_ENGINE_SAPI = "sapi"
 TTS_ENGINE_AUTO = "auto"
 TTS_AUTO_VOICE_ID = "auto"
-DEFAULT_EDGE_VOICE_ID = "pt-BR-AntonioNeural"
+# A voz Neural é sintetizada na nuvem da Microsoft e soa consideravelmente mais
+# natural que as vozes SAPI instaladas no Windows.  O mecanismo SAPI permanece
+# disponível apenas como uma escolha explícita de acessibilidade/offline.
+DEFAULT_EDGE_VOICE_ID = "pt-BR-FranciscaNeural"
 KNOWN_EDGE_TTS_VOICES = (
     {
         "id": "pt-BR-AntonioNeural",
@@ -573,12 +580,147 @@ class VoiceModule:
                 if self._speak_with_edge_tts(text):
                     return True
             except Exception as exc:
-                print(f"Falha no Edge TTS; tentando SAPI: {exc}")
+                print(f"Falha na voz neural Edge: {exc}")
+                # "edge" é uma escolha deliberada: não substituímos uma voz
+                # natural por SAPI sem avisar, pois isso degrada perceptivelmente
+                # o áudio gerado. "auto" continua podendo atender offline.
+                if engine_name == TTS_ENGINE_EDGE:
+                    return False
+        if engine_name == TTS_ENGINE_EDGE:
+            return False
         try:
             return self._speak_with_sapi(text)
         except Exception as exc:
             print(f"Erro na fala: {exc}")
             return False
+
+    def _save_with_edge_tts(self, text, destination):
+        """Gera um MP3 persistente sem iniciar a reprodução do sistema."""
+        if edge_tts is None:
+            return False
+
+        async def save_audio():
+            communicate = edge_tts.Communicate(
+                text,
+                self._edge_voice_id(),
+                rate="+0%",
+                volume="+0%",
+            )
+            await communicate.save(str(destination))
+
+        asyncio.run(save_audio())
+        return destination.is_file() and destination.stat().st_size > 0
+
+    def _save_with_sapi(self, text, destination):
+        """Fallback local em WAV quando Edge TTS não estiver disponível."""
+        if pyttsx3 is None:
+            return False
+        engine = None
+        try:
+            engine = pyttsx3.init()
+            _configure_tts_engine(engine, self._tts_voice_id())
+            engine.save_to_file(text, str(destination))
+            engine.runAndWait()
+            return destination.is_file() and destination.stat().st_size > 0
+        finally:
+            if engine is not None:
+                try:
+                    engine.stop()
+                except Exception:
+                    pass
+
+    def _save_with_windows_speech(self, text, destination):
+        """Gera WAV pelo System.Speech quando o adaptador SAPI do pyttsx3 falha.
+
+        Em algumas instalações recentes do Python, o pyttsx3 não consegue
+        acessar o COM SAPI5 ("Classe não registrada") embora as vozes locais
+        do Windows funcionem. System.Speech usa o mecanismo nativo e mantém a
+        geração offline disponível.
+        """
+        if os.name != "nt":
+            return False
+
+        destination = Path(destination)
+        payload = base64.b64encode(
+            json.dumps({"text": str(text), "destination": str(destination)}, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii")
+        script = f"""
+$payload = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}'))
+$request = $payload | ConvertFrom-Json
+Add-Type -AssemblyName System.Speech
+$synthesizer = [System.Speech.Synthesis.SpeechSynthesizer]::new()
+try {{
+    $synthesizer.SetOutputToWaveFile([string]$request.destination)
+    $synthesizer.Speak([string]$request.text)
+}} finally {{
+    $synthesizer.Dispose()
+}}
+"""
+        encoded_script = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        result = subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                "-EncodedCommand", encoded_script,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=45,
+        )
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "erro desconhecido").strip()
+            raise RuntimeError(f"System.Speech falhou: {message}")
+        return destination.is_file() and destination.stat().st_size > 44
+
+    def generate_audio_file(self, text, output_dir):
+        """Converte texto em áudio reutilizável e retorna o arquivo gerado.
+
+        Este fluxo é independente de qualquer provedor de chat. Por padrão usa
+        Edge TTS Neural; a voz local do Windows só é usada quando o mecanismo
+        SAPI/automático foi selecionado explicitamente.
+        """
+        narration = " ".join(str(text or "").split()).strip()
+        if not narration:
+            raise ValueError("Informe um conteúdo para gerar o áudio.")
+        target_dir = os.fspath(output_dir)
+        os.makedirs(target_dir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        unique = f"{int(time.time() * 1000) % 1000:03d}"
+        engine_name = self._tts_engine_name()
+
+        if engine_name in {TTS_ENGINE_AUTO, TTS_ENGINE_EDGE}:
+            mp3_path = os.path.join(target_dir, f"narracao_{stamp}_{unique}.mp3")
+            try:
+                if self._save_with_edge_tts(narration, Path(mp3_path)):
+                    return mp3_path
+            except Exception as exc:
+                print(f"Falha ao gerar áudio com voz neural Edge: {exc}")
+                if engine_name == TTS_ENGINE_EDGE:
+                    raise RuntimeError(
+                        "A voz neural está indisponível. Verifique a conexão com a internet e tente novamente."
+                    ) from exc
+            if engine_name == TTS_ENGINE_EDGE:
+                raise RuntimeError(
+                    "A voz neural não respondeu. Verifique a conexão com a internet e tente novamente."
+                )
+
+        wav_path = os.path.join(target_dir, f"narracao_{stamp}_{unique}.wav")
+        sapi_error = None
+        try:
+            if self._save_with_sapi(narration, Path(wav_path)):
+                return wav_path
+        except Exception as exc:
+            sapi_error = exc
+            print(f"Falha no SAPI via pyttsx3; tentando System.Speech: {exc}")
+
+        try:
+            if self._save_with_windows_speech(narration, Path(wav_path)):
+                return wav_path
+        except Exception as exc:
+            detail = f" SAPI: {sapi_error}; System.Speech: {exc}" if sapi_error else f" System.Speech: {exc}"
+            raise RuntimeError(f"Não foi possível gerar o áudio local.{detail}") from exc
+        raise RuntimeError("Nenhum mecanismo de geração de áudio está disponível nesta instalação.")
 
     def speak(self, text):
         if edge_tts is None and pyttsx3 is None:

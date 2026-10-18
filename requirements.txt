@@ -2,10 +2,11 @@ customtkinter==5.2.2
 PySide6==6.11.1
 google-genai==2.0.1
 numpy==2.4.4
-Pillow==12.2.0
+Pillow==11.3.0
+moviepy==2.2.1
 Pygments==2.20.0
 pyttsx3==2.99
-edge-tts==7.2.8
+edge-tts==7.3.0
 scipy==1.17.1
 sounddevice==0.5.5
 SpeechRecognition==3.16.1

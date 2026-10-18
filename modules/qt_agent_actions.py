@@ -24,6 +24,9 @@ class QtAgentActions:
         write_staging=None,
         on_human_test=None,
         on_browser_action=None,
+        allowed_actions=None,
+        skill_label="",
+        on_before_change=None,
     ):
         self.workspace = Path(workspace).resolve()
         self.on_message = on_message
@@ -40,10 +43,40 @@ class QtAgentActions:
         self.last_browser_action_requested = False
         self.on_human_test = on_human_test
         self.on_browser_action = on_browser_action
+        self.allowed_actions = (
+            frozenset(str(action).strip().upper() for action in allowed_actions)
+            if allowed_actions is not None
+            else None
+        )
+        self.skill_label = str(skill_label or "perfil ativo")
+        self.on_before_change = on_before_change
 
     def _message(self, author, text):
         self.last_observations.append(f"{author}: {text}")
         self.on_message(author, text)
+
+    def _allowed(self, action_name):
+        """Aplica o contrato da especialidade sem conceder novas ações."""
+        action_name = str(action_name or "").strip().upper()
+        if self.allowed_actions is None or action_name in self.allowed_actions:
+            return True
+        self.last_followup_required += 1
+        self._message(
+            "Sistema",
+            f"{action_name} bloqueado pelo {self.skill_label}. "
+            "Escolha uma ação compatível com a especialidade ativa.",
+        )
+        return False
+
+    def _snapshot_before_change(self, path, action, summary=""):
+        """Registra o estado anterior quando a interface fornece histórico."""
+        if not callable(self.on_before_change):
+            return
+        try:
+            self.on_before_change(Path(path), str(action), str(summary))
+        except Exception:
+            # O histórico não pode impedir uma ação já validada pelo executor.
+            return
 
     def _path(self, raw):
         path = (self.workspace / str(raw).strip()).resolve()
@@ -114,14 +147,20 @@ class QtAgentActions:
         self.last_browser_action_requested = False
         for patch in re.findall(r"\[PATCH(?:\s*:[^\]]+)?\](.*?)\[/PATCH\]", response, re.I | re.S):
             self.last_action_count += 1
+            if not self._allowed("PATCH"):
+                continue
             self.last_followup_required += 1
             changed.extend(self._patch(patch))
         for request in re.findall(r"\[READ:\s*([^\]]+)\]", response, re.I):
             self.last_action_count += 1
+            if not self._allowed("READ"):
+                continue
             self.last_followup_required += 1
             self._read(request)
         for request in re.findall(r"\[SEARCH_TEXT:\s*([^\]]+)\]", response, re.I):
             self.last_action_count += 1
+            if not self._allowed("SEARCH_TEXT"):
+                continue
             self.last_followup_required += 1
             self._search(request)
         for raw_path, part, total, content in re.findall(
@@ -129,6 +168,8 @@ class QtAgentActions:
             response, re.I | re.S,
         ):
             self.last_action_count += 1
+            if not self._allowed("WRITE_PART"):
+                continue
             self.last_followup_required += 1
             try:
                 path = self._path(raw_path)
@@ -154,6 +195,7 @@ class QtAgentActions:
                 if issue:
                     raise ValueError(f"Conteúdo inválido: {issue.get('message') or issue.get('kind')}")
                 path.parent.mkdir(parents=True, exist_ok=True)
+                self._snapshot_before_change(path, "WRITE_PART", f"Arquivo recebido em {total} partes")
                 path.write_text(source.rstrip("\n") + "\n", encoding="utf-8")
                 changed.append(path)
                 self._message("Sistema", f"Arquivo gravado pela IA em {total} partes: {path.relative_to(self.workspace)}")
@@ -162,6 +204,8 @@ class QtAgentActions:
                 self._mutation_recovery(raw_path)
         for raw_path, content in re.findall(r"\[WRITE:\s*([^\]\r\n]+)\](.*?)\[/WRITE\]", response, re.I | re.S):
             self.last_action_count += 1
+            if not self._allowed("WRITE"):
+                continue
             self.last_followup_required += 1
             try:
                 path = self._path(raw_path)
@@ -173,6 +217,7 @@ class QtAgentActions:
                         f"{issue.get('message') or issue.get('kind')}."
                     )
                 path.parent.mkdir(parents=True, exist_ok=True)
+                self._snapshot_before_change(path, "WRITE", "Arquivo completo gravado pelo agente")
                 path.write_text(source.rstrip("\n") + "\n", encoding="utf-8")
                 changed.append(path)
                 self._message("Sistema", f"Arquivo gravado pela IA: {path.relative_to(self.workspace)}")
@@ -181,6 +226,8 @@ class QtAgentActions:
                 self._mutation_recovery(raw_path)
         for raw_path, body in re.findall(r"\[REPLACE:\s*([^\]]+)\](.*?)\[/REPLACE\]", response, re.I | re.S):
             self.last_action_count += 1
+            if not self._allowed("REPLACE"):
+                continue
             self.last_followup_required += 1
             old = re.search(r"\[OLD\](.*?)\[/OLD\]", body, re.I | re.S)
             new = re.search(r"\[NEW\](.*?)\[/NEW\]", body, re.I | re.S)
@@ -199,6 +246,7 @@ class QtAgentActions:
                         f"Conteúdo inválido para {path.name} na linha {issue.get('line') or '?'}: "
                         f"{issue.get('message') or issue.get('kind')}."
                     )
+                self._snapshot_before_change(path, "REPLACE", "Trecho substituído pelo agente")
                 path.write_text(source.replace(old_text, replacement, 1), encoding="utf-8")
                 changed.append(path)
                 self._message("Sistema", f"Arquivo atualizado pela IA: {path.relative_to(self.workspace)}")
@@ -210,6 +258,8 @@ class QtAgentActions:
             response, re.I | re.S,
         ):
             self.last_action_count += 1
+            if not self._allowed("INSERT_BEFORE"):
+                continue
             self.last_followup_required += 1
             try:
                 path = self._path(raw_path)
@@ -222,6 +272,7 @@ class QtAgentActions:
                 issue = validate_source_text(path, candidate)
                 if issue:
                     raise ValueError(f"Conteúdo inválido: {issue.get('message') or issue.get('kind')}")
+                self._snapshot_before_change(path, "INSERT_BEFORE", f"Inserção antes de {marker}")
                 path.write_text(candidate, encoding="utf-8")
                 changed.append(path)
                 self._message("Sistema", f"Conteúdo acrescentado antes de {marker}: {path.relative_to(self.workspace)}")
@@ -233,6 +284,8 @@ class QtAgentActions:
             response, re.I | re.S,
         ):
             self.last_action_count += 1
+            if not self._allowed("INSERT_AFTER"):
+                continue
             self.last_followup_required += 1
             try:
                 path = self._path(raw_path)
@@ -245,6 +298,7 @@ class QtAgentActions:
                 issue = validate_source_text(path, candidate)
                 if issue:
                     raise ValueError(f"Conteúdo inválido: {issue.get('message') or issue.get('kind')}")
+                self._snapshot_before_change(path, "INSERT_AFTER", f"Inserção após {marker}")
                 path.write_text(candidate, encoding="utf-8")
                 changed.append(path)
                 self._message("Sistema", f"Conteúdo acrescentado após {marker}: {path.relative_to(self.workspace)}")
@@ -253,6 +307,8 @@ class QtAgentActions:
                 self._mutation_recovery(raw_path)
         for raw_path in re.findall(r"\[VALIDATE\s*:\s*([^\]\r\n]+)\]", response, re.I):
             self.last_action_count += 1
+            if not self._allowed("VALIDATE"):
+                continue
             self.last_followup_required += 1
             try:
                 path = self._path(raw_path)
@@ -265,6 +321,7 @@ class QtAgentActions:
                     repaired = unwrap_transport_code(source, path)
                     repair_issue = validate_source_text(path, repaired)
                     if repair_issue is None and repaired != source:
+                        self._snapshot_before_change(path, "VALIDATE_REPAIR", "Artefatos de transporte removidos")
                         path.write_text(repaired.rstrip("\n") + "\n", encoding="utf-8")
                         changed.append(path)
                         issue = None
@@ -281,6 +338,8 @@ class QtAgentActions:
         # Python, índices PowerShell etc.). Capture até o último ``]`` da linha.
         for request in re.findall(r"\[HUMAN_TEST\s*:\s*([^\]\r\n]*)\]", response, re.I):
             self.last_action_count += 1
+            if not self._allowed("HUMAN_TEST"):
+                continue
             request = request.strip() or "auto"
             if not callable(self.on_human_test):
                 self._message("Erro", "HUMAN_TEST indisponivel nesta interface.")
@@ -325,6 +384,15 @@ class QtAgentActions:
             # DOM real ao agente antes da proxima decisao.
             action, payload, _position = min(browser_requests, key=lambda item: item[2])
             self.last_action_count += 1
+            action_name = {
+                "open": "OPEN_URL",
+                "inspect": "BROWSER_INSPECT",
+                "click": "BROWSER_CLICK",
+                "scroll": "BROWSER_SCROLL",
+                "type": "BROWSER_TYPE",
+            }.get(action, action.upper())
+            if not self._allowed(action_name):
+                return changed
             if not callable(self.on_browser_action):
                 self._message("Erro", "Navegador interno indisponivel nesta interface.")
             else:
@@ -335,16 +403,20 @@ class QtAgentActions:
                 else:
                     if started is False:
                         self._message("Erro", "Acao do navegador nao iniciada.")
+                        self.last_followup_required += 1
                     else:
                         self.last_browser_action_requested = True
                         self._message("Sistema", f"Acao do navegador iniciada: {action}.")
         for command in re.findall(r"(?im)^\s*\[EXECUTE\s*:\s*(.+)\]\s*$", response):
             self.last_action_count += 1
+            if not self._allowed("EXECUTE"):
+                continue
             command = command.strip()
             if command:
                 started = self.on_command(command)
                 if started is False:
                     self._message("Erro", f"EXECUTE não iniciado: {command}")
+                    self.last_followup_required += 1
                 else:
                     self.last_command_requested = True
                     self._message("Sistema", f"EXECUTE encaminhado ao terminal: {command}")
@@ -378,9 +450,11 @@ class QtAgentActions:
                 if kind == "Add File":
                     if target.exists(): raise ValueError(f"Arquivo ja existe: {raw_path}")
                     target.parent.mkdir(parents=True, exist_ok=True)
+                    self._snapshot_before_change(target, "PATCH", "Arquivo criado por patch")
                     target.write_text("\n".join(line[1:] for line in lines if line.startswith("+")) + "\n", encoding="utf-8")
                 elif kind == "Delete File":
                     if not target.exists(): raise ValueError(f"Arquivo nao existe: {raw_path}")
+                    self._snapshot_before_change(target, "PATCH", "Arquivo removido por patch")
                     target.unlink()
                 else:
                     source = target.read_text(encoding="utf-8")
@@ -395,6 +469,7 @@ class QtAgentActions:
                             if source_lines[index:index + len(old)] == old:
                                 source_lines[index:index + len(old)] = new; break
                         else: raise ValueError(f"Contexto nao encontrado: {raw_path}")
+                    self._snapshot_before_change(target, "PATCH", "Arquivo atualizado por patch")
                     target.write_text("\n".join(source_lines) + ("\n" if final_newline else ""), encoding="utf-8")
                 changed.append(target)
                 self._message("Sistema", f"PATCH aplicado: {target.relative_to(self.workspace)}")

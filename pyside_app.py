@@ -24,12 +24,12 @@ from urllib.parse import urlsplit
 
 from PIL import ImageGrab
 
-from PySide6.QtCore import QModelIndex, QDir, QFileInfo, QProcess, QProcessEnvironment, QSortFilterProxyModel, QStandardPaths, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPixmap, QSyntaxHighlighter, QTextCharFormat, QTextDocument
+from PySide6.QtCore import QModelIndex, QDir, QFileInfo, QMimeData, QProcess, QProcessEnvironment, QSortFilterProxyModel, QStandardPaths, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QDrag, QFont, QIcon, QKeySequence, QPainter, QPixmap, QSyntaxHighlighter, QTextCharFormat, QTextDocument
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
-    QSizePolicy, QSplitter, QStyle, QTabWidget, QTextEdit, QToolBar, QTreeView, QProgressBar,
+    QSizePolicy, QSlider, QSplitter, QStyle, QTabWidget, QTextEdit, QToolBar, QTreeView, QProgressBar,
     QVBoxLayout, QWidget, QFileSystemModel, QScrollArea,
 )
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile
@@ -51,12 +51,186 @@ from modules.qt_agent_actions import QtAgentActions
 from modules.project_manager import ProjectManager
 from modules.voice import VoiceModule
 from modules.plugin_manager import build_plugin_report_messages, initialize_plugins
-from modules.video_generation import VIDEO_SUFFIXES, VideoGenerationRequest, VideoGenerationService
+from modules.video_generation import (
+    VIDEO_SUFFIXES,
+    VideoGenerationRequest,
+    VideoGenerationService,
+    VideoNarrationService,
+)
 
 
 ROOT = Path(__file__).resolve().parent
 ACCENT = "#18c9e8"
 APP_ICON_PATH = ROOT / "assets" / "merotec-ide-icon.svg"
+
+
+AUDIO_SUFFIXES = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".flac", ".wma"}
+
+
+def _media_source_value(source) -> str:
+    """Extracts the URL or local path from a web media artifact."""
+    if isinstance(source, dict):
+        for field in ("url", "src", "href", "source"):
+            value = str(source.get(field) or "").strip()
+            if value:
+                return value
+        return ""
+    return str(source or "").strip()
+
+
+def _media_source_name(source) -> str:
+    """Retorna um nome legível para um arquivo local ou URL de mídia."""
+    if isinstance(source, dict):
+        name = str(source.get("name") or source.get("title") or "").strip()
+        if name:
+            return name
+    text = _media_source_value(source)
+    return Path(urlsplit(text).path).name or "Áudio gerado"
+
+
+def _is_audio_source(source) -> bool:
+    """Reconhece arquivos e URLs de áudio que podem ser tocados pelo Qt."""
+    text = _media_source_value(source)
+    if not text:
+        return False
+    if isinstance(source, dict) and str(source.get("media_type") or source.get("type") or "").casefold() == "audio":
+        return True
+    parsed = urlsplit(text)
+    if Path(parsed.path).suffix.casefold() in AUDIO_SUFFIXES:
+        return True
+    hints = f"{parsed.path}?{parsed.query}".casefold()
+    return parsed.scheme in {"http", "https"} and any(
+        hint in hints for hint in ("audio", "voice", "narrat", "speech", "tts", "sound")
+    )
+
+
+def _is_video_source(source) -> bool:
+    """Reconhece arquivos e URLs de video retornados por provedores."""
+    text = _media_source_value(source)
+    if not text:
+        return False
+    if isinstance(source, dict) and str(source.get("media_type") or source.get("type") or "").casefold() == "video":
+        return True
+    parsed = urlsplit(text)
+    if Path(parsed.path).suffix.casefold() in VIDEO_SUFFIXES:
+        return True
+    hints = f"{parsed.path}?{parsed.query}".casefold()
+    return parsed.scheme in {"http", "https"} and any(
+        hint in hints for hint in ("video", "movie", "clip", "mp4", "webm", "render")
+    )
+
+
+def _media_url(source) -> QUrl:
+    """Converte uma origem local ou remota para a URL esperada pelo player."""
+    text = _media_source_value(source)
+    parsed = urlsplit(text)
+    if parsed.scheme in {"http", "https", "file"}:
+        return QUrl(text)
+    return QUrl.fromLocalFile(str(Path(text).resolve()))
+
+
+class AudioPlayerWidget(QFrame):
+    """Player compacto para áudios apresentados no chat."""
+
+    def __init__(self, source, parent=None):
+        super().__init__(parent)
+        self.setObjectName("chatAudioPlayer")
+        self.source = _media_source_value(source)
+        self.player = QMediaPlayer(self)
+        self.audio_output = QAudioOutput(self)
+        self.audio_output.setVolume(0.9)
+        self.player.setAudioOutput(self.audio_output)
+        self.player.setSource(_media_url(source))
+        self._duration = 0
+        self._seeking = False
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(5)
+        self.title = QLabel(f"Áudio: {_media_source_name(source)}")
+        self.title.setObjectName("chatAttachmentName")
+        self.title.setWordWrap(True)
+        layout.addWidget(self.title)
+
+        controls = QHBoxLayout()
+        self.play_button = QPushButton("Reproduzir")
+        self.play_button.setObjectName("chatImageAction")
+        self.play_button.clicked.connect(self.toggle_playback)
+        controls.addWidget(self.play_button)
+        self.stop_button = QPushButton("Parar")
+        self.stop_button.setObjectName("chatImageAction")
+        self.stop_button.clicked.connect(self.stop)
+        controls.addWidget(self.stop_button)
+        self.position = QLabel("0:00 / 0:00")
+        self.position.setObjectName("chatMeta")
+        controls.addStretch()
+        controls.addWidget(self.position)
+        layout.addLayout(controls)
+
+        self.progress = QSlider(Qt.Orientation.Horizontal)
+        self.progress.setObjectName("chatAudioProgress")
+        self.progress.setRange(0, 0)
+        self.progress.sliderPressed.connect(self._start_seek)
+        self.progress.sliderReleased.connect(self._finish_seek)
+        layout.addWidget(self.progress)
+
+        self.player.playbackStateChanged.connect(self._update_play_button)
+        self.player.positionChanged.connect(self._update_position)
+        self.player.durationChanged.connect(self._update_duration)
+        self.player.mediaStatusChanged.connect(self._media_status_changed)
+        self.player.errorOccurred.connect(self._media_error)
+
+    @staticmethod
+    def _format_duration(milliseconds):
+        seconds = max(0, int(milliseconds or 0) // 1000)
+        return f"{seconds // 60}:{seconds % 60:02d}"
+
+    def toggle_playback(self):
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        else:
+            if self.player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia:
+                self.player.setPosition(0)
+            self.player.play()
+
+    def stop(self):
+        self.player.stop()
+        self.player.setPosition(0)
+
+    def _start_seek(self):
+        self._seeking = True
+
+    def _finish_seek(self):
+        self.player.setPosition(self.progress.value())
+        self._seeking = False
+
+    def _update_play_button(self, state):
+        playing = state == QMediaPlayer.PlaybackState.PlayingState
+        self.play_button.setText("Pausar" if playing else "Reproduzir")
+
+    def _update_duration(self, duration):
+        self._duration = max(0, int(duration or 0))
+        self.progress.setRange(0, self._duration)
+        self._update_time_label(self.player.position())
+
+    def _update_position(self, position):
+        if not self._seeking:
+            self.progress.setValue(max(0, int(position or 0)))
+        self._update_time_label(position)
+
+    def _update_time_label(self, position):
+        self.position.setText(
+            f"{self._format_duration(position)} / {self._format_duration(self._duration)}"
+        )
+
+    def _media_status_changed(self, status):
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self.player.setPosition(0)
+            self.play_button.setText("Reproduzir")
+
+    def _media_error(self, _error, error_string):
+        if error_string:
+            self.title.setText(f"Não foi possível reproduzir {_media_source_name(self.source)}: {error_string}")
 
 
 class PythonHighlighter(QSyntaxHighlighter):
@@ -310,6 +484,68 @@ class RecursiveFileFilter(QSortFilterProxyModel):
         return False
 
 
+class ExplorerTreeView(QTreeView):
+    """Arvore de arquivos com arrastar/soltar delegado a janela principal."""
+
+    paths_dropped = Signal(list, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QTreeView.DragDropMode.DragDrop)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+
+    def startDrag(self, _supported_actions):
+        indexes = self.selectionModel().selectedRows(0)
+        urls = []
+        for index in indexes:
+            source_model = self.model()
+            while isinstance(source_model, QSortFilterProxyModel):
+                index = source_model.mapToSource(index)
+                source_model = source_model.sourceModel()
+            path = source_model.filePath(index) if isinstance(source_model, QFileSystemModel) else ""
+            if path:
+                urls.append(QUrl.fromLocalFile(path))
+        if not urls:
+            return
+        mime_data = QMimeData()
+        mime_data.setUrls(urls)
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+        drag.exec(Qt.DropAction.MoveAction)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event):
+        urls = [url for url in event.mimeData().urls() if url.isLocalFile()]
+        if not urls:
+            event.ignore()
+            return
+        index = self.indexAt(event.position().toPoint())
+        target = ""
+        if index.isValid():
+            source_model = self.model()
+            while isinstance(source_model, QSortFilterProxyModel):
+                index = source_model.mapToSource(index)
+                source_model = source_model.sourceModel()
+            if isinstance(source_model, QFileSystemModel):
+                target = source_model.filePath(index)
+        self.paths_dropped.emit([url.toLocalFile() for url in urls], target)
+        event.acceptProposedAction()
+
+
 class TerminalInput(QLineEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -372,8 +608,44 @@ class ChatBubble(QFrame):
         self.label.setObjectName("chatText")
         layout.addWidget(self.label)
         self.video_players = []
-        for path in attachments or []:
-            path = Path(path)
+        self.audio_players = []
+        for attachment in attachments or []:
+            if _is_audio_source(attachment):
+                audio_player = AudioPlayerWidget(attachment, self)
+                self.audio_players.append(audio_player)
+                layout.addWidget(audio_player)
+                continue
+            if _is_video_source(attachment):
+                player = QMediaPlayer(self)
+                audio = QAudioOutput(self)
+                player.setAudioOutput(audio)
+                preview = QVideoWidget(self)
+                preview.setObjectName("chatVideoPreview")
+                preview.setMinimumSize(260, 180)
+                preview.setMaximumSize(520, 330)
+                player.setVideoOutput(preview)
+                player.setSource(_media_url(attachment))
+                self.video_players.append((player, audio))
+                layout.addWidget(preview)
+                actions = QHBoxLayout()
+                play_button = QPushButton("Reproduzir")
+                play_button.setObjectName("chatImageAction")
+                play_button.clicked.connect(lambda _checked=False, media_player=player: self._toggle_video(media_player))
+                actions.addWidget(play_button)
+                source = _media_source_value(attachment)
+                if urlsplit(source).scheme not in {"http", "https"}:
+                    open_button = QPushButton("Abrir")
+                    open_button.setObjectName("chatImageAction")
+                    open_button.clicked.connect(lambda _checked=False, video_path=Path(source): self._open_media(video_path))
+                    actions.addWidget(open_button)
+                    save_button = QPushButton("Salvar como...")
+                    save_button.setObjectName("chatImageAction")
+                    save_button.clicked.connect(lambda _checked=False, video_path=Path(source): self._save_media_as(video_path))
+                    actions.addWidget(save_button)
+                actions.addStretch()
+                layout.addLayout(actions)
+                continue
+            path = Path(attachment)
             if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
                 pixmap = QPixmap(str(path))
                 if not pixmap.isNull():
@@ -402,34 +674,6 @@ class ChatBubble(QFrame):
                     actions.addStretch()
                     layout.addLayout(actions)
                     continue
-            if path.suffix.lower() in VIDEO_SUFFIXES:
-                player = QMediaPlayer(self)
-                audio = QAudioOutput(self)
-                player.setAudioOutput(audio)
-                preview = QVideoWidget(self)
-                preview.setObjectName("chatVideoPreview")
-                preview.setMinimumSize(260, 180)
-                preview.setMaximumSize(520, 330)
-                player.setVideoOutput(preview)
-                player.setSource(QUrl.fromLocalFile(str(path.resolve())))
-                self.video_players.append((player, audio))
-                layout.addWidget(preview)
-                actions = QHBoxLayout()
-                play_button = QPushButton("Reproduzir")
-                play_button.setObjectName("chatImageAction")
-                play_button.clicked.connect(lambda _checked=False, media_player=player: self._toggle_video(media_player))
-                actions.addWidget(play_button)
-                open_button = QPushButton("Abrir")
-                open_button.setObjectName("chatImageAction")
-                open_button.clicked.connect(lambda _checked=False, video_path=path: self._open_media(video_path))
-                actions.addWidget(open_button)
-                save_button = QPushButton("Salvar como...")
-                save_button.setObjectName("chatImageAction")
-                save_button.clicked.connect(lambda _checked=False, video_path=path: self._save_media_as(video_path))
-                actions.addWidget(save_button)
-                actions.addStretch()
-                layout.addLayout(actions)
-                continue
             attachment_name = QLabel(f"Anexo: {path.name}")
             attachment_name.setObjectName("chatAttachmentName")
             attachment_name.setWordWrap(True)
@@ -474,7 +718,9 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
     chat_reply = Signal(str)
     chat_stream = Signal(str)
     image_generation_finished = Signal(str, str)
+    audio_generation_finished = Signal(str, str)
     video_generation_finished = Signal(str, str)
+    video_narration_finished = Signal(str, str, str, str, str)
     browser_action_requested = Signal(str, object, object)
 
     def __init__(self):
@@ -512,8 +758,6 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self._terminal_session_queue = []
         self._terminal_session_interactive = False
         self.pending_attachments = []
-        self.video_cancel_event = threading.Event()
-        self._next_video_generation_options = {}
         self.chat_busy = False
         self.codex_login_started = False
         self.chat_started_at = None
@@ -530,6 +774,13 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.streaming_text = ""
         self.activity_bubble = None
         self.activity_lines = []
+        self._published_chat_audio = set()
+        self._published_chat_video = set()
+        # A referencia fica disponivel para pedidos curtos de revisao do video.
+        self._last_video_reference_image = None
+        self._last_video_generation_prompt = ""
+        self._last_video_generation_options = {}
+        self._active_video_duration_seconds = 0
         self._chat_task_prompt = ""
         self._chat_agent_round = 0
         self._chat_waiting_for_browser = False
@@ -557,6 +808,8 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self._open_initial_file()
         self.load_plugins()
         self.report_plugin_status()
+        QTimer.singleShot(0, self._restore_latest_audio_player)
+        QTimer.singleShot(0, self._restore_latest_video_player)
 
     def _apply_brand_icon(self):
         """Aplica a marca da IDE na barra de título, seletor Alt+Tab e taskbar."""
@@ -702,6 +955,109 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.ui_bridge.call_soon(
             lambda: self.add_chat(sender, text or f"Anexo: {path.name}", outgoing, attachments=[path])
         )
+
+    def add_chat_audio_message(self, sender, audio_source, text="", immediate=False):
+        """Publica um áudio com controles de reprodução dentro do chat."""
+        source = _media_source_value(audio_source)
+        if not _is_audio_source(audio_source):
+            return
+        audio_name = _media_source_name(audio_source)
+        note = f"{text}\n[áudio anexado: {audio_name}]" if text else f"[áudio anexado: {audio_name}]"
+        self._remember_ai_context_message(sender, note)
+        outgoing = str(sender or "").lower() in {"voce", "vocÃª"}
+        publish = lambda: self.add_chat(
+            sender,
+            text or f"Áudio pronto: {audio_name}",
+            outgoing,
+            attachments=[audio_source],
+        )
+        if immediate:
+            publish()
+        else:
+            self.ui_bridge.call_soon(publish)
+
+    def _latest_generated_audio(self):
+        """Retorna o último áudio local gerado que pode ser reproduzido."""
+        directory = self.workspace / ".merotec_system_ai" / "generated_audio"
+        try:
+            candidates = [
+                path for path in directory.iterdir()
+                if path.is_file() and path.suffix.casefold() in AUDIO_SUFFIXES and path.stat().st_size > 44
+            ]
+        except OSError:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime, default=None)
+
+    def _restore_latest_audio_player(self):
+        """Mantém disponível no chat o último áudio criado nesta workspace."""
+        path = self._latest_generated_audio()
+        if path is None:
+            return False
+        key = str(path.resolve()).casefold()
+        if key in self._published_chat_audio:
+            return False
+        self._published_chat_audio.add(key)
+        self.add_chat_audio_message(
+            "Merotec IA",
+            path,
+            "Áudio mais recente disponível. Use os controles abaixo para reproduzir.",
+            immediate=True,
+        )
+        return True
+
+    def _latest_generated_video(self):
+        """Retorna o último vídeo local que a IDE pode reproduzir no chat."""
+        directory = self.workspace / ".merotec_system_ai" / "generated_videos"
+        try:
+            candidates = [
+                path for path in directory.iterdir()
+                if path.is_file() and path.suffix.casefold() in VIDEO_SUFFIXES and path.stat().st_size > 0
+            ]
+        except OSError:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime, default=None)
+
+    def _restore_latest_video_player(self):
+        """Restaura no chat a prévia do último vídeo ao abrir a workspace."""
+        path = self._latest_generated_video()
+        if path is None:
+            return False
+        key = str(path.resolve()).casefold()
+        if key in self._published_chat_video:
+            return False
+        self._published_chat_video.add(key)
+        self.add_chat(
+            "Merotec IA",
+            "Vídeo mais recente disponível. Use Reproduzir, Abrir ou Salvar como... abaixo da prévia.",
+            attachments=[path],
+        )
+        return True
+
+    def _publish_unattached_narration(self, reply):
+        """Evita resposta textual de sucesso sem o player do áudio gerado."""
+        normalized = " ".join(str(reply or "").casefold().split())
+        narration_markers = ("narração", "narracao", "áudio", "audio")
+        completion_markers = ("criada", "criado", "gerada", "gerado", "pronta", "pronto", "validada", "validado")
+        if not any(marker in normalized for marker in narration_markers):
+            return False
+        if not any(marker in normalized for marker in completion_markers):
+            return False
+        path = self._latest_generated_audio()
+        if path is None:
+            return False
+        published = getattr(self, "_published_chat_audio", set())
+        key = str(path.resolve()).casefold()
+        if key in published:
+            return False
+        published.add(key)
+        self._published_chat_audio = published
+        self.add_chat_audio_message(
+            "Merotec IA",
+            path,
+            "Áudio pronto. Use os controles abaixo para reproduzir.",
+            immediate=True,
+        )
+        return True
 
     def plugin_services(self):
         return {"app": self, "settings": self.settings, "workspace": self.current_workspace, "engine": self.engine, "voice": self.voice, "project_manager": self.pm, "executor": self.executor}
@@ -872,13 +1228,16 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.file_filter = RecursiveFileFilter(self)
         self.file_filter.setSourceModel(self.model)
         self.file_filter.setRecursiveFilteringEnabled(True)
-        self.tree = QTreeView()
+        self.tree = ExplorerTreeView()
         self.tree.setObjectName("fileTree")
         self.tree.setModel(self.file_filter)
         self.tree.setRootIndex(self.file_filter.mapFromSource(self.model.index(str(self.workspace))))
         self.tree.setHeaderHidden(True)
         self.tree.setAnimated(True)
         self.tree.doubleClicked.connect(self.open_index)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self.show_explorer_context_menu)
+        self.tree.paths_dropped.connect(self.move_explorer_items)
         for column in range(1, 4):
             self.tree.hideColumn(column)
         self.tree.setVisible(self.project_open)
@@ -1071,7 +1430,9 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.chat_reply.connect(self.finish_chat_reply)
         self.chat_stream.connect(self.append_chat_stream)
         self.image_generation_finished.connect(self.finish_image_generation)
+        self.audio_generation_finished.connect(self.finish_audio_generation)
         self.video_generation_finished.connect(self.finish_video_generation)
+        self.video_narration_finished.connect(self.finish_video_narration)
         # Ação emitida pelo worker do agente: sempre volte ao event loop Qt
         # antes de consultar ou controlar o QWebEngineView.
         self.browser_action_requested.connect(
@@ -1646,6 +2007,197 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         if path.is_file():
             self.open_file(path)
 
+    def _explorer_path_from_index(self, index):
+        """Converte um indice filtrado da arvore em um caminho real."""
+        if not index.isValid():
+            return None
+        source_index = self.file_filter.mapToSource(index)
+        path = Path(self.model.filePath(source_index))
+        return path.resolve()
+
+    def _is_editable_workspace_path(self, path):
+        """Aceita somente itens internos, sem permitir operar a raiz do projeto."""
+        if not path:
+            return False
+        try:
+            resolved = Path(path).resolve()
+            resolved.relative_to(self.workspace.resolve())
+        except (OSError, ValueError):
+            return False
+        return resolved != self.workspace.resolve()
+
+    def _discard_tabs_for_path(self, path):
+        """Remove abas que apontam para um item excluido, sem pedir novo dialogo."""
+        target = Path(path).resolve()
+        indexes = []
+        for index, opened in self.paths_by_tab.items():
+            try:
+                Path(opened).resolve().relative_to(target)
+            except ValueError:
+                continue
+            indexes.append(index)
+        for index in sorted(indexes, reverse=True):
+            self.tabs.removeTab(index)
+        if indexes:
+            removed = set(indexes)
+            self.paths_by_tab = {
+                index - sum(1 for removed_index in removed if removed_index < index): opened
+                for index, opened in self.paths_by_tab.items()
+                if index not in removed
+            }
+
+    def _remap_open_tabs(self, old_path, new_path):
+        """Mantem abas abertas associadas ao arquivo apos renomear ou mover."""
+        old_path = Path(old_path).resolve()
+        new_path = Path(new_path).resolve()
+        for index, opened in list(self.paths_by_tab.items()):
+            opened = Path(opened).resolve()
+            try:
+                relative = opened.relative_to(old_path)
+            except ValueError:
+                continue
+            updated = new_path / relative
+            self.paths_by_tab[index] = updated
+            suffix = " *" if self.tabs.tabText(index).endswith(" *") else ""
+            self.tabs.setTabText(index, f"{updated.name}{suffix}")
+
+    def show_explorer_context_menu(self, position):
+        index = self.tree.indexAt(position)
+        path = self._explorer_path_from_index(index)
+        if not self._is_editable_workspace_path(path):
+            return
+        self.tree.setCurrentIndex(index)
+        menu = QMenu(self.tree)
+        if path.is_file():
+            open_action = menu.addAction("Abrir")
+            open_action.triggered.connect(lambda _checked=False, item=path: self.open_file(item))
+            menu.addSeparator()
+        rename_action = menu.addAction("Renomear")
+        rename_action.triggered.connect(lambda _checked=False, item=path: self.rename_explorer_item(item))
+        delete_action = menu.addAction("Excluir")
+        delete_action.triggered.connect(lambda _checked=False, item=path: self.delete_explorer_item(item))
+        menu.exec(self.tree.viewport().mapToGlobal(position))
+
+    def rename_explorer_item(self, path=None):
+        path = Path(path).resolve() if path else self._explorer_path_from_index(self.tree.currentIndex())
+        if not self._is_editable_workspace_path(path):
+            QMessageBox.warning(self, "Merotec IA", "Selecione um arquivo ou pasta dentro do projeto.")
+            return
+        new_name, accepted = QInputDialog.getText(
+            self,
+            "Renomear",
+            "Novo nome:",
+            text=path.name,
+        )
+        new_name = new_name.strip()
+        if not accepted or new_name == path.name:
+            return
+        if (
+            not new_name
+            or new_name in {".", ".."}
+            or Path(new_name).name != new_name
+            or re.search(r'[<>:"/\\|?*]', new_name)
+            or new_name.endswith((".", " "))
+        ):
+            QMessageBox.warning(self, "Merotec IA", "Informe um nome valido, sem caracteres especiais ou caminhos.")
+            return
+        destination = path.with_name(new_name)
+        if destination.exists():
+            QMessageBox.warning(self, "Merotec IA", f"Ja existe um item chamado '{new_name}'.")
+            return
+        try:
+            path.rename(destination)
+        except OSError as exc:
+            QMessageBox.critical(self, "Merotec IA", f"Nao foi possivel renomear.\n{exc}")
+            return
+        self._remap_open_tabs(path, destination)
+        self.refresh_tree()
+        self.set_status(f"Renomeado para {destination.name}")
+
+    def delete_explorer_item(self, path=None):
+        path = Path(path).resolve() if path else self._explorer_path_from_index(self.tree.currentIndex())
+        if not self._is_editable_workspace_path(path):
+            QMessageBox.warning(self, "Merotec IA", "A raiz do projeto nao pode ser excluida pelo explorador.")
+            return
+        item_kind = "a pasta e todo o seu conteudo" if path.is_dir() else "o arquivo"
+        opened = []
+        for tab_path in self.paths_by_tab.values():
+            try:
+                Path(tab_path).resolve().relative_to(path)
+                opened.append(Path(tab_path).name)
+            except ValueError:
+                continue
+        extra_notice = "\nAs abas abertas deste item tambem serao fechadas sem salvar." if opened else ""
+        choice = QMessageBox.question(
+            self,
+            "Confirmar exclusao",
+            f"Excluir {item_kind} '{path.name}'? Esta acao nao pode ser desfeita.{extra_notice}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except OSError as exc:
+            QMessageBox.critical(self, "Merotec IA", f"Nao foi possivel excluir.\n{exc}")
+            return
+        self._discard_tabs_for_path(path)
+        self.refresh_tree()
+        self.set_status(f"Excluido: {path.name}")
+
+    def move_explorer_items(self, source_paths, target_path):
+        """Move arquivos e pastas arrastados, mantendo o projeto e as abas coerentes."""
+        target = Path(target_path).resolve() if target_path else self.workspace.resolve()
+        if target.is_file():
+            target = target.parent
+        if not self._is_editable_workspace_path(target) and target != self.workspace.resolve():
+            QMessageBox.warning(self, "Merotec IA", "O destino precisa estar dentro do projeto aberto.")
+            return
+        sources = []
+        for raw_path in source_paths:
+            source = Path(raw_path).resolve()
+            if source not in sources and self._is_editable_workspace_path(source):
+                sources.append(source)
+        # Ao arrastar uma pasta junto com um filho, move apenas a pasta.
+        sources = [
+            source for source in sources
+            if not any(source != parent and source.is_relative_to(parent) for parent in sources)
+        ]
+        if not sources:
+            return
+        destinations = []
+        for source in sources:
+            try:
+                target.relative_to(source)
+                QMessageBox.warning(self, "Merotec IA", "Nao e possivel mover uma pasta para dentro dela mesma.")
+                return
+            except ValueError:
+                pass
+            destination = target / source.name
+            if source.parent == target:
+                continue
+            if destination.exists():
+                QMessageBox.warning(self, "Merotec IA", f"Ja existe '{source.name}' em {target.name or target}.")
+                return
+            destinations.append((source, destination))
+        if not destinations:
+            return
+        try:
+            for source, destination in destinations:
+                shutil.move(str(source), str(destination))
+                self._remap_open_tabs(source, destination)
+        except OSError as exc:
+            QMessageBox.critical(self, "Merotec IA", f"Nao foi possivel mover os itens.\n{exc}")
+            self.refresh_tree()
+            return
+        self.refresh_tree()
+        suffix = "item" if len(destinations) == 1 else "itens"
+        self.set_status(f"{len(destinations)} {suffix} movido(s) para {target.name or target}")
+
     def open_file(self, path: Path):
         path = path.resolve()
         for index, existing in self.paths_by_tab.items():
@@ -1654,6 +2206,12 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
                 return
         if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}:
             self.open_image(path)
+            return
+        if _is_video_source(path):
+            self.open_video(path)
+            return
+        if _is_audio_source(path):
+            self.open_audio(path)
             return
         try:
             text = path.read_text(encoding="utf-8")
@@ -1706,6 +2264,127 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.paths_by_tab[tab] = path
         self.tabs.setCurrentIndex(tab)
         self.language.setText("Imagem")
+
+    def open_audio(self, path: Path):
+        """Abre um arquivo de áudio na aba usando o mesmo player do chat."""
+        panel = QWidget()
+        panel.setObjectName("audioViewer")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+
+        title = QLabel("Player de áudio")
+        title.setObjectName("audioViewerTitle")
+        layout.addWidget(title)
+
+        player = AudioPlayerWidget(path, panel)
+        player.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        layout.addWidget(player)
+        layout.addStretch(1)
+
+        tab = self.tabs.addTab(panel, path.name)
+        self.paths_by_tab[tab] = path
+        self.tabs.setCurrentIndex(tab)
+        self.language.setText("Áudio")
+
+    def open_video(self, path: Path):
+        """Abre um vídeo na aba com prévia e controles de reprodução."""
+        panel = QWidget()
+        panel.setObjectName("videoViewer")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+
+        title = QLabel("Player de vídeo")
+        title.setObjectName("videoViewerTitle")
+        layout.addWidget(title)
+
+        preview = QVideoWidget(panel)
+        preview.setObjectName("videoViewerPreview")
+        preview.setMinimumSize(480, 270)
+        preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout.addWidget(preview, 1)
+
+        player = QMediaPlayer(panel)
+        audio_output = QAudioOutput(panel)
+        audio_output.setVolume(0.9)
+        player.setAudioOutput(audio_output)
+        player.setVideoOutput(preview)
+        player.setSource(_media_url(path))
+
+        controls = QHBoxLayout()
+        play_button = QPushButton("Reproduzir")
+        play_button.setObjectName("terminalAction")
+        stop_button = QPushButton("Parar")
+        stop_button.setObjectName("terminalAction")
+        position = QLabel("0:00 / 0:00")
+        position.setObjectName("videoViewerPosition")
+        controls.addWidget(play_button)
+        controls.addWidget(stop_button)
+        controls.addWidget(position)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        progress = QSlider(Qt.Orientation.Horizontal)
+        progress.setObjectName("videoViewerProgress")
+        progress.setRange(0, 0)
+        layout.addWidget(progress)
+
+        seeking = {"active": False}
+
+        def format_duration(milliseconds):
+            seconds = max(0, int(milliseconds or 0) // 1000)
+            return f"{seconds // 60}:{seconds % 60:02d}"
+
+        def update_position(value):
+            if not seeking["active"]:
+                progress.setValue(max(0, int(value or 0)))
+            position.setText(
+                f"{format_duration(progress.value() if seeking['active'] else value)} / "
+                f"{format_duration(player.duration())}"
+            )
+
+        def toggle_playback():
+            if player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                player.pause()
+            else:
+                if player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia:
+                    player.setPosition(0)
+                player.play()
+
+        def update_play_button(state):
+            play_button.setText(
+                "Pausar" if state == QMediaPlayer.PlaybackState.PlayingState else "Reproduzir"
+            )
+
+        def stop_playback():
+            player.stop()
+            player.setPosition(0)
+
+        def start_seek():
+            seeking["active"] = True
+
+        def finish_seek():
+            player.setPosition(progress.value())
+            seeking["active"] = False
+
+        def show_error(_error, error_string):
+            if error_string:
+                position.setText(f"Não foi possível reproduzir: {error_string}")
+
+        play_button.clicked.connect(toggle_playback)
+        stop_button.clicked.connect(stop_playback)
+        progress.sliderPressed.connect(start_seek)
+        progress.sliderReleased.connect(finish_seek)
+        player.durationChanged.connect(lambda duration: progress.setRange(0, max(0, int(duration or 0))))
+        player.positionChanged.connect(update_position)
+        player.playbackStateChanged.connect(update_play_button)
+        player.errorOccurred.connect(show_error)
+
+        tab = self.tabs.addTab(panel, path.name)
+        self.paths_by_tab[tab] = path
+        self.tabs.setCurrentIndex(tab)
+        self.language.setText("Vídeo")
 
     def _internal_browser_is_usable(self):
         """Retorna se a WebView de sessão ainda existe no lado nativo do Qt."""
@@ -2942,13 +3621,23 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView),
             "Gerar imagem com IA...",
         )
-        video_action = menu.addAction(
+        video_generation_action = menu.addAction(
             self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay),
             "Gerar vídeo com IA...",
         )
+        video_script_action = menu.addAction(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_FileDialogInfoView),
+            "Criar roteiro de vídeo...",
+        )
+        audio_action = menu.addAction(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaVolume),
+            "Gerar áudio...",
+        )
         attach_action.triggered.connect(self.add_attachments)
         image_action.triggered.connect(self.request_image_generation)
-        video_action.triggered.connect(self.request_video_generation)
+        video_generation_action.triggered.connect(self.request_video_generation)
+        video_script_action.triggered.connect(self.request_video_script)
+        audio_action.triggered.connect(self.request_audio_generation)
         menu.exec(self.attach_button.mapToGlobal(self.attach_button.rect().topLeft()))
 
     def clear_attachments(self):
@@ -3011,20 +3700,86 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         if attachments:
             self.clear_attachments()
         self.set_status("Merotec IA pensando...")
-        if self._is_image_generation_request(prompt):
+        video_attachment = next(
+            (path for path in attachments if VideoNarrationService.is_video_file(path)),
+            None,
+        )
+        if video_attachment and VideoNarrationService.is_narration_request(prompt):
             self.streaming_text = ""
             self.streaming_bubble = None
-            self.activity_bubble = self.add_chat("Atividade da IA", "• Gerando imagem...")
-            self.activity_lines = ["• Gerando imagem..."]
-            threading.Thread(target=self._generate_image, args=(prompt,), daemon=True).start()
+            self.activity_bubble = self.add_chat("Atividade da IA", "• Extraindo as telas do vídeo...")
+            self.activity_lines = ["• Extraindo as telas do vídeo..."]
+            threading.Thread(
+                target=self._generate_video_narration,
+                args=(video_attachment, prompt, False),
+                daemon=True,
+            ).start()
             return
-        if self._is_video_generation_request(prompt):
+        latest_video = self._latest_generated_video()
+        if latest_video and self._is_video_narration_revision_request(prompt):
+            self.streaming_text = ""
+            self.streaming_bubble = None
+            self.activity_bubble = self.add_chat(
+                "Atividade da IA", "• Preparando a narração para o último vídeo..."
+            )
+            self.activity_lines = ["• Preparando a narração para o último vídeo..."]
+            threading.Thread(
+                target=self._generate_video_narration,
+                args=(latest_video, prompt, True),
+                daemon=True,
+            ).start()
+            return
+        theme_revision = self._is_video_theme_revision_request(prompt)
+        requested_duration = self._requested_video_duration_seconds(prompt)
+        duration_revision = self._is_video_duration_revision_request(prompt)
+        remembered_reference = getattr(self, "_last_video_reference_image", None)
+        remembered_video_prompt = (
+            str(getattr(self, "_last_video_generation_prompt", "") or "").strip()
+            or self._last_video_generation_prompt_from_context()
+        )
+        new_video_request = self._is_video_generation_request(prompt)
+        video_revision = self._is_video_revision_request(prompt)
+        if (
+            new_video_request
+            or (theme_revision and remembered_reference)
+            or (duration_revision and remembered_video_prompt)
+            or (video_revision and remembered_video_prompt)
+        ):
             self.streaming_text = ""
             self.streaming_bubble = None
             reference_image = next((path for path in attachments if self._is_image_attachment(path)), None)
+            reference_image = reference_image or remembered_reference
+            if reference_image:
+                self._last_video_reference_image = Path(reference_image)
             self.video_cancel_event = threading.Event()
-            video_options = dict(getattr(self, "_next_video_generation_options", {}) or {})
+            if (duration_revision or theme_revision or video_revision) and remembered_video_prompt:
+                revision_instruction = prompt.strip()
+                prompt = remembered_video_prompt
+                video_options = dict(getattr(self, "_last_video_generation_options", {}) or {})
+                if revision_instruction.casefold() not in prompt.casefold():
+                    prompt = (
+                        f"{prompt}\n\n"
+                        f"Requisitos obrigatorios da revisao: {revision_instruction}"
+                    )
+            else:
+                video_options = dict(getattr(self, "_next_video_generation_options", {}) or {})
             self._next_video_generation_options = {}
+            if theme_revision:
+                prompt = (
+                    f"{prompt}\n\nGere um video animado que preserve obrigatoriamente o tema, a paleta, "
+                    "os elementos visuais e a atmosfera da imagem de referencia. "
+                    "A imagem de referencia deve aparecer como assunto principal."
+                )
+            if requested_duration is not None:
+                video_options["duration_seconds"] = requested_duration
+            if reference_image and self._is_source_aspect_ratio_request(prompt):
+                video_options["aspect_ratio"] = self._aspect_ratio_for_reference_image(reference_image)
+            video_options.setdefault("aspect_ratio", "16:9")
+            video_options.setdefault("duration_seconds", 5)
+            video_options.setdefault("quality", "standard")
+            self._last_video_generation_prompt = prompt
+            self._last_video_generation_options = dict(video_options)
+            self._active_video_duration_seconds = int(video_options["duration_seconds"])
             self.activity_bubble = self.add_chat("Atividade da IA", "• Preparando geração de vídeo...")
             self.activity_lines = ["• Preparando geração de vídeo..."]
             threading.Thread(
@@ -3032,6 +3787,20 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
                 args=(prompt, reference_image, video_options, self.video_cancel_event),
                 daemon=True,
             ).start()
+            return
+        if self._is_image_generation_request(prompt):
+            self.streaming_text = ""
+            self.streaming_bubble = None
+            self.activity_bubble = self.add_chat("Atividade da IA", "• Gerando imagem...")
+            self.activity_lines = ["• Gerando imagem..."]
+            threading.Thread(target=self._generate_image, args=(prompt,), daemon=True).start()
+            return
+        if self._is_audio_generation_request(prompt):
+            self.streaming_text = ""
+            self.streaming_bubble = None
+            self.activity_bubble = self.add_chat("Atividade da IA", "• Gerando áudio local...")
+            self.activity_lines = ["• Gerando áudio local..."]
+            threading.Thread(target=self._generate_audio, args=(prompt,), daemon=True).start()
             return
         editor = self.current_editor()
         direct_conversation = self._is_direct_chat_request(prompt)
@@ -3062,6 +3831,17 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.chat_input.setPlainText(f"Gere uma imagem: {prompt.strip()}")
         self.send_chat()
 
+    def request_video_script(self):
+        prompt, accepted = QInputDialog.getMultiLineText(
+            self,
+            "Criar roteiro de vídeo",
+            "Descreva o vídeo que deseja planejar:",
+        )
+        if not accepted or not prompt.strip() or self.chat_busy:
+            return
+        self.chat_input.setPlainText(f"Crie um roteiro de vídeo: {prompt.strip()}")
+        self.send_chat()
+
     def request_video_generation(self):
         prompt, accepted = QInputDialog.getMultiLineText(
             self,
@@ -3085,12 +3865,62 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         )
         if not accepted:
             return
+        style, accepted = QInputDialog.getItem(
+            self,
+            "Direcao criativa",
+            "Estilo visual:",
+            [
+                "Anuncio de impacto", "Cinematico premium", "Reel dinamico",
+                "Institucional limpo", "Neon futurista", "Retro vintage", "Organico leve",
+            ],
+            0,
+            False,
+        )
+        if not accepted:
+            return
+        rhythm, accepted = QInputDialog.getItem(
+            self, "Direcao criativa", "Ritmo:",
+            ["Ritmo medio", "Energetico e rapido", "Calmo e elegante"], 0, False,
+        )
+        if not accepted:
+            return
+        text_style, accepted = QInputDialog.getItem(
+            self, "Direcao criativa", "Texto na tela:",
+            ["Texto automatico", "Texto pequeno sem fundo", "Texto 3D", "Sem texto"], 0, False,
+        )
+        if not accepted:
+            return
+        transition, accepted = QInputDialog.getItem(
+            self, "Direcao criativa", "Transicao entre cenas:",
+            ["Dissolve suave", "Zoom", "Glitch", "Cortes secos"], 0, False,
+        )
+        if not accepted:
+            return
+        soundtrack, accepted = QInputDialog.getItem(
+            self, "Direcao criativa", "Trilha:",
+            ["Video silencioso", "Trilha instrumental local"], 0, False,
+        )
+        if not accepted:
+            return
+        creative_direction = f"{style}; {rhythm}; {text_style}; {transition}; {soundtrack}"
         self._next_video_generation_options = {
             "aspect_ratio": aspect_ratio,
             "duration_seconds": duration_seconds,
             "quality": quality,
+            "creative_direction": creative_direction,
         }
         self.chat_input.setPlainText(f"Gere um vídeo: {prompt.strip()}")
+        self.send_chat()
+
+    def request_audio_generation(self):
+        prompt, accepted = QInputDialog.getMultiLineText(
+            self,
+            "Gerar áudio",
+            "Digite o conteúdo que deseja transformar em áudio:",
+        )
+        if not accepted or not prompt.strip() or self.chat_busy:
+            return
+        self.chat_input.setPlainText(f"Gere um áudio: {prompt.strip()}")
         self.send_chat()
 
     @staticmethod
@@ -3106,6 +3936,116 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         text = " ".join(str(prompt or "").casefold().split())
         return bool(re.match(
             r"^(?:gere|gerar|crie|criar|faça|faca|produza|anime|renderize)\s+(?:um\s+)?v[ií]deo(?:\s|:|$)",
+            text,
+        ))
+
+    @staticmethod
+    def _is_video_theme_revision_request(prompt):
+        """Reconhece ajustes curtos que pedem tema, paleta ou estilo da imagem."""
+        text = " ".join(str(prompt or "").casefold().split())
+        theme_terms = (
+            "tema da imagem", "tema da foto", "tema da referencia",
+            "tema da referência", "estilo da imagem", "estilo da foto",
+            "paleta da imagem", "paleta da foto",
+        )
+        return any(term in text for term in theme_terms)
+
+    @staticmethod
+    def _is_video_revision_request(prompt):
+        """Reconhece pedidos que alteram o ultimo video sem trocar seu assunto."""
+        text = " ".join(str(prompt or "").casefold().split())
+        revision_cues = (
+            "novamente", "de novo", "refaca", "refaça", "recrie", "recria", "regere", "regenere",
+            "sem bolha", "sem as bolhas", "texto 3d", "textos 3d",
+            "texto em 3d", "textos em 3d", "letras 3d", "letras em 3d",
+            "texto menor", "textos menores", "letra menor", "letras menores",
+            "imagem maior", "imagem bem maior", "foto maior", "referencia maior", "referência maior",
+            "amplie a imagem", "aumente a imagem", "aproxime a imagem",
+            "sem barra", "sem faixa", "sem fundo", "sem tarja", "sem caixa",
+            "cinematico", "cinemático", "premium", "reel", "dinamico", "dinâmico",
+            "neon", "retro", "retrô", "vintage", "institucional", "organico", "orgânico",
+            "glitch", "transicao", "transição", "zoom", "trilha", "musica", "música",
+            "sem som", "sem trilha", "sem musica", "sem música", "calmo", "energetico", "energético",
+        )
+        visual_revision_cues = (
+            "raio", "raios", "feixe", "feixes", "laser", "particula", "brilho",
+            "centralizada", "centralizado", "ocupar a tela", "quase toda tela", "tela inteira",
+            "mesmo formato", "mesma proporcao", "vertical", "horizontal", "camera",
+        )
+        return any(cue in text for cue in revision_cues + visual_revision_cues) or (
+            any(term in text for term in ("texto", "textos", "letra", "letras"))
+            and bool(re.search(r"\b(?:bem\s+)?(?:menor|pequen[oa])\b", text))
+        ) or bool(re.search(
+            r"\b(?:imagem|foto|refer[eê]ncia)\b[^\n]{0,36}\b(?:bem\s+)?maior\b"
+            r"|\b(?:amplie|aumente|aproxime)\b[^\n]{0,36}\b(?:imagem|foto|refer[eê]ncia)\b",
+            text,
+        ))
+
+    @staticmethod
+    def _is_video_narration_revision_request(prompt):
+        """Reconhece quando a locução deve substituir o som do último vídeo."""
+        text = " ".join(str(prompt or "").casefold().split())
+        narration_terms = ("narração", "narracao", "locução", "locucao", "voz narrada")
+        audio_edit_terms = (
+            "trilha", "música", "musica", "som", "áudio", "audio",
+            "anúncio", "anuncio", "vídeo", "video", "refaça", "refaca",
+        )
+        return any(term in text for term in narration_terms) and any(term in text for term in audio_edit_terms)
+
+    @staticmethod
+    def _is_source_aspect_ratio_request(prompt):
+        """Identifica quando a revisao pede o formato nativo da imagem-base."""
+        text = " ".join(str(prompt or "").casefold().split())
+        return any(term in text for term in (
+            "mesmo formato da imagem", "formato da imagem", "proporcao da imagem",
+            "formato da foto", "proporcao da foto",
+        ))
+
+    @staticmethod
+    def _aspect_ratio_for_reference_image(source):
+        """Escolhe o formato suportado mais proximo da imagem sem estica-la."""
+        try:
+            from PIL import Image
+
+            with Image.open(Path(source)) as image:
+                ratio = image.width / max(1, image.height)
+        except (OSError, ValueError):
+            return "16:9"
+        candidates = {"16:9": 16 / 9, "9:16": 9 / 16, "1:1": 1.0}
+        return min(candidates, key=lambda name: abs(candidates[name] - ratio))
+
+    @staticmethod
+    def _requested_video_duration_seconds(prompt):
+        """Extrai durações explícitas como ``30s`` ou ``30 segundos``."""
+        text = " ".join(str(prompt or "").casefold().split())
+        match = re.search(r"\b(\d{1,3})\s*(?:s|seg(?:undo)?s?)\b", text)
+        if not match:
+            return None
+        return max(1, min(120, int(match.group(1))))
+
+    @classmethod
+    def _is_video_duration_revision_request(cls, prompt):
+        text = " ".join(str(prompt or "").casefold().split())
+        return (
+            cls._requested_video_duration_seconds(text) is not None
+            and any(term in text for term in ("tempo", "duração", "duracao", "segundo", "video", "vídeo"))
+        )
+
+    def _last_video_generation_prompt_from_context(self):
+        """Recupera o último pedido de vídeo depois de reabrir a IDE."""
+        for message in reversed(getattr(self, "ai_context_memory", []) or []):
+            if not isinstance(message, dict):
+                continue
+            text = str(message.get("text") or "").strip()
+            if self._is_video_generation_request(text):
+                return text
+        return ""
+
+    @staticmethod
+    def _is_audio_generation_request(prompt):
+        text = " ".join(str(prompt or "").casefold().split())
+        return bool(re.match(
+            r"^(?:gere|gerar|crie|criar|faça|faca|produza)\s+(?:um\s+|uma\s+)?(?:áudio|audio|narração|narracao|voz|fala)(?:\s|:|$)",
             text,
         ))
 
@@ -3139,6 +4079,9 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
                 prompt.strip(),
                 flags=re.IGNORECASE,
             ).strip() or prompt.strip()
+            creative_direction = str(options.get("creative_direction") or "").strip()
+            if creative_direction:
+                clean_prompt = f"{clean_prompt}\n\nDirecao criativa: {creative_direction}"
             service = VideoGenerationService(self.settings)
             request = VideoGenerationRequest(
                 prompt=clean_prompt,
@@ -3161,7 +4104,8 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
     def finish_video_generation(self, video_path, error):
         self._set_chat_busy(False)
         if error:
-            if self.video_cancel_event.is_set() or "cancelada" in error.casefold():
+            cancelled = getattr(self, "video_cancel_event", None)
+            if (cancelled is not None and cancelled.is_set()) or "cancelada" in error.casefold():
                 self._append_chat_activity("Geração de vídeo cancelada.")
             else:
                 self._append_chat_activity("Geração de vídeo indisponível.")
@@ -3169,11 +4113,135 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             self.set_status("Pronto")
             return
         path = Path(video_path)
+        if not path.is_file() or path.suffix.casefold() not in VIDEO_SUFFIXES:
+            self._append_chat_activity("A geração não retornou um arquivo de vídeo válido.")
+            self.add_chat("Erro", "A geração de vídeo terminou sem um arquivo reproduzível.")
+            self.set_status("Pronto")
+            return
         self._append_chat_activity("Vídeo pronto no chat.")
-        self.last_response = "Vídeo gerado. Use Reproduzir, Abrir ou Salvar como... abaixo da prévia."
+        duration = int(getattr(self, "_active_video_duration_seconds", 0) or 0)
+        duration_label = f" de {duration} s" if duration else ""
+        self.last_response = f"Vídeo{duration_label} gerado. Use Reproduzir, Abrir ou Salvar como... abaixo da prévia."
         self._remember_ai_context_message("Merotec IA", self.last_response)
+        published = getattr(self, "_published_chat_video", set())
+        published.add(str(path.resolve()).casefold())
+        self._published_chat_video = published
         self.add_chat("Merotec IA", self.last_response, attachments=[path])
         self.set_status("Vídeo gerado.")
+
+    def _generate_audio(self, prompt):
+        try:
+            narration = re.sub(
+                r"^(?:gere|gerar|crie|criar|faça|faca|produza)\s+(?:um\s+|uma\s+)?(?:áudio|audio|narração|narracao|voz|fala)(?:\s*:\s*|\s+)",
+                "",
+                prompt.strip(),
+                flags=re.IGNORECASE,
+            ).strip() or prompt.strip()
+            output_dir = self.workspace / ".merotec_system_ai" / "generated_audio"
+            path = self.voice.generate_audio_file(narration, output_dir)
+            self.audio_generation_finished.emit(str(path), "")
+        except Exception as exc:
+            self.audio_generation_finished.emit("", str(exc))
+
+    def _generate_video_narration(self, video_path, prompt, replace_video_audio=False):
+        try:
+            output_dir = self.workspace / ".merotec_system_ai" / "video_analysis"
+            service = VideoNarrationService()
+            self.chat_stream.emit("[ATIVIDADE] Extraindo telas representativas do vídeo...")
+            analysis = service.extract_storyboard(video_path, output_dir)
+            self.chat_stream.emit("[ATIVIDADE] Analisando as telas e escrevendo o roteiro...")
+            script = self.engine.generate_solution(
+                service.build_narration_prompt(
+                    prompt,
+                    analysis,
+                    target_duration_seconds=service.read_duration(Path(video_path)),
+                ),
+                image_path=analysis.storyboard_path,
+                code_context="",
+                workspace_path=str(self.workspace),
+            ).strip()
+            if not script or script.startswith("Erro no motor") or script.startswith("Chat Web não concluiu"):
+                raise RuntimeError(script or "A IA não retornou um roteiro para o vídeo.")
+            self.chat_stream.emit("[ATIVIDADE] Gerando áudio com voz neural...")
+            audio_path = self.voice.generate_audio_file(
+                script,
+                self.workspace / ".merotec_system_ai" / "generated_audio",
+            )
+            narrated_video = ""
+            if replace_video_audio:
+                self.chat_stream.emit("[ATIVIDADE] Removendo a trilha anterior e inserindo a narração...")
+                output_dir = self.workspace / ".merotec_system_ai" / "generated_videos"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                target = output_dir / f"video_narrado_{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns() % 1_000_000:06d}.mp4"
+                narrated_video = str(service.replace_audio_with_narration(video_path, audio_path, target))
+            self.video_narration_finished.emit(
+                str(audio_path), script, str(analysis.storyboard_path), narrated_video, ""
+            )
+        except Exception as exc:
+            self.video_narration_finished.emit("", "", "", "", str(exc))
+
+    def finish_audio_generation(self, audio_path, error):
+        self._set_chat_busy(False)
+        if error:
+            self._append_chat_activity("Geração de áudio indisponível.")
+            self.add_chat("Erro", error)
+            self.set_status("Pronto")
+            return
+        path = Path(audio_path)
+        if not path.is_file() or not _is_audio_source(path):
+            self._append_chat_activity("A geração não retornou um arquivo de áudio válido.")
+            self.add_chat("Erro", "A geração de áudio terminou sem um arquivo reproduzível.")
+            self.set_status("Pronto")
+            return
+        self._append_chat_activity("Áudio pronto no chat.")
+        self.last_response = "Áudio gerado localmente. Use o player abaixo."
+        self._remember_ai_context_message("Merotec IA", self.last_response)
+        published = getattr(self, "_published_chat_audio", set())
+        published.add(str(path.resolve()).casefold())
+        self._published_chat_audio = published
+        self.add_chat_audio_message("Merotec IA", path, self.last_response, immediate=True)
+        self.set_status("Áudio gerado.")
+
+    def finish_video_narration(self, audio_path, script, storyboard_path, narrated_video_path, error):
+        self._set_chat_busy(False)
+        if error:
+            self._append_chat_activity("Não foi possível criar a narração do vídeo.")
+            self.add_chat("Erro", error)
+            self.set_status("Pronto")
+            return
+        audio = Path(audio_path)
+        storyboard = Path(storyboard_path)
+        if not audio.is_file() or not _is_audio_source(audio):
+            self._append_chat_activity("A análise terminou sem um áudio reproduzível.")
+            self.add_chat("Erro", "A narração do vídeo terminou sem um arquivo de áudio válido.")
+            self.set_status("Pronto")
+            return
+        narrated_video = Path(narrated_video_path) if narrated_video_path else None
+        if narrated_video is not None and (not narrated_video.is_file() or narrated_video.suffix.casefold() not in VIDEO_SUFFIXES):
+            self._append_chat_activity("A narração foi criada, mas a cópia do vídeo não é reproduzível.")
+            self.add_chat("Erro", "A narração foi gerada, porém o vídeo com a trilha substituída não é válido.")
+            self.set_status("Pronto")
+            return
+        self._append_chat_activity("Telas analisadas, trilha removida e narração pronta no chat." if narrated_video else "Telas analisadas e áudio pronto no chat.")
+        self.last_response = (
+            "Vídeo atualizado: a trilha anterior foi removida e a narração foi inserida. "
+            "Use Reproduzir, Abrir ou Salvar como... abaixo da prévia."
+            if narrated_video else "Narração criada a partir das telas do vídeo. Use o player abaixo."
+        )
+        self._remember_ai_context_message("Merotec IA", self.last_response)
+        if storyboard.is_file():
+            self.add_chat("Merotec IA", "Prancha de telas usada para criar o roteiro.", attachments=[storyboard])
+        self.add_chat("Merotec IA", f"Roteiro gerado:\n{script}")
+        if narrated_video is not None:
+            published_videos = getattr(self, "_published_chat_video", set())
+            published_videos.add(str(narrated_video.resolve()).casefold())
+            self._published_chat_video = published_videos
+            self.add_chat("Merotec IA", self.last_response, attachments=[narrated_video])
+        published = getattr(self, "_published_chat_audio", set())
+        published.add(str(audio.resolve()).casefold())
+        self._published_chat_audio = published
+        self.add_chat_audio_message("Merotec IA", audio, self.last_response, immediate=True)
+        self.set_status("Vídeo narrado gerado." if narrated_video else "Narração do vídeo gerada.")
 
     def _generate_reply(self, prompt, context, image_path=None):
         try:
@@ -3202,6 +4270,12 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
                 getattr(self.engine, "latest_generated_image_paths", None)
                 or getattr(self.engine, "latest_generated_image_path", "")
             )
+            self._deliver_generated_chat_audio(
+                (getattr(self.engine, "latest_web_chat_artifacts", {}) or {}).get("audio", [])
+            )
+            self._deliver_generated_chat_video(
+                (getattr(self.engine, "latest_web_chat_artifacts", {}) or {}).get("video", [])
+            )
         except Exception as exc:
             reply = f"Nao foi possivel consultar o provedor configurado: {exc}"
         self.chat_reply.emit(reply or "Nao recebi uma resposta do provedor configurado.")
@@ -3220,6 +4294,41 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
                 continue
             delivered.add(key)
             self.add_chat_image_message("Merotec IA", path, "Imagem gerada pelo Codex.")
+
+    def _deliver_generated_chat_audio(self, audio_sources):
+        """Entrega áudios detectados pelo Chat Web como players no chat."""
+        if isinstance(audio_sources, (str, Path)):
+            audio_sources = [audio_sources]
+        delivered = set()
+        for audio_source in audio_sources or []:
+            source = _media_source_value(audio_source)
+            if not _is_audio_source(audio_source):
+                continue
+            key = source.casefold()
+            if key in delivered:
+                continue
+            delivered.add(key)
+            self.add_chat_audio_message("Merotec IA", audio_source, "Áudio gerado. Use o player abaixo.")
+
+    def _deliver_generated_chat_video(self, video_sources):
+        """Entrega vídeos criados pelo Chat Web como uma prévia reproduzível."""
+        if isinstance(video_sources, (str, Path, dict)):
+            video_sources = [video_sources]
+        delivered = set()
+        for video_source in video_sources or []:
+            source = _media_source_value(video_source)
+            if not _is_video_source(video_source):
+                continue
+            key = source.casefold()
+            if key in delivered:
+                continue
+            delivered.add(key)
+            name = _media_source_name(video_source)
+            note = f"Vídeo gerado. Use Reproduzir abaixo: {name}"
+            self._remember_ai_context_message("Merotec IA", f"{note}\n[vídeo anexado: {name}]")
+            self.ui_bridge.call_soon(
+                lambda source=video_source, text=note: self.add_chat("Merotec IA", text, attachments=[source])
+            )
 
     @staticmethod
     def _is_direct_chat_request(prompt):
@@ -3326,8 +4435,6 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
     def cancel_ai_task(self):
         if not self.chat_busy:
             return
-        if hasattr(self, "video_cancel_event"):
-            self.video_cancel_event.set()
         self.engine.cancel_generation()
         self.streaming_bubble = None
         self._set_chat_busy(False)
@@ -3519,6 +4626,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             self.streaming_bubble = None
         else:
             self.add_chat("Merotec IA", reply)
+        self._publish_unattached_narration(reply)
         self.set_status("Pronto")
 
     def _apply_agent_reply_actions(self, reply):
@@ -3889,7 +4997,7 @@ QPushButton#tinyButton { background: transparent; border: 0; color: #c9d9ea; fon
 QTabWidget#editorTabs::pane { border: 0; } QTabBar::tab { background: #0d1927; color: #b5c3d3; padding: 10px 18px; border-right: 1px solid #223347; min-width: 105px; } QTabBar::tab:hover { background: #17334a; color: #edf8ff; } QTabBar::tab:selected { background: #173b56; color: #eef6ff; border-top: 2px solid #20cbea; } QTabBar::close-button { background: #29445b; border: 1px solid #416881; border-radius: 4px; margin: 3px; } QTabBar::close-button:hover { background: #a63e50; border-color: #f28b99; } QTabBar::close-button:pressed { background: #d05064; border-color: #ffd0d6; }
 QPlainTextEdit#editor { background: #0c1725; color: #d9e2ed; border: 0; padding: 10px; selection-background-color: #294a65; }
 QFrame#terminalPanel { background: #0a1420; border-top: 1px solid #26384c; } QLabel#terminalProgress { color: #79d8e9; padding-left: 12px; } QProgressBar#terminalProgressBar { background: #11263a; border: 0; } QProgressBar#terminalProgressBar::chunk { background: #20cbe8; } QPlainTextEdit#terminal { background: #09131f; border: 0; border-top: 1px solid #203349; color: #bdc9d9; padding: 10px; } QLineEdit#terminalInput { background: #0b1725; border: 1px solid #203349; color: #dce8f6; padding: 8px 12px; } QPushButton#terminalAction { background: transparent; border: 0; color: #a5b8cc; padding: 4px 9px; } QPushButton#terminalAction:hover { color: #21d0eb; }
-QLabel#chatTitle { font-weight: 700; font-size: 17px; color: #eef5ff; } QLabel#provider { color: #68cfea; font-size: 11px; } QScrollArea#chatScroll, QScrollArea#chatScroll > QWidget > QWidget { border: 0; background: #0c1826; } QScrollArea#chatScroll QScrollBar:vertical { background: #0c1826; width: 10px; } QScrollArea#chatScroll QScrollBar::handle:vertical { background: #365d79; border: 2px solid #0c1826; border-radius: 5px; min-height: 38px; } QScrollArea#chatScroll QScrollBar::handle:vertical:hover { background: #4f8caf; } QFrame#chatIncoming, QFrame#chatOutgoing { border-radius: 8px; max-width: 300px; } QFrame#chatIncoming { background: #182637; } QFrame#chatOutgoing { background: #164a75; } QLabel#chatText { color: #e1ebf6; } QLabel#chatMeta { color: #8fa2b7; font-size: 11px; }
+QLabel#chatTitle { font-weight: 700; font-size: 17px; color: #eef5ff; } QLabel#provider { color: #68cfea; font-size: 11px; } QScrollArea#chatScroll, QScrollArea#chatScroll > QWidget > QWidget { border: 0; background: #0c1826; } QScrollArea#chatScroll QScrollBar:vertical { background: #0c1826; width: 10px; } QScrollArea#chatScroll QScrollBar::handle:vertical { background: #365d79; border: 2px solid #0c1826; border-radius: 5px; min-height: 38px; } QScrollArea#chatScroll QScrollBar::handle:vertical:hover { background: #4f8caf; } QFrame#chatIncoming, QFrame#chatOutgoing { border-radius: 8px; max-width: 300px; } QFrame#chatIncoming { background: #182637; } QFrame#chatOutgoing { background: #164a75; } QLabel#chatText { color: #e1ebf6; } QLabel#chatMeta { color: #a9c0d3; font-size: 11px; } QFrame#chatAudioPlayer { background: #102438; border: 1px solid #315a75; border-radius: 6px; } QFrame#chatAudioPlayer QLabel#chatAttachmentName { color: #f1f7ff; font-weight: 600; } QFrame#chatAudioPlayer QLabel#chatMeta { color: #c0d4e4; } QSlider#chatAudioProgress::groove:horizontal { height: 5px; border-radius: 2px; background: #07121d; } QSlider#chatAudioProgress::sub-page:horizontal { border-radius: 2px; background: #27cbea; } QSlider#chatAudioProgress::handle:horizontal { width: 14px; height: 14px; margin: -5px 0; border: 2px solid #f4fbff; border-radius: 7px; background: #3acdec; }
 QFrame#attachmentPanel { background: #102238; border: 1px solid #2e5e7b; border-radius: 6px; }
 QLabel#chatImagePreview { background: #091522; border: 1px solid #355d78; border-radius: 5px; padding: 3px; } QPushButton#chatImageAction { background: #214963; border: 1px solid #3b7597; border-radius: 4px; color: #edf8ff; padding: 4px 8px; } QPushButton#chatImageAction:hover { background: #2c6d90; border-color: #94dff1; } QPushButton#imageButton { min-width: 55px; min-height: 36px; border: 1px solid #2f6687; border-radius: 4px; background: #24536f; color: #eef8ff; padding: 0 7px; } QPushButton#imageButton:hover { background: #31749a; border-color: #79cdeb; } QPushButton#imageButton:disabled { background: #1d3446; border-color: #2a4a61; color: #8298ac; }
 QLabel#attachmentLabel { color: #9be7f6; font-weight: 600; }

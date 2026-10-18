@@ -52,6 +52,9 @@ GLOBAL_SETTING_KEYS = {
     "codex_app_server_idle_timeout_seconds",
     "codex_task_timeout_seconds",
     "external_ai_fallback_enabled",
+    "agent_skill_id",
+    "continuous_development_loop_enabled",
+    "continuous_development_max_cycles",
 }
 
 PROFILE_DEFAULTS = {

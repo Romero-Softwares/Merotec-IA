@@ -2986,6 +2986,7 @@ except Exception as exc:
             )
 
         try:
+            user_content = self._openai_chat_message_content(prompt, code_context, image_path)
             # Detecta se a chave pertence ao OpenRouter
             base_url = str(getattr(self, "openai_base_url", "") or "https://api.openai.com/v1").rstrip("/")
             openrouter_key = self.openai_api_key.startswith("sk-or-")
@@ -3005,7 +3006,7 @@ except Exception as exc:
                     "model": current_model,
                     "messages": [
                         {"role": "system", "content": self._agent_protocol_system_instruction()},
-                        {"role": "user", "content": self._agent_message_payload(prompt, code_context)}
+                        {"role": "user", "content": user_content}
                     ],
                     "temperature": 0.1,
                     "max_tokens": 4096,
@@ -3022,7 +3023,7 @@ except Exception as exc:
                     "model": self.model_id,
                     "messages": [
                         {"role": "system", "content": self._agent_protocol_system_instruction()},
-                        {"role": "user", "content": self._agent_message_payload(prompt, code_context)}
+                        {"role": "user", "content": user_content}
                     ],
                     "temperature": 0.1,
                     "max_tokens": 4096,
@@ -3051,6 +3052,29 @@ except Exception as exc:
             return self._format_openai_http_error(exc.code, body)
         except Exception as exc:
             return f"Erro no motor OpenAI usando modelo `{self.model_id}`: {exc}"
+
+    def _openai_chat_message_content(self, prompt, code_context=None, image_path=None):
+        """Monta conteúdo multimodal para o endpoint Chat Completions.
+
+        A prancha de um vídeo é enviada como ``image_url`` em data URL, que é
+        o formato aceito pelo endpoint. Sem imagem, preserva o payload textual
+        compacto já usado pela IDE.
+        """
+        text = self._agent_message_payload(prompt, code_context)
+        if not image_path:
+            return text
+        try:
+            path = Path(image_path)
+            if not path.is_file() or path.stat().st_size > 8 * 1024 * 1024:
+                return text
+            mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        except OSError:
+            return text
+        return [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{encoded}", "detail": "high"}},
+        ]
 
     def generate_image(self, prompt, output_dir):
         """Gera uma imagem e salva uma cópia local pronta para a interface exibir."""

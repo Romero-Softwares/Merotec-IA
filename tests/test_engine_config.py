@@ -192,6 +192,18 @@ class EngineConfigTest(unittest.TestCase):
         }
         self.assertEqual("[READ: src/app.py]", engine._extract_openai_text(data))
 
+    def test_openai_chat_content_includes_local_image_as_data_url(self):
+        engine = UniversalEngine.__new__(UniversalEngine)
+        engine._agent_message_payload = lambda prompt, context: f"Pedido: {prompt}"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image = Path(temp_dir) / "frames.jpg"
+            image.write_bytes(b"jpeg-bytes")
+            content = engine._openai_chat_message_content("narre o vídeo", "", image)
+
+        self.assertEqual("text", content[0]["type"])
+        self.assertEqual("image_url", content[1]["type"])
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
+
     def test_image_generation_saves_openai_base64_response(self):
         engine = UniversalEngine.__new__(UniversalEngine)
         engine.provider = "openai"

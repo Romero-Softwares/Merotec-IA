@@ -1336,7 +1336,39 @@ def run(
                       const collect = selector => node ? [...node.querySelectorAll(selector)]
                         .map(el => el.currentSrc || el.src || el.href || '')
                         .filter(Boolean).slice(0, 12) : [];
-                      return JSON.stringify({images: collect('img'), audio: collect('audio source,audio,video source,video')});
+                      const audio = [];
+                      const video = [];
+                      const seenAudio = new Set();
+                      const seenVideo = new Set();
+                      const addAudio = (el, url) => {
+                        url = String(url || '').trim();
+                        if (!url || seenAudio.has(url)) return;
+                        seenAudio.add(url);
+                        const label = [el?.getAttribute?.('aria-label'), el?.getAttribute?.('title'), el?.getAttribute?.('download'), el?.textContent]
+                          .filter(Boolean).join(' ').trim();
+                        audio.push({url, media_type: 'audio', name: label || 'Áudio gerado'});
+                      };
+                      const addVideo = (el, url) => {
+                        url = String(url || '').trim();
+                        if (!url || seenVideo.has(url)) return;
+                        seenVideo.add(url);
+                        const label = [el?.getAttribute?.('aria-label'), el?.getAttribute?.('title'), el?.getAttribute?.('download'), el?.textContent]
+                          .filter(Boolean).join(' ').trim();
+                        video.push({url, media_type: 'video', name: label || 'Video gerado'});
+                      };
+                      if (node) {
+                        [...node.querySelectorAll('audio, audio source, [data-testid*="audio"] source, [class*="audio"] source')]
+                          .forEach(el => addAudio(el, el.currentSrc || el.src));
+                        [...node.querySelectorAll('video, video source, [data-testid*="video"] source, [class*="video"] source')]
+                          .forEach(el => addVideo(el, el.currentSrc || el.src));
+                        [...node.querySelectorAll('a[href]')].forEach(el => {
+                          const url = String(el.href || '');
+                          const label = [el.getAttribute('aria-label'), el.getAttribute('title'), el.getAttribute('download'), el.textContent].filter(Boolean).join(' ').toLowerCase();
+                          if (/\.(mp3|wav|m4a|aac|ogg|opus|flac|wma)(?:$|[?#])/i.test(url) || /audio|voice|narr|speech|tts|som/.test(label)) addAudio(el, url);
+                          if (/\.(mp4|webm|mov|mkv|avi)(?:$|[?#])/i.test(url) || /video|movie|clip|render/.test(label)) addVideo(el, url);
+                        });
+                      }
+                      return JSON.stringify({images: collect('img'), audio, video});
                     })()
                     """)
                     try:

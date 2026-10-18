@@ -43,19 +43,25 @@ botões **Abrir** e **Salvar como...**.
 As imagens são copiadas para `.merotec_system_ai/generated_images/` dentro do
 workspace ativo. Essa pasta é local e fica ignorada pelo Git.
 
-## Geração local de vídeo
+## Vídeos e narração
 
-A conversa pode gerar vídeo pelo menu de anexo, em **Gerar vídeo com IA...**,
-ou pela mensagem `Gere um vídeo: ...`. A primeira versão usa um ComfyUI local:
+O menu de anexo mantém dois fluxos independentes: **Gerar vídeo com IA...**
+para renderizar um vídeo pelo provedor local configurado, e **Criar roteiro de
+vídeo...** para planejar o material com o assistente. A mensagem `Gere um
+vídeo: ...` também aciona a geração, sem interferir na análise de vídeos
+anexados.
 
-1. Inicie o ComfyUI com a API em `http://127.0.0.1:8188`.
-2. Em **Configurações da IA**, informe a URL e o caminho do workflow JSON de vídeo exportado pelo ComfyUI.
-3. Inclua `$PROMPT` no campo de texto do workflow. Os tokens opcionais são `$WIDTH`, `$HEIGHT`, `$DURATION_SECONDS`, `$QUALITY` e `$REFERENCE_IMAGE`.
+A geração local usa um ComfyUI em `http://127.0.0.1:8188`. Em
+**Configurações da IA**, informe a URL e o caminho do workflow JSON exportado
+pelo ComfyUI. O workflow deve incluir `$PROMPT`; os tokens opcionais são
+`$WIDTH`, `$HEIGHT`, `$DURATION_SECONDS`, `$QUALITY` e `$REFERENCE_IMAGE`.
+Os vídeos são salvos em `.merotec_system_ai/generated_videos/`, aparecem no
+chat com reprodução e podem ser abertos ou salvos em outro local.
 
-O resultado é salvo em `.merotec_system_ai/generated_videos/`, aparece no chat
-com controles de reprodução e pode ser aberto ou salvo em outro local. Anexe uma
-imagem antes de gerar para usá-la como referência; nesse caso o workflow precisa
-conter `$REFERENCE_IMAGE`.
+Para analisar uma gravação de tela, anexe o vídeo e peça, por exemplo,
+`Analise este vídeo e crie uma narração natural`. A IDE extrai telas em ordem
+cronológica, cria o roteiro com base apenas no que aparece nelas e gera o áudio
+no chat.
 
 ## Requisitos
 

@@ -48,6 +48,8 @@ DEFAULT_APP_SETTINGS = {
     # 0 = sem limite artificial de ciclos; o usuário pode definir um limite positivo em ide_settings.json.
     "continuous_development_loop_enabled": True,
     "continuous_development_max_cycles": 0,
+    # ``auto`` escolhe o especialista localmente a cada nova missão.
+    "agent_skill_id": "auto",
     "autonomous_max_repair_cycles": 4,  # compatibilidade com instalações antigas
     "codex_auto_approve_app_server_requests": True,
     "codex_app_server_approval_policy": "on-request",
@@ -65,7 +67,7 @@ DEFAULT_APP_SETTINGS = {
     "web_chat_auto_attach_media": True,
     # Geração de vídeo local: o workflow JSON é exportado pelo ComfyUI e
     # recebe os tokens $PROMPT, $WIDTH, $HEIGHT e opcionais da IDE.
-    "video_provider": "comfyui",
+    "video_provider": "moviepy",
     "comfyui_base_url": "http://127.0.0.1:8188",
     "comfyui_video_workflow_path": "",
     "video_timeout_seconds": 900,
@@ -76,7 +78,7 @@ DEFAULT_APP_SETTINGS = {
     "web_chat_fallback_enabled": False,
     "voice_keyword_listener_enabled": False,
     "tts_engine": "edge",
-    "tts_voice_id": "pt-BR-AntonioNeural",
+    "tts_voice_id": "pt-BR-FranciscaNeural",
 }
 
 SCRATCHPAD_DEFAULT_TEXT = """# Como configurar um modelo de IA nesta IDE

@@ -13,9 +13,18 @@ if str(ROOT) not in sys.path:
 
 PYSIDE_AVAILABLE = importlib.util.find_spec("PySide6") is not None
 if PYSIDE_AVAILABLE:
-    from pyside_app import MerotecIDE
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtMultimediaWidgets import QVideoWidget
+    from pyside_app import AudioPlayerWidget, MerotecIDE, QMessageBox, _is_audio_source, _is_video_source, _media_source_name
 else:
+    QApplication = None
+    QVideoWidget = None
+    AudioPlayerWidget = None
     MerotecIDE = None
+    QMessageBox = None
+    _is_audio_source = None
+    _is_video_source = None
+    _media_source_name = None
 
 
 @unittest.skipUnless(PYSIDE_AVAILABLE, "PySide6 nao esta instalado neste interpretador")
@@ -43,6 +52,41 @@ class PySideTerminalTests(unittest.TestCase):
         self.assertTrue(MerotecIDE._is_image_generation_request("Gere uma imagem de pessoas ficticias"))
         self.assertTrue(MerotecIDE._is_image_generation_request("crie imagem: uma cidade futurista"))
         self.assertFalse(MerotecIDE._is_image_generation_request("consegue criar imagem de pessoas?"))
+
+    def test_short_request_to_preserve_image_theme_is_detected(self):
+        self.assertTrue(MerotecIDE._is_video_theme_revision_request("Deve ter o tema da imagem"))
+        self.assertTrue(MerotecIDE._is_video_theme_revision_request("Use a paleta da foto"))
+        self.assertFalse(MerotecIDE._is_video_theme_revision_request("Gere um video de uma cidade"))
+
+    def test_video_generation_request_remains_distinct_from_video_narration(self):
+        self.assertTrue(MerotecIDE._is_video_generation_request("Gere um vídeo: uma cidade futurista"))
+        self.assertTrue(MerotecIDE._is_video_generation_request("renderize vídeo de uma floresta"))
+        self.assertFalse(MerotecIDE._is_video_generation_request("analise este vídeo e crie uma narração"))
+
+    def test_requested_video_duration_is_extracted_and_duration_revision_is_detected(self):
+        self.assertEqual(30, MerotecIDE._requested_video_duration_seconds("Gere um video de 30s"))
+        self.assertEqual(45, MerotecIDE._requested_video_duration_seconds("duração: 45 segundos"))
+        self.assertIsNone(MerotecIDE._requested_video_duration_seconds("gere um video moderno"))
+        self.assertTrue(MerotecIDE._is_video_duration_revision_request("O tempo de video deve ser 30s"))
+        self.assertFalse(MerotecIDE._is_video_duration_revision_request("O tempo de renderizacao e longo"))
+
+    def test_video_revision_is_detected_for_explicit_visual_corrections(self):
+        self.assertTrue(MerotecIDE._is_video_revision_request(
+            "Gere o video novamente mas sem as bolhas e com textos 3d"
+        ))
+        self.assertFalse(MerotecIDE._is_video_revision_request("Gere um video de uma cidade"))
+
+    def test_last_video_prompt_is_recovered_from_persisted_chat_context(self):
+        ide = MerotecIDE.__new__(MerotecIDE)
+        ide.ai_context_memory = [
+            {"author": "Você", "text": "Gere um vídeo: uma cidade futurista"},
+            {"author": "Merotec IA", "text": "Vídeo gerado."},
+        ]
+
+        self.assertEqual(
+            "Gere um vídeo: uma cidade futurista",
+            ide._last_video_generation_prompt_from_context(),
+        )
 
     def test_agent_image_message_is_forwarded_to_chat_as_attachment(self):
         class ImmediateBridge:
@@ -118,6 +162,249 @@ class PySideTerminalTests(unittest.TestCase):
                 ("Merotec IA", other, "Imagem gerada pelo Codex."),
             ],
         )
+
+    def test_audio_sources_are_recognized_for_the_embedded_player(self):
+        self.assertTrue(_is_audio_source("C:/audios/narracao.mp3"))
+        self.assertTrue(_is_audio_source("https://example.test/voice.ogg?download=1"))
+        self.assertTrue(_is_audio_source({"url": "https://cdn.example.test/content?id=1", "media_type": "audio"}))
+        self.assertFalse(_is_audio_source("https://example.test/preview.png"))
+        self.assertEqual(_media_source_name("https://example.test/audio/narracao.mp3"), "narracao.mp3")
+
+    def test_open_file_routes_audio_to_the_embedded_player_tab(self):
+        class FakeIDE:
+            open_file = MerotecIDE.open_file
+
+            def __init__(self):
+                self.paths_by_tab = {}
+                self.opened_audio = None
+
+            def open_audio(self, path):
+                self.opened_audio = path
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "fala.wav"
+            path.write_bytes(b"RIFF" + b"x" * 48)
+            ide = FakeIDE()
+            ide.open_file(path)
+
+        self.assertEqual(ide.opened_audio, path.resolve())
+
+    def test_open_file_routes_video_to_the_embedded_player_tab(self):
+        class FakeIDE:
+            open_file = MerotecIDE.open_file
+
+            def __init__(self):
+                self.paths_by_tab = {}
+                self.opened_video = None
+
+            def open_video(self, path):
+                self.opened_video = path
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "demonstracao.mp4"
+            path.write_bytes(b"video")
+            ide = FakeIDE()
+            ide.open_file(path)
+
+        self.assertEqual(ide.opened_video, path.resolve())
+
+    def test_audio_tab_uses_the_same_player_widget_as_the_chat(self):
+        app = QApplication.instance() or QApplication([])
+
+        class Tabs:
+            def __init__(self):
+                self.widget = None
+                self.current_index = None
+
+            def addTab(self, widget, _title):
+                self.widget = widget
+                return 3
+
+            def setCurrentIndex(self, index):
+                self.current_index = index
+
+        class Language:
+            def __init__(self):
+                self.text = ""
+
+            def setText(self, text):
+                self.text = text
+
+        ide = type("FakeIDE", (), {})()
+        ide.tabs = Tabs()
+        ide.paths_by_tab = {}
+        ide.language = Language()
+
+        MerotecIDE.open_audio(ide, Path("C:/audios/fala.wav"))
+
+        self.assertIsInstance(ide.tabs.widget.findChild(AudioPlayerWidget), AudioPlayerWidget)
+        self.assertEqual(ide.paths_by_tab[3], Path("C:/audios/fala.wav"))
+        self.assertEqual(ide.language.text, "Áudio")
+        self.assertIsNotNone(app)
+        ide.tabs.widget.deleteLater()
+
+    def test_video_tab_uses_an_embedded_video_widget(self):
+        app = QApplication.instance() or QApplication([])
+
+        class Tabs:
+            def __init__(self):
+                self.widget = None
+                self.current_index = None
+
+            def addTab(self, widget, _title):
+                self.widget = widget
+                return 4
+
+            def setCurrentIndex(self, index):
+                self.current_index = index
+
+        class Language:
+            def __init__(self):
+                self.text = ""
+
+            def setText(self, text):
+                self.text = text
+
+        ide = type("FakeIDE", (), {})()
+        ide.tabs = Tabs()
+        ide.paths_by_tab = {}
+        ide.language = Language()
+
+        MerotecIDE.open_video(ide, Path("C:/videos/demonstracao.mp4"))
+
+        self.assertIsInstance(ide.tabs.widget.findChild(QVideoWidget), QVideoWidget)
+        self.assertEqual(ide.paths_by_tab[4], Path("C:/videos/demonstracao.mp4"))
+        self.assertEqual(ide.language.text, "Vídeo")
+        self.assertIsNotNone(app)
+        ide.tabs.widget.deleteLater()
+
+    def test_local_audio_generation_requests_do_not_require_chat_web(self):
+        self.assertTrue(MerotecIDE._is_audio_generation_request("Gere um áudio: Olá mundo"))
+        self.assertTrue(MerotecIDE._is_audio_generation_request("criar narração: teste"))
+        self.assertTrue(MerotecIDE._is_audio_generation_request("Produza uma voz: teste"))
+        self.assertFalse(MerotecIDE._is_audio_generation_request("Gere uma imagem: cidade"))
+
+    def test_local_audio_generation_strips_the_request_prefix(self):
+        class Signal:
+            def __init__(self):
+                self.values = []
+
+            def emit(self, *values):
+                self.values.append(values)
+
+        class Voice:
+            def __init__(self):
+                self.text = ""
+
+            def generate_audio_file(self, text, output_dir):
+                self.text = text
+                path = Path(output_dir) / "narracao.mp3"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"audio")
+                return path
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ide = type("FakeIDE", (), {})()
+            ide.workspace = Path(temp_dir)
+            ide.voice = Voice()
+            ide.audio_generation_finished = Signal()
+            MerotecIDE._generate_audio(ide, "Gere um áudio Esta é uma narração local.")
+
+        self.assertEqual(ide.voice.text, "Esta é uma narração local.")
+        self.assertEqual(ide.audio_generation_finished.values[0][1], "")
+
+    def test_generated_audio_artifacts_are_delivered_to_the_chat_player(self):
+        class FakeIDE:
+            _deliver_generated_chat_audio = MerotecIDE._deliver_generated_chat_audio
+
+            def __init__(self):
+                self.delivered = []
+
+            def add_chat_audio_message(self, sender, source, text):
+                self.delivered.append((sender, source, text))
+
+        ide = FakeIDE()
+        signed_audio = {"url": "https://cdn.example.test/content?id=1", "media_type": "audio", "name": "Narracao da resposta"}
+        ide._deliver_generated_chat_audio([
+            "https://example.test/narracao.mp3",
+            "https://example.test/narracao.mp3",
+            signed_audio,
+            "https://example.test/arquivo.txt",
+        ])
+
+        self.assertEqual(len(ide.delivered), 2)
+        self.assertEqual(ide.delivered[0][1], "https://example.test/narracao.mp3")
+        self.assertEqual(ide.delivered[1][1], signed_audio)
+
+    def test_generated_video_artifacts_are_delivered_to_the_chat_player(self):
+        class ImmediateBridge:
+            @staticmethod
+            def call_soon(callback):
+                callback()
+
+        class FakeIDE:
+            _deliver_generated_chat_video = MerotecIDE._deliver_generated_chat_video
+
+            def __init__(self):
+                self.ui_bridge = ImmediateBridge()
+                self.remembered = []
+                self.messages = []
+
+            def _remember_ai_context_message(self, sender, text):
+                self.remembered.append((sender, text))
+
+            def add_chat(self, sender, text, outgoing=False, attachments=None):
+                self.messages.append((sender, text, outgoing, attachments))
+
+        ide = FakeIDE()
+        ide._deliver_generated_chat_video([
+            "https://example.test/anuncio.mp4",
+            "https://example.test/anuncio.mp4",
+            {"url": "https://cdn.example.test/media?id=1", "media_type": "video", "name": "Anúncio"},
+            "https://example.test/arquivo.txt",
+        ])
+
+        self.assertEqual(len(ide.messages), 2)
+        self.assertEqual(ide.messages[0][3], ["https://example.test/anuncio.mp4"])
+        self.assertEqual(ide.messages[1][3][0]["name"], "Anúncio")
+        self.assertTrue(_is_video_source({"url": "https://example.test/stream", "media_type": "video"}))
+
+    def test_completed_narration_reply_publishes_the_latest_local_audio(self):
+        class FakeIDE:
+            _latest_generated_audio = MerotecIDE._latest_generated_audio
+            _publish_unattached_narration = MerotecIDE._publish_unattached_narration
+
+            def __init__(self, workspace):
+                self.workspace = Path(workspace)
+                self._published_chat_audio = set()
+                self.delivered = []
+
+            def add_chat_audio_message(self, sender, source, text, immediate=False):
+                self.delivered.append((sender, Path(source), text, immediate))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_dir = Path(temp_dir) / ".merotec_system_ai" / "generated_audio"
+            audio_dir.mkdir(parents=True)
+            audio_path = audio_dir / "narracao.wav"
+            audio_path.write_bytes(b"RIFF" + b"x" * 48)
+            ide = FakeIDE(temp_dir)
+
+            published = ide._publish_unattached_narration("Narração criada e validada.")
+
+        self.assertTrue(published)
+        self.assertEqual(ide.delivered[0][1].name, "narracao.wav")
+        self.assertTrue(ide.delivered[0][3])
+
+    def test_embedded_audio_player_has_playback_controls(self):
+        app = QApplication.instance() or QApplication([])
+        player = AudioPlayerWidget("C:/audios/narracao.mp3")
+
+        self.assertEqual(player.play_button.text(), "Reproduzir")
+        self.assertEqual(player.stop_button.text(), "Parar")
+        self.assertEqual(player.position.text(), "0:00 / 0:00")
+        self.assertEqual(player.progress.minimum(), 0)
+        self.assertIsNotNone(app)
+        player.deleteLater()
 
     def test_webengine_json_result_is_accepted_for_chat_actions(self):
         result = MerotecIDE._decode_web_javascript_result(
@@ -346,3 +633,103 @@ class PySideTerminalTests(unittest.TestCase):
             self.assertTrue(ide._chat_waiting_for_command)
             self.assertEqual(ide.command, "python -m compileall -q app.py")
             self.assertEqual(ide._chat_auto_validation_paths, {target.resolve()})
+
+    def test_explorer_moves_a_file_when_dropped_on_a_folder(self):
+        class FakeIDE:
+            _is_editable_workspace_path = MerotecIDE._is_editable_workspace_path
+            _remap_open_tabs = MerotecIDE._remap_open_tabs
+            move_explorer_items = MerotecIDE.move_explorer_items
+
+            def __init__(self, workspace):
+                self.workspace = Path(workspace)
+                self.paths_by_tab = {}
+                self.refreshed = False
+                self.status = ""
+
+            def refresh_tree(self):
+                self.refreshed = True
+
+            def set_status(self, text):
+                self.status = text
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            origin = workspace / "origem"
+            destination = workspace / "destino"
+            origin.mkdir()
+            destination.mkdir()
+            source = origin / "arquivo.py"
+            source.write_text("print('ok')\n", encoding="utf-8")
+            ide = FakeIDE(workspace)
+
+            ide.move_explorer_items([str(source)], str(destination))
+
+            self.assertFalse(source.exists())
+            self.assertTrue((destination / "arquivo.py").is_file())
+            self.assertTrue(ide.refreshed)
+            self.assertIn("movido", ide.status)
+
+    def test_explorer_renames_a_workspace_file(self):
+        class FakeIDE:
+            _is_editable_workspace_path = MerotecIDE._is_editable_workspace_path
+            _remap_open_tabs = MerotecIDE._remap_open_tabs
+            rename_explorer_item = MerotecIDE.rename_explorer_item
+
+            def __init__(self, workspace):
+                self.workspace = Path(workspace)
+                self.paths_by_tab = {}
+                self.refreshed = False
+                self.status = ""
+
+            def refresh_tree(self):
+                self.refreshed = True
+
+            def set_status(self, text):
+                self.status = text
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            source = workspace / "antes.txt"
+            source.write_text("conteudo", encoding="utf-8")
+            ide = FakeIDE(workspace)
+
+            with patch("pyside_app.QInputDialog.getText", return_value=("depois.txt", True)):
+                ide.rename_explorer_item(source)
+
+            self.assertFalse(source.exists())
+            self.assertTrue((workspace / "depois.txt").is_file())
+            self.assertTrue(ide.refreshed)
+
+    def test_explorer_deletes_only_after_confirmation(self):
+        class FakeIDE:
+            _is_editable_workspace_path = MerotecIDE._is_editable_workspace_path
+            _discard_tabs_for_path = MerotecIDE._discard_tabs_for_path
+            delete_explorer_item = MerotecIDE.delete_explorer_item
+
+            def __init__(self, workspace):
+                self.workspace = Path(workspace)
+                self.paths_by_tab = {}
+                self.refreshed = False
+                self.status = ""
+
+            def refresh_tree(self):
+                self.refreshed = True
+
+            def set_status(self, text):
+                self.status = text
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            source = workspace / "remover.txt"
+            source.write_text("conteudo", encoding="utf-8")
+            ide = FakeIDE(workspace)
+
+            with patch(
+                "pyside_app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ):
+                ide.delete_explorer_item(source)
+
+            self.assertFalse(source.exists())
+            self.assertTrue(ide.refreshed)
+            self.assertIn("Excluido", ide.status)
