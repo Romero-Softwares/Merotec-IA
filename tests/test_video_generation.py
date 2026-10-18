@@ -255,6 +255,11 @@ class VideoGenerationTests(unittest.TestCase):
         self.assertIn("0:v:0", commands[0])
         self.assertNotIn("0:a:0", commands[0])
         self.assertIn("[narration]", commands[0])
+        self.assertIn("[1:a]aresample=44100,apad[narration]", commands[0])
+        self.assertIn("-strict", commands[0])
+        self.assertEqual("-2", commands[0][commands[0].index("-strict") + 1])
+        self.assertEqual("44100", commands[0][commands[0].index("-ar") + 1])
+        self.assertEqual("96k", commands[0][commands[0].index("-b:a") + 1])
 
     def test_video_narration_samples_evenly_inside_video(self):
         timestamps = VideoNarrationService._sample_timestamps(20.0, 4)

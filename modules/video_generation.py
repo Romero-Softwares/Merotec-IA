@@ -231,9 +231,13 @@ class VideoNarrationService:
         command = [
             "ffmpeg", "-loglevel", "error", "-y",
             "-i", str(source), "-i", str(narration),
-            "-filter_complex", "[1:a]aresample=async=1,apad[narration]",
+            # O encoder AAC do FFmpeg 2013 presente em algumas instalações
+            # Windows rejeita 160 kbps quando a voz chega com amostragem baixa.
+            # A normalização evita o limite de bits por frame sem alterar o
+            # vídeo de origem, que continua em stream copy.
+            "-filter_complex", "[1:a]aresample=44100,apad[narration]",
             "-map", "0:v:0", "-map", "[narration]",
-            "-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+            "-c:v", "copy", "-c:a", "aac", "-strict", "-2", "-ar", "44100", "-b:a", "96k",
             "-t", f"{duration:.3f}", "-movflags", "+faststart", str(target),
         ]
         result = subprocess.run(command, capture_output=True, text=True, timeout=max(90, int(duration * 4)))
