@@ -5960,22 +5960,24 @@ def _merotec_v7_workspace_signature(instance):
     digest = _merotec_v7_hashlib.sha256()
     count = 0
     try:
-        for path in sorted(root.rglob("*")):
-            try:
-                if not path.is_file() or any(is_ignored_dir_name(part) for part in path.parts):
+        for directory, names, files in os.walk(root, followlinks=False):
+            names[:] = sorted(name for name in names if not is_ignored_dir_name(name))
+            for filename in sorted(files):
+                path = Path(directory) / filename
+                try:
+                    if not path.is_file():
+                        continue
+                    relative = path.relative_to(root).as_posix()
+                    # Operational files must not reset the no-progress guard.
+                    if relative.endswith((".bak", ".pyc")) or relative in {"tasks.db", "tasks.db-journal"}:
+                        continue
+                    stat = path.stat()
+                    digest.update(f"{relative}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode("utf-8", "replace"))
+                    count += 1
+                    if count >= 2500:
+                        return digest.hexdigest()[:24]
+                except OSError:
                     continue
-                relative = path.relative_to(root).as_posix()
-                # Backups and databases change as a side effect of valid edits;
-                # they must not reset the no-progress guard by themselves.
-                if relative.endswith((".bak", ".pyc")) or relative in {"tasks.db", "tasks.db-journal"}:
-                    continue
-                stat = path.stat()
-                digest.update(f"{relative}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode("utf-8", "replace"))
-                count += 1
-                if count >= 2500:
-                    break
-            except OSError:
-                continue
     except OSError:
         return "workspace-indisponivel"
     return digest.hexdigest()[:24]
@@ -6013,7 +6015,8 @@ def _merotec_v7_is_output_only_command(command):
 
 def _merotec_v7_metric(instance, task_id):
     metrics = instance.get_ai_task_metrics(task_id)
-    metrics.setdefault("v7_workspace_signature", _merotec_v7_workspace_signature(instance))
+    if "v7_workspace_signature" not in metrics:
+        metrics["v7_workspace_signature"] = _merotec_v7_workspace_signature(instance)
     return metrics
 
 
