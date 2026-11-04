@@ -39,7 +39,7 @@ import asyncio
 import base64
 import ctypes
 import json
-import subprocess
+from modules.process_runtime import subprocess
 from pathlib import Path
 from queue import Empty, Queue
 

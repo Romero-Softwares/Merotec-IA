@@ -1,15 +1,16 @@
 import ctypes
 import locale
-import ctypes
 import os
-import subprocess
+from pathlib import Path
+from modules.process_runtime import subprocess
 import sys
 
 class CodeExecutor:
     def run_python_code(self, file_path, on_start=None):
         try:
             process = subprocess.Popen(
-                [sys.executable, file_path],
+                [sys.executable, str(Path(file_path).resolve())],
+                cwd=str(Path(file_path).resolve().parent),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
             )
@@ -17,7 +18,9 @@ class CodeExecutor:
                 on_start(process)
             output, _ = process.communicate()
             decoded = self._decode_output(output)
-            return process.returncode == 0, decoded
+            observation = getattr(process, "observation", None)
+            interrupted = bool(observation and (observation.cancelled or observation.timed_out))
+            return process.returncode == 0 and not interrupted, decoded
         except Exception as e:
             return False, str(e)
 

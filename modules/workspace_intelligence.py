@@ -2,7 +2,7 @@ import json
 import hashlib
 import os
 import re
-import subprocess
+from modules.process_runtime import subprocess
 import sys
 import threading
 import unicodedata
@@ -13,6 +13,7 @@ from pathlib import Path
 
 from modules.app_constants import IGNORED_DIRS, IGNORED_SUFFIXES, MEROTEC_SYSTEM_AI_DIR
 from modules.memory import MemorySubnet
+from modules.execution_policy import execution_guidance
 
 
 class WorkspaceIntelligenceMixin:
@@ -2226,6 +2227,10 @@ class WorkspaceIntelligenceMixin:
         self.memory_subnet = MemorySubnet(workspace)
         self.memory_subnet.ingest_project_signals(files, summary=summary, recent_changes=recent_changes)
         memory_subnet = self.memory_subnet.format_for_agent(limit=14 if deep else 10)
+        try:
+            execution_context = execution_guidance(workspace)
+        except (OSError, ValueError):
+            execution_context = "Memória de execução indisponível; confira ambiente e permissões antes de testar."
         run_hints = []
         if (workspace / "pubspec.yaml").exists():
             run_hints.extend([
@@ -2240,6 +2245,7 @@ class WorkspaceIntelligenceMixin:
             run_hints.append("- Use os arquivos-chave e o explorer para escolher a menor mudanca verificavel.")
 
         return (
+            f"{execution_context}\n\n"
             "MAPA PERMANENTE DO PROJETO PARA A IA:\n"
             f"{summary}\n\n"
             "Arquivos-chave do projeto:\n"
@@ -2368,6 +2374,10 @@ class WorkspaceIntelligenceMixin:
         return "\n".join(lines)
 
     def detect_project_type(self, workspace, suffix_counts):
+        from modules.electronics import detect_embedded
+        embedded = detect_embedded(workspace) or detect_embedded(workspace / "firmware")
+        if embedded:
+            return embedded
         if (workspace / "pubspec.yaml").exists():
             return "Flutter" if self.detect_run_kind(workspace) == "flutter" else "Dart"
         if (workspace / "package.json").exists():

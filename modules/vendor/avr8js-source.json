@@ -1,0 +1,7 @@
+{
+  "version": "0.21.1",
+  "url": "https://registry.npmjs.org/avr8js/-/avr8js-0.21.1.tgz",
+  "integrity": "sha512-lS1vPaB0gB2GXoPrHFQOUG/5CRORjvnmjbs8SiPZdJpt4HkV0+v6HnNeXxo/X9lPqumqphls2Qyql8zsw9rBaw==",
+  "license": "MIT",
+  "repository": "https://github.com/wokwi/avr8js"
+}

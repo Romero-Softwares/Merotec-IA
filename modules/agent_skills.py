@@ -109,6 +109,23 @@ BUILTIN_AGENT_SKILLS = (
         priority=7,
     ),
     _skill(
+        "electrical-electronics-engineer",
+        "Engenharia elétrica, eletrônica e sistemas embarcados",
+        "Desenvolvimento pessoal e industrial: circuitos, instrumentação, PCB, firmware e automação.",
+        "Conduza requisitos, diagrama de blocos, seleção de componentes, cálculos com unidades e tolerâncias, "
+        "BOM, pinagem, firmware e plano de ensaios. Trabalhe com Arduino/C/C++, ESP32/ESP-IDF, STM32, "
+        "MicroPython, Raspberry Pi, RTOS, HDL, SPICE e KiCad conforme a ferramenta real do projeto. "
+        "Para automação considere sensores, 4–20 mA, 0–10 V, RS-485/Modbus, CAN, CLP e IEC 61131-3. "
+        "Confirme datasheets e revisões; não invente pinagens, limites absolutos ou conformidade normativa. "
+        "Declare hipóteses e diferencie simulação, compilação e medição física. Não afirme testar hardware ausente. "
+        "Use estados seguros, watchdog, temporização não bloqueante, proteção e isolamento adequados. "
+        "Não grave placas nem acione atuadores sem pedido explícito; preserve os guardas do executor. "
+        "Em rede elétrica e funções críticas, indique revisão por profissional habilitado e ensaios antes da operação.",
+        triggers=("arduino", "esp32", "stm32", "micropython", "eletronica", "eletrico", "eletrica", "circuito", "firmware", "kicad", "pcb", "modbus", "clp", "embedded", "fpga", "verilog", "vhdl", "platformio", "esp-idf", "sensor", "rs-485"),
+        project_kinds=("arduino", "platformio", "esp32", "stm32", "micropython", "electronics"),
+        priority=7,
+    ),
+    _skill(
         "python-pyside-maintainer",
         "Python e PySide6",
         "Manutenção de aplicações Python desktop e fluxos Qt.",

@@ -1,6 +1,8 @@
 import os
 import re
+from modules.electronics import EMBEDDED_KINDS, create_embedded_files
 from pathlib import Path
+from modules.process_runtime import ProcessObservation, execution_context
 
 class ProjectManager:
     def __init__(self, base_dir="projects"):
@@ -16,6 +18,21 @@ class ProjectManager:
         return project_path
 
     def create_project(self, parent_dir, project_name, project_type="empty"):
+        parent = Path(parent_dir).expanduser().resolve()
+        observation = ProcessObservation(["create_project", str(project_name), str(project_type)], parent,
+                                         origin="project-manager", operation="create", timeout=None)
+        try:
+            result = self._create_project(parent_dir, project_name, project_type)
+        except Exception as exc:
+            observation.feed(type(exc).__name__)
+            observation.finish(outcome="rejected")
+            raise
+        observation.workspace = observation.cwd = Path(result).resolve()
+        observation.context = execution_context(observation.workspace)
+        observation.finish(outcome="applied")
+        return result
+
+    def _create_project(self, parent_dir, project_name, project_type="empty"):
         """Cria um projeto novo sem sobrescrever uma pasta existente."""
         name = (project_name or "").strip()
         if not name or name in {".", ".."}:
@@ -31,6 +48,7 @@ class ProjectManager:
 
         kind = (project_type or "empty").strip().lower()
         aliases = {
+            "pcb": "electronics",
             "vazio": "empty",
             "html": "web",
             "javascript": "web",
@@ -46,8 +64,8 @@ class ProjectManager:
             "dotnet": "csharp",
         }
         kind = aliases.get(kind, kind)
-        if kind not in {"empty", "python", "web", "flet", "dart", "flutter", "cpp", "csharp"}:
-            raise ValueError("Tipo invalido. Use vazio, python, web, flet, dart, flutter, cpp ou csharp.")
+        if kind not in {"empty", "python", "web", "flet", "dart", "flutter", "cpp", "csharp", *EMBEDDED_KINDS}:
+            raise ValueError("Tipo invalido. Use vazio, python, web, flet, dart, flutter, cpp, csharp, arduino, esp32, stm32, micropython ou electronics.")
         safe_pubspec_name = re.sub(r"[^a-z0-9_]+", "_", name.lower()).strip("_") or "merotec_app"
         dart_display_name = name.replace("\\", "\\\\").replace("'", "\\'")
         dotnet_project_name = re.sub(r"[^A-Za-z0-9_]", "", name) or "MerotecApp"
@@ -164,6 +182,8 @@ class ProjectManager:
             (project_path / "Program.cs").write_text(
                 'Console.WriteLine("Ola, Merotec IA + C#!");\n', encoding="utf-8"
             )
+        if kind in EMBEDDED_KINDS:
+            create_embedded_files(project_path, kind)
         return project_path
 
     def save_file(self, project_name, subfolder, filename, content):

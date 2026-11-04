@@ -11,10 +11,11 @@ import json
 import os
 import re
 import shutil
-import subprocess
+from modules.process_runtime import subprocess
 import sys
 import threading
 import time
+import uuid
 import urllib.request
 import ctypes
 from ctypes import wintypes
@@ -24,7 +25,7 @@ from urllib.parse import urlsplit
 
 from PIL import ImageGrab
 
-from PySide6.QtCore import QModelIndex, QDir, QFileInfo, QMimeData, QProcess, QProcessEnvironment, QSortFilterProxyModel, QStandardPaths, Qt, QTimer, Signal
+from PySide6.QtCore import QModelIndex, QDir, QFileInfo, QMimeData, QProcess, QProcessEnvironment, QSortFilterProxyModel, QStandardPaths, Qt, QTimer, Signal, QThreadPool
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QDrag, QFont, QIcon, QKeySequence, QPainter, QPixmap, QSyntaxHighlighter, QTextCharFormat, QTextDocument
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QInputDialog, QLabel,
@@ -40,13 +41,18 @@ from PySide6.QtCore import QUrl
 
 from modules.engine import UniversalEngine
 from modules.executor import CodeExecutor
+from modules.execution_lessons import ExecutionLessons
+from modules.execution_policy import context_fingerprint, prepare_test_launch, record_observed_result, runner_report
+from modules.process_runtime import ProcessObservation, RepeatedExecutionError, set_active_workspace
 from modules.qt_ui_bridge import QtUiBridge
 from modules.ui_web_chat_bridge import InternalBrowserWebChatBridge
 from modules.app_constants import APP_CHANGE_HISTORY_FILE, APP_HISTORY_FILE, APP_SETTINGS_FILE, PROJECTS_DIR, IGNORED_SUFFIXES, is_ignored_dir_name
 from modules.app_state import AppStateMixin
 from modules.workspace_intelligence import WorkspaceIntelligenceMixin
 from modules.memory import MemorySubnet
-from modules.qt_settings_dialog import QtSettingsDialog
+from modules.qt_settings_dialog import QtSettingsDialog, ModelDiscoveryJob
+from modules.qt_statusbar import AdaptiveStatusBar, ElidedLabel
+from modules.codex_model_discovery import discover_codex_models
 from modules.qt_agent_actions import QtAgentActions
 from modules.project_manager import ProjectManager
 from modules.voice import VoiceModule
@@ -734,6 +740,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self._apply_settings_to_environment()
         self.current_workspace = str(self._initial_workspace())
         self.workspace = Path(self.current_workspace)
+        set_active_workspace(self.workspace)
         # ``projects`` e a pasta que abriga projetos, nao um projeto aberto.
         # O estado separado evita que o explorer pareca reabrir um projeto ao fecha-lo.
         self.project_open = self.workspace.resolve() != PROJECTS_DIR.resolve()
@@ -799,12 +806,18 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.setMinimumSize(1120, 600)
         self._build_ui()
         self._connect_signals()
+        QTimer.singleShot(0, self.apply_voice_keyword_listener_setting)
         self.terminal_progress_timer = QTimer(self)
         self.terminal_progress_timer.setInterval(180)
         self.terminal_progress_timer.timeout.connect(self._render_terminal_progress)
         self.quota_refresh_timer = QTimer(self)
         self.quota_refresh_timer.setInterval(500)
         self.quota_refresh_timer.timeout.connect(self._refresh_chat_runtime_status)
+        self.model_identity_timer = QTimer(self)
+        self.model_identity_timer.setInterval(500)
+        self.model_identity_timer.timeout.connect(self._refresh_model_identity)
+        self.model_identity_timer.start()
+        QTimer.singleShot(0, self._discover_model_identity)
         self._open_initial_file()
         self.load_plugins()
         self.report_plugin_status()
@@ -906,7 +919,10 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             quota = str(self.engine.quota_status_text() or "").strip()
         except Exception:
             quota = ""
-        self.quota_status.setText(f"Cota: {quota}" if quota else "Cota: indisponivel")
+        # The adjacent field already contains the exact model identity.
+        # Keep the provider/model/reasoning prefix in the full tooltip only.
+        usage = quota.partition("|")[2].strip() if "|" in quota else quota
+        self.quota_status.setText(f"Cota: {usage}" if usage else "Cota: indisponivel")
         self.quota_status.setToolTip(quota or "A cota sera exibida quando o provedor informar o status.")
 
     def _refresh_chat_runtime_status(self):
@@ -919,6 +935,47 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         if len(detail) > 72:
             detail = detail[:69].rstrip() + "..."
         self.status.setText(f"🤖  {detail} ({elapsed}s)")
+
+    def _refresh_model_identity(self):
+        engine = getattr(self, "engine", None)
+        if engine is None:
+            return
+        name = engine.assistant_display_name()
+        if hasattr(self, "model_identity"):
+            self.model_identity.setText(f"Modelo: {name}")
+            error = getattr(self, "_model_identity_error", "")
+            self.model_identity.setToolTip(f"{engine.provider} · {name}" + ("\n" + error if error else ""))
+        if hasattr(self, "provider_label"):
+            self.provider_label.setText(f"{engine.provider} · {name}")
+            self.provider_label.setToolTip(f"Modelo identificado: {name}")
+
+    def _discover_model_identity(self):
+        engine = self.engine
+        self._model_identity_token = getattr(self, "_model_identity_token", 0) + 1
+        self._model_identity_target = engine
+        self._model_identity_error = ""
+        self._refresh_model_identity()
+        if engine.provider != "codex" or str(engine.codex_model_name or "").strip():
+            return
+        token = self._model_identity_token
+        def query():
+            executable = getattr(engine, "codex_executable", None) or engine._find_codex_executable()
+            return discover_codex_models(executable, timeout=12)
+        job = ModelDiscoveryJob(token, query)
+        job.signals.done.connect(self._codex_model_identity_discovered)
+        QThreadPool.globalInstance().start(job)
+
+    def _codex_model_identity_discovered(self, token, records, error):
+        if token != getattr(self, "_model_identity_token", None) or self.engine is not getattr(self, "_model_identity_target", None):
+            return
+        if error:
+            self._model_identity_error = error + " Nenhum ID foi presumido. Atualize os modelos nas configurações."
+            self._refresh_model_identity()
+            return
+        default = next((row.get("id") for row in records if row.get("default")), "")
+        if default:
+            self.engine.remember_codex_default_model(default)
+        self._refresh_model_identity()
 
     def log_agent(self, text):
         # Durante a migracao, o terminal e o registro visivel da atividade.
@@ -1107,7 +1164,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
     def _build_menu(self):
         menu = self.menuBar()
         menu.setObjectName("menuBar")
-        for name in ("Arquivo", "Editar", "Selecionar", "Exibir", "Executar", "Terminal", "Ajuda"):
+        for name in ("Arquivo", "Editar", "Selecionar", "Exibir", "Executar", "Terminal", "Engenharia", "Ajuda"):
             current = menu.addMenu(name)
             if name == "Arquivo":
                 current.addAction("Abrir pasta...", self.choose_workspace)
@@ -1132,10 +1189,30 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
                 self._add_menu_action(current, "Diminuir fonte", "Ctrl+-", lambda: self.zoom_editor(-1))
                 self._add_menu_action(current, "Restaurar fonte", "Ctrl+0", lambda: self.zoom_editor(0))
                 current.addAction("Navegador interno", lambda: self.open_internal_browser("https://chatgpt.com/", "usuario"))
+            if name == "Engenharia":
+                current.addAction("Bancada eletrônica...", self.open_electronics_workbench)
+                current.addAction("Editor nativo de esquemático e PCB...", self.open_native_pcb)
             if name == "Terminal":
                 current.addAction("Novo comando", self.focus_terminal_input, "Ctrl+`")
                 current.addAction("Interromper processo", self.cancel_terminal_process, "Ctrl+C")
                 current.addAction("Limpar", self.terminal_clear)
+
+    def open_electronics_workbench(self):
+        from modules.qt_electronics import ElectronicsDialog
+        ElectronicsDialog(self).exec()
+
+    def open_native_pcb(self):
+        from modules.qt_native_pcb import NativePCBWindow
+        window = getattr(self, "native_pcb_window", None)
+        try:
+            if window is not None and window.isVisible():
+                window.raise_()
+                window.activateWindow()
+                return
+        except RuntimeError:
+            pass
+        self.native_pcb_window = NativePCBWindow(self)
+        self.native_pcb_window.show()
 
     def _add_menu_action(self, menu, text, shortcut, callback):
         action = QAction(text, self)
@@ -1319,8 +1396,11 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         title.setObjectName("chatTitle")
         header.addWidget(title)
         header.addStretch()
-        self.provider_label = QLabel(f"{self.engine.provider}")
+        self.provider_label = ElidedLabel(f"{self.engine.provider}")
         self.provider_label.setObjectName("provider")
+        self.provider_label.setMaximumWidth(350)
+        self.provider_label.setMinimumWidth(0)
+        self.provider_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         header.addWidget(self.provider_label)
         layout.addLayout(header)
         self.chat_body = QWidget()
@@ -1398,32 +1478,11 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         return panel
 
     def _build_statusbar(self):
-        bar = QFrame()
-        bar.setObjectName("statusbar")
-        bar.setFixedHeight(42)
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(17, 0, 17, 0)
-        self.status = QLabel("●  Pronto")
-        self.status.setObjectName("readyStatus")
-        layout.addWidget(self.status)
-        layout.addStretch()
-        self.quota_status = QLabel()
-        self.quota_status.setObjectName("quotaStatus")
-        self.quota_status.setMaximumWidth(420)
-        layout.addWidget(self.quota_status)
-        agent = QLabel("🤖  Agente IA: ativo")
-        agent.setObjectName("agentStatus")
-        layout.addWidget(agent)
-        self.language = QLabel("Python")
-        self.language.setObjectName("statusText")
-        layout.addWidget(self.language)
-        self.cursor = QLabel("Ln 1, Col 1")
-        self.cursor.setObjectName("statusText")
-        layout.addWidget(self.cursor)
-        encoding = QLabel("UTF-8    CRLF    4 espacos")
-        encoding.setObjectName("statusText")
-        layout.addWidget(encoding)
+        bar = AdaptiveStatusBar()
+        for name in ("status", "model_identity", "quota_status", "language", "cursor"):
+            setattr(self, name, getattr(bar, name))
         self.refresh_quota_status()
+        self._refresh_model_identity()
         return bar
 
     def _connect_signals(self):
@@ -2911,7 +2970,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         name, accepted = QInputDialog.getText(self, "Novo projeto", "Nome do projeto:")
         if not accepted or not name.strip():
             return
-        kinds = ["python", "web", "flet", "dart", "flutter", "cpp", "csharp", "empty"]
+        kinds = ["python", "web", "flet", "dart", "flutter", "cpp", "csharp", "arduino", "esp32", "stm32", "micropython", "electronics", "pcb", "empty"]
         kind, accepted = QInputDialog.getItem(self, "Tipo do projeto", "Template:", kinds, 0, False)
         if not accepted:
             return
@@ -2971,6 +3030,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
 
         neutral_workspace.mkdir(parents=True, exist_ok=True)
         self.workspace = neutral_workspace
+        set_active_workspace(self.workspace)
         self.current_workspace = str(neutral_workspace)
         self.project_open = False
         self.terminal_working_directory = neutral_workspace
@@ -2991,6 +3051,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
 
     def open_workspace(self, folder):
         self.workspace = Path(folder).resolve()
+        set_active_workspace(self.workspace)
         self.project_open = True
         self.terminal_working_directory = self.workspace
         self.current_workspace = str(self.workspace)
@@ -3132,6 +3193,12 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             self.append_terminal(f"[Terminal] Comando adicionado a fila ({len(self._terminal_session_queue)}): {command}\n")
             self.set_status("Comando aguardando na fila do terminal")
             return
+        observation = ProcessObservation(command, getattr(self, "workspace", self.terminal_working_directory),
+                                         cwd=self.terminal_working_directory, origin="terminal-session")
+        assessment = observation.assess()
+        if assessment.get("should_pause"):
+            self.append_terminal("[Diagnóstico] Tentativa manual: " + assessment["recommendation"] + "\n")
+        self._terminal_session_observation = observation
         process = self.terminal_session
         try:
             session_is_running = bool(process) and process.state() != QProcess.ProcessState.NotRunning
@@ -3151,6 +3218,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             environment.insert("TTY_INTERACTIVE", "0")
             environment.insert("PYTHONUTF8", "1")
             environment.insert("PYTHONUNBUFFERED", "1")
+            environment.insert("MEROTEC_EXECUTION_WORKSPACE", str(observation.workspace))
             process.setProcessEnvironment(environment)
             process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
             process.readyReadStandardOutput.connect(lambda p=process: self._read_terminal_stdout(p))
@@ -3164,24 +3232,36 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             else:
                 process.start("/bin/sh", ["-i"])
         self._terminal_session_command_number += 1
-        marker = f"__MEROTEC_COMMAND_DONE_{self._terminal_session_command_number}__"
+        marker = f"__MEROTEC_COMMAND_DONE_{self._terminal_session_command_number}_{uuid.uuid4().hex}__"
         self._terminal_session_marker = marker
         self._terminal_session_output_buffer = ""
         self._terminal_session_interactive = self._command_requires_interactive_input(command)
         self._start_terminal_progress("session", f"Executando: {command}")
         if os.name == "nt":
-            wrapped_command = f"{command} & echo {marker}"
+            # A separate input line expands errorlevel AFTER the command. '&
+            # echo %errorlevel%' on the same line would read the old status.
+            wrapped_command = f"{command}\r\necho {marker}%errorlevel%^|%CD%"
         else:
-            wrapped_command = f"({command}); printf '{marker}\\n'"
+            # No subshell: cd, exports and activated environments must survive.
+            wrapped_command = f"{command}\n__merotec_command_status=$?; printf '{marker}%s|%s\\n' \"$__merotec_command_status\" \"$PWD\""
         try:
             process.write((wrapped_command + "\r\n").encode("utf-8"))
         except RuntimeError:
+            observation.finish(launch_error=True)
             self.terminal_session = None
             self._stop_terminal_progress("session")
             self._terminal_session_queue.clear()
             self.append_terminal("A sessao do terminal foi encerrada. Envie o comando novamente.\n")
             return
+        if observation.timeout:
+            QTimer.singleShot(int(observation.timeout * 1000), lambda o=observation: self._terminal_session_deadline(o))
         self.set_status("Executando comando no terminal")
+
+    def _terminal_session_deadline(self, observation):
+        if getattr(self, "_terminal_session_observation", None) is observation and not observation.finished:
+            observation.timed_out = True
+            self.append_terminal(f"\n[Diagnóstico] Limite de {observation.timeout:g}s excedido. A sessão será interrompida; confira o ambiente antes de repetir.\n")
+            self.cancel_terminal_process(self.terminal_session)
 
     @staticmethod
     def _command_requires_interactive_input(command):
@@ -3208,6 +3288,11 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         if process is not self.terminal_session:
             return
         self._read_terminal_stdout(process)
+        observation = getattr(self, "_terminal_session_observation", None)
+        if isinstance(observation, ProcessObservation) and not observation.finished:
+            observation.feed("Sessão encerrada antes do comprovante de conclusão do comando.")
+            observation.finish(_exit_code, cancelled=True)
+        self._terminal_session_observation = None
         self.terminal_session = None
         self._stop_terminal_progress("session")
         self._terminal_session_marker = ""
@@ -3228,6 +3313,11 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         except RuntimeError:
             detail = "processo removido"
         self.append_terminal(f"Nao foi possivel iniciar o terminal: {detail}.\n")
+        observation = getattr(self, "_terminal_session_observation", None)
+        if isinstance(observation, ProcessObservation):
+            observation.feed(detail)
+            observation.finish(launch_error=True)
+        self._terminal_session_observation = None
         self.terminal_session = None
         self._stop_terminal_progress("session")
         self._terminal_session_marker = ""
@@ -3287,8 +3377,29 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         if self.terminal_process and self.terminal_process.state() != QProcess.ProcessState.NotRunning:
             self.append_terminal("Um processo ja esta em execucao. Interrompa-o antes de iniciar outro.\n")
             return False
+        cwd = Path(working_directory or self.terminal_working_directory).resolve()
+        observation = ProcessObservation(label, getattr(self, "workspace", cwd), cwd=cwd,
+                                         origin="agent" if getattr(self, "_agent_command_pending", "") else "terminal",
+                                         autonomous=bool(getattr(self, "_agent_command_pending", "")))
+        try:
+            assessment = observation.check()
+        except RepeatedExecutionError as exc:
+            self.append_terminal(str(exc) + "\n")
+            return False
+        if assessment.get("should_pause"):
+            self.append_terminal("[Diagnóstico] Nova tentativa manual: " + assessment["recommendation"] + "\n")
         process = QProcess(self)
-        process.setWorkingDirectory(str(Path(working_directory or self.terminal_working_directory).resolve()))
+        process.setWorkingDirectory(str(cwd))
+        process._merotec_observation = observation
+        meta = getattr(self, "_agent_execution_meta", {})
+        if meta:
+            meta["observation"] = observation
+            if meta.get("test_argv"):
+                observation.strategy = meta["strategy"]
+                observation.timeout = None  # The isolated runner owns this deadline/report.
+        environment = QProcessEnvironment.systemEnvironment()
+        environment.insert("MEROTEC_EXECUTION_WORKSPACE", str(observation.workspace))
+        process.setProcessEnvironment(environment)
         # Um único fluxo preserva a ordem entre stdout/stderr e evita que logs
         # importantes do compilador só apareçam quando o processo terminar.
         process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
@@ -3301,7 +3412,16 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.terminal_input.setEnabled(False)
         self._start_terminal_progress("process", f"Executando: {label}")
         process.start(program, arguments)
+        if observation.timeout:
+            QTimer.singleShot(int(observation.timeout * 1000), lambda p=process, o=observation: self._terminal_deadline(p, o))
         return True
+
+    def _terminal_deadline(self, process, observation):
+        if process is not self.terminal_process or observation.finished:
+            return
+        observation.timed_out = True
+        self.append_terminal(f"\n[Diagnóstico] Tempo limite de {observation.timeout:g}s excedido; causa não confirmada.\n")
+        self.cancel_terminal_process()
 
     def _start_terminal_progress(self, source, description):
         self._terminal_progress_percent = None
@@ -3361,10 +3481,16 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         except RuntimeError:
             return
         text = self._decode_process_output(data)
+        observation = getattr(process, "_merotec_observation", None)
+        if isinstance(observation, ProcessObservation):
+            observation.feed(text)
         if process is self.terminal_process and getattr(self, "_agent_command_pending", ""):
             self._agent_command_output = (getattr(self, "_agent_command_output", "") + text)[-12000:]
         self._observe_terminal_progress_output(text)
         if process is self.terminal_session:
+            session_observation = getattr(self, "_terminal_session_observation", None)
+            if isinstance(session_observation, ProcessObservation):
+                session_observation.feed(text)
             self._append_terminal_session_output(text)
             return
         self.append_terminal(text)
@@ -3390,13 +3516,34 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         marker_index = self._terminal_session_output_buffer.find(marker)
         if marker_index >= 0:
             before = self._terminal_session_output_buffer[:marker_index]
-            after = self._terminal_session_output_buffer[marker_index + len(marker):]
+            payload = self._terminal_session_output_buffer[marker_index + len(marker):]
+            end = re.search(r"\r?\n", payload)
+            if end is None:
+                return  # A pipe can split the status/cwd across multiple reads.
+            status_line = payload[:end.start()]
+            result = re.fullmatch(r"(-?\d+)\|(.*)", status_line)
+            code = int(result.group(1)) if result else None
+            after = payload[end.end():]
+            observation = getattr(self, "_terminal_session_observation", None)
+            if isinstance(observation, ProcessObservation):
+                if code is not None:
+                    observation.finish(code)
+                else:
+                    observation.feed("Comprovante de conclusão inválido; resultado não confirmado.")
+                    observation.finish(outcome="cancelled")
+                if observation.result and observation.result.get("diagnosis"):
+                    self.append_terminal("[Diagnóstico] " + observation.result["diagnosis"] + "\n")
+            self._terminal_session_observation = None
+            if result:
+                candidate = Path(result.group(2))
+                if candidate.is_dir():
+                    self.terminal_working_directory = candidate.resolve()
             self.append_terminal((before + after).lstrip("\r\n"))
             self._terminal_session_output_buffer = ""
             self._terminal_session_marker = ""
             self._terminal_session_interactive = False
             self._stop_terminal_progress("session")
-            self.set_status("Terminal pronto")
+            self.set_status("Terminal pronto" if code == 0 else "Comando terminou sem aprovação")
             self._run_next_terminal_session_command()
             return
         safe_length = max(0, len(self._terminal_session_output_buffer) - len(marker) - 2)
@@ -3428,6 +3575,10 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             return
         if error == QProcess.ProcessError.FailedToStart:
             detail = process.errorString().strip()
+            observation = getattr(process, "_merotec_observation", None)
+            if isinstance(observation, ProcessObservation):
+                observation.feed(detail)
+                observation.finish(launch_error=True)
             self.append_terminal(f"Nao foi possivel iniciar '{self._terminal_command}': {detail or 'executavel indisponivel'}.\n")
             self.set_status("Falha ao iniciar comando")
             self.terminal_input.setEnabled(True)
@@ -3440,6 +3591,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             agent_command = getattr(self, "_agent_command_pending", "")
             if agent_command:
                 self._agent_command_pending = ""
+                self._record_agent_command_result(agent_command, False, -1, detail)
                 self._continue_agent_after_command(agent_command, False, -1, detail or "Não foi possível iniciar o comando.")
 
     def _terminal_finished(self, process, exit_code, exit_status):
@@ -3451,6 +3603,14 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         was_cancelled = self._terminal_cancel_requested
         agent_command = getattr(self, "_agent_command_pending", "")
         agent_output = getattr(self, "_agent_command_output", "")
+        observation = getattr(process, "_merotec_observation", None)
+        if isinstance(observation, ProcessObservation):
+            meta = getattr(self, "_agent_execution_meta", {})
+            report = runner_report(meta["workspace"], meta["test_argv"], exit_code, meta["started_at"]) if meta.get("test_argv") else None
+            observation.finish(exit_code, crashed=exit_status != QProcess.ExitStatus.NormalExit,
+                               cancelled=was_cancelled, timed_out=bool(report and report.get("timed_out")))
+            if observation.result and observation.result.get("diagnosis"):
+                self.append_terminal("[Diagnóstico] " + observation.result["diagnosis"] + "\n")
         if was_cancelled:
             message = "\nProcesso interrompido.\n"
         else:
@@ -3467,15 +3627,28 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         if agent_command:
             self._agent_command_pending = ""
             self._agent_command_output = ""
+            note = self._record_agent_command_result(agent_command, succeeded and not was_cancelled, exit_code, agent_output)
+            if note:
+                agent_output += "\n\n" + note
             self._continue_agent_after_command(agent_command, succeeded and not was_cancelled, exit_code, agent_output)
 
-    def cancel_terminal_process(self):
-        process = self.terminal_process or self.terminal_session
+    def cancel_terminal_process(self, process=None):
+        process = process if isinstance(process, QProcess) else (self.terminal_process or self.terminal_session)
         if not process or process.state() == QProcess.ProcessState.NotRunning:
             self.set_status("Nenhum processo em execucao")
             return
         self.append_terminal("\nInterrompendo processo...\n")
         self._terminal_cancel_requested = True
+        if os.name == "nt" and process.processId():
+            # Stop the runner's tree while its parent PID still exists. Killing
+            # the wrapper first could leave the test process running unnoticed.
+            try:
+                subprocess.run([str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/taskkill.exe"),
+                                "/PID", str(process.processId()), "/T", "/F"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         process.terminate()
         QTimer.singleShot(1500, lambda: self._force_stop_terminal_process(process))
 
@@ -4641,6 +4814,10 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             on_browser_action=self.run_agent_browser_action,
         )
         actions.changed_paths = actions.apply(reply)
+        rejection = getattr(self, "_agent_command_rejection", "")
+        if rejection:
+            actions.last_observations.append(rejection)
+            self._agent_command_rejection = ""
         return actions
 
     def _start_automatic_validation(self, changed_paths):
@@ -4663,6 +4840,43 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self._chat_auto_validation_paths = set()
         self.add_chat("Erro", "A primeira validacao automatica nao conseguiu iniciar no Terminal Local.")
         return False
+
+    def apply_voice_keyword_listener_setting(self):
+        """Aplica a preferência de escuta contínua sem tocar nos widgets do worker."""
+        try:
+            self.voice.stop_keyword_listener()
+            if not self.settings.get("voice_keyword_listener_enabled", False):
+                return False
+            started = self.voice.start_keyword_listener(
+                self._receive_keyword_voice_command,
+                self._update_keyword_voice_capture_state,
+            )
+            if not started:
+                self.set_status("Comando de voz indisponível")
+            return started
+        except Exception as exc:
+            self.set_status("Comando de voz indisponível")
+            self.add_chat("Sistema", f"Não foi possível ativar o comando de voz: {exc}")
+            return False
+
+    def _update_keyword_voice_capture_state(self, capturing):
+        self.ui_bridge.call_soon(
+            lambda: self.set_status(
+                "Ouvindo comando de voz..." if capturing else "Comando de voz aguardando palavra-chave"
+            )
+        )
+
+    def _receive_keyword_voice_command(self, command):
+        text = str(command or "").strip()
+        if text:
+            self.ui_bridge.call_soon(lambda: self._send_keyword_voice_command(text))
+
+    def _send_keyword_voice_command(self, command):
+        if self.chat_busy:
+            self.add_chat("Sistema", "Comando de voz recebido, mas a IA ainda está ocupada.")
+            return
+        self.chat_input.setPlainText(command)
+        self.send_chat()
 
     def toggle_voice_capture(self):
         if not self.voice_capture_active:
@@ -4713,6 +4927,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             else:
                 self.add_chat("Sistema", "Nenhum comando de voz reconhecido.")
             self.set_status("Pronto")
+            self.apply_voice_keyword_listener_setting()
         self.ui_bridge.call_soon(completed)
 
     def play_last_response(self):
@@ -4756,17 +4971,67 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
         self.set_status(status_text)
 
     def run_agent_command(self, command):
+        self._agent_command_rejection = ""
         if self.terminal_process and self.terminal_process.state() != QProcess.ProcessState.NotRunning:
             self.add_chat("Sistema", "Comando da IA nao executado: o terminal ja esta ocupado.")
+            return False
+        workspace = Path(self.workspace).resolve()
+        try:
+            fingerprint = context_fingerprint(workspace)
+            assessment = ExecutionLessons(workspace).assess_repeat(command, context=fingerprint)
+            if assessment["should_pause"]:
+                self._agent_command_rejection = "EXECUTE recusado após falhas repetidas no mesmo contexto. " + assessment["recommendation"]
+                self.append_terminal(self._agent_command_rejection + "\n")
+                self._append_chat_activity(self._agent_command_rejection)
+                return False
+            launch = prepare_test_launch(command, workspace)
+        except (OSError, ValueError) as exc:
+            self._agent_command_rejection = f"Preparação do comando não concluída: {exc}"
+            self.append_terminal(self._agent_command_rejection + "\n")
             return False
         self.append_terminal(f"\n[IA - comando executado] {command}\n")
         self._append_chat_activity(f"Comando enviado ao terminal: {command}")
         self._agent_command_pending = command
         self._agent_command_output = ""
-        started = self._start_shell_command(command, working_directory=self.workspace)
+        self._agent_execution_meta = {"workspace": workspace, "context": fingerprint,
+                                      "started_at": time.time(), "strategy": "shell_process"}
+        if launch:
+            self._agent_execution_meta.update(strategy=launch["strategy"], test_argv=launch["test_argv"])
+            self.append_terminal("[Testes] AppData/temporários isolados no workspace; limite de 120s.\n")
+            started = self.start_terminal_process(launch["program"], launch["arguments"], command, working_directory=workspace)
+        else:
+            started = self._start_shell_command(command, working_directory=workspace)
         if not started:
             self._agent_command_pending = ""
+            self._agent_execution_meta = {}
         return started
+
+    def _record_agent_command_result(self, command, succeeded, exit_code, output):
+        meta = getattr(self, "_agent_execution_meta", {})
+        self._agent_execution_meta = {}
+        if not meta:
+            return ""
+        try:
+            observation = meta.get("observation")
+            if isinstance(observation, ProcessObservation):
+                assessment = observation.assess()
+                return "MEMÓRIA DE EXECUÇÃO: " + assessment["recommendation"] + " " + (observation.result or {}).get("diagnosis", "")
+            report = runner_report(meta["workspace"], meta.get("test_argv"), exit_code, meta["started_at"]) if meta.get("test_argv") else None
+            result = record_observed_result(meta["workspace"], command, exit_code, succeeded=succeeded,
+                                            timed_out=bool(report and report.get("timed_out")),
+                                            strategy=meta["strategy"], output=output, context=meta["context"])
+            if result:
+                if not result["entry"].get("persisted"):
+                    return "O resultado do processo foi observado, mas não foi possível persistir a memória no workspace."
+                note = "MEMÓRIA DE EXECUÇÃO: " + result["assessment"]["recommendation"]
+                if report and report.get("timed_out"):
+                    note += " Timeout observado; causa não confirmada. Localize a etapa e verifique ambiente/permissões antes de repetir."
+                if meta.get("test_argv"):
+                    note += " Estratégia utilizada: AppData e temporários locais ao workspace, apenas no processo de testes."
+                return note
+        except (OSError, ValueError):
+            pass
+        return "Memória não gravada; use somente o resultado observado deste processo."
 
     def _continue_agent_after_command(self, command, succeeded, exit_code, output):
         """Entrega ao agente o resultado real de um EXECUTE antes de encerrar a tarefa."""
@@ -4913,8 +5178,10 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             self._save_settings()
             self.engine = UniversalEngine()
             self.attach_internal_web_chat_bridge()
+            self.apply_voice_keyword_listener_setting()
             self.provider_label.setText(self.engine.provider)
-            self.set_status("Configuracoes salvas.")
+            self._discover_model_identity()
+            self.set_status(f"Configurações aplicadas: {self.engine.provider} · {self.engine.assistant_display_name()}")
 
     def launch_codex_login(self):
         """Abre a autenticacao da conta Codex selecionada no Windows."""
@@ -4964,6 +5231,7 @@ class MerotecIDE(AppStateMixin, WorkspaceIntelligenceMixin, QMainWindow):
             self.attach_internal_web_chat_bridge()
             self.provider_label.setText(self.engine.provider)
             self.codex_login_started = False
+            self._discover_model_identity()
             self.set_status("Codex conectado.")
             self.add_chat("Sistema", "Sessao Codex conectada e pronta para uso.")
             return

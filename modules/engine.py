@@ -1,4 +1,5 @@
 import base64
+from collections import deque
 import atexit
 import hashlib
 import importlib.util
@@ -8,7 +9,7 @@ import os
 import queue
 import re
 import shutil
-import subprocess
+from modules.process_runtime import subprocess
 import sys
 import tempfile
 import threading
@@ -34,6 +35,10 @@ from modules.ai_profiles import (
     profile_for,
 )
 from modules.web_chat_bridge import WebChatBridge
+from modules.model_discovery import normalize_openai_base_url
+from modules.execution_lessons import ExecutionLessons
+from modules.process_runtime import execution_context
+from modules.execution_policy import context_fingerprint, execution_guidance, record_codex_command_event, record_codex_action_event, record_codex_cli_event
 
 
 class UniversalEngine:
@@ -79,6 +84,8 @@ class UniversalEngine:
         self.provider = requested_provider
         
         self.codex_model_name = str(settings.get("codex_model_name", os.getenv("CODEX_MODEL_NAME", app_config.CODEX_MODEL_NAME))).strip()
+        self.codex_default_model_name = ""
+        self.active_codex_model_name = ""
         self.codex_reasoning_effort = str(settings.get("codex_reasoning_effort", os.getenv("CODEX_REASONING_EFFORT", app_config.CODEX_REASONING_EFFORT))).strip().lower() or "high"
         
         # 3. Carrega as chaves de API salvas na configuração do JSON ou do ambiente
@@ -379,6 +386,10 @@ class UniversalEngine:
         self.lm_studio_model_name = getattr(self, "lm_studio_model_name", "")
         self.google_model_name = getattr(self, "google_model_name", "")
         self.local_gguf_path = getattr(self, "local_gguf_path", "")
+        # A remote account default is not a stable provider/model cache key.
+        # Its exact identity is supplied asynchronously by discovery or runtime.
+        if self.provider == "codex":
+            return self._codex_display_model()
         self._model_cache = getattr(self, "_model_cache", {})
         configured_model = {
             "web_chat": self.web_chat_url,
@@ -398,8 +409,6 @@ class UniversalEngine:
             except Exception:
                 host = self.web_chat_url
             model_id = f"Chat Web · {host or 'URL livre'}"
-        elif self.provider == "codex":
-            model_id = self.codex_model_name or "gpt-5.5"
         elif self.provider == "openai":
             model_id = self.openai_model_name or "gpt-5.5"
         elif self.provider == "lm_studio":
@@ -427,14 +436,85 @@ class UniversalEngine:
                 or "Modelo do servidor LLM"
             )
         if self.provider == "openai":
-            return self.active_openai_model_name or self.openai_model_name or self.model_id or "Modelo OpenAI"
+            return getattr(self, "active_openai_model_name", "") or self.openai_model_name or self.model_id or "modelo não confirmado"
         if self.provider == "google":
             return self.google_model_name or self.model_id or "Modelo Google"
         if self.provider == "local_gguf":
             return self.model_id or "Modelo local GGUF"
         if self.provider == "codex":
-            return self.codex_model_name or "Codex"
+            return self._codex_display_model()
         return self.model_id or "IA"
+
+    @staticmethod
+    def _exact_model_identity(value):
+        if not isinstance(value, str):
+            return ""
+        value = value.strip()
+        if not value or len(value) > 256 or any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value):
+            return ""
+        return value
+
+    def _codex_display_model(self):
+        active = self._exact_model_identity(getattr(self, "active_codex_model_name", ""))
+        if active:
+            return active
+        configured = getattr(self, "codex_model_name", "")
+        if configured:
+            return self._exact_model_identity(configured) or "modelo não confirmado"
+        default = self._exact_model_identity(getattr(self, "codex_default_model_name", ""))
+        if default:
+            return default
+        # Support legacy/bare instances with an explicitly supplied identity,
+        # without letting a previous default leak into a configured instance.
+        if not hasattr(self, "codex_model_name"):
+            exact = self._exact_model_identity(getattr(self, "model_id", ""))
+            if exact:
+                return exact
+        return "modelo não confirmado"
+
+    def remember_codex_default_model(self, model_id):
+        """Apply a discovered exact default ID without selecting/pinning it."""
+        exact = self._exact_model_identity(model_id)
+        if not exact:
+            return False
+        self.codex_default_model_name = exact
+        if getattr(self, "provider", "") == "codex":
+            self.model_id = self._codex_display_model()
+        return True
+
+    def _remember_codex_response_model(self, payload, requested_model=""):
+        """Remember known runtime model fields, preferring reported over requested."""
+        def reported(value, depth=0):
+            if not isinstance(value, dict) or depth > 3:
+                return ""
+            for key in ("model", "modelId", "model_id"):
+                exact = self._exact_model_identity(value.get(key))
+                if exact:
+                    return exact
+            for key in ("thread", "turn", "response", "result"):
+                exact = reported(value.get(key), depth + 1)
+                if exact:
+                    return exact
+            return ""
+        exact = reported(payload) or self._exact_model_identity(requested_model)
+        if not exact:
+            return False
+        self.active_codex_model_name = exact
+        if getattr(self, "provider", "") == "codex":
+            self.model_id = exact
+        return True
+
+    def _remember_codex_cli_model(self, output):
+        # The exec CLI prints its selected model in the startup metadata block.
+        # Do not infer identities from arbitrary assistant prose or tool output.
+        lines = str(output or "").splitlines()[:40]
+        if not lines or "codex" not in lines[0].casefold() or not any(line.startswith("workdir:") for line in lines):
+            return False
+        for line in lines:
+            match = re.fullmatch(r"model:\s*(\S+)\s*", line)
+            if match:
+                return self._remember_codex_response_model({"model": match.group(1)})
+        return False
 
     def _remember_lm_studio_response_model(self, payload):
         if not isinstance(payload, dict):
@@ -477,13 +557,13 @@ class UniversalEngine:
         else:
             key_state = "chave ok" if self.client else "sem chave"
         effort = f" | raciocinio {self.codex_reasoning_effort}" if self.provider == "codex" else ""
-        displayed_model = self.assistant_display_name() if self.provider == "lm_studio" else self.model_id
+        displayed_model = self.assistant_display_name() if self.provider in {"lm_studio", "codex", "openai"} else self.model_id
         warnings = getattr(self, "configuration_warnings", [])
         warning = f" | aviso: {warnings[-1]}" if warnings else ""
         return f"{self.provider.upper()} | {displayed_model}{effort} | {key_state}{warning}"
 
     def quota_status_text(self):
-        model = self.assistant_display_name() if self.provider == "lm_studio" else (self.model_id or "modelo atual")
+        model = self.assistant_display_name() if self.provider in {"lm_studio", "codex", "openai"} else (self.model_id or "modelo atual")
         if self.provider == "web_chat":
             return (
                 f"CHAT WEB {model} | conversa por projeto | URL livre | "
@@ -1017,6 +1097,8 @@ Regras essenciais:
         priorities = (
             ("contexto adicional", 120),
             ("missao ativa", 110),
+            ("execução e diagnóstico do projeto", 105),
+            ("memória de execução", 105),
             ("briefing inteligente", 100),
             ("mapa inteligente", 95),
             ("conversa recente", 80),
@@ -2011,6 +2093,13 @@ except Exception as exc:
                 workspace_path=workspace_path,
                 approval_callback=approval_callback,
             )
+            if getattr(self, "_codex_attempt_succeeded", False) and app_server_response:
+                return app_server_response
+            if getattr(self, "_codex_attempt_had_activity", False) and (
+                not app_server_response or self._is_capacity_message(app_server_response)
+                or self._is_codex_error_message(app_server_response) or self._is_codex_progress_timeout(app_server_response)
+            ):
+                return self._codex_partial_execution_diagnostic(app_server_response)
             if app_server_response:
                 if self._is_capacity_message(app_server_response):
                     fallback_response = self._try_codex_fallback_models(
@@ -2056,6 +2145,14 @@ except Exception as exc:
                 efforts.append(effort)
         return efforts
 
+    @staticmethod
+    def _codex_partial_execution_diagnostic(detail=""):
+        return (
+            "Execução interrompida após ações já iniciadas. A IDE preservou o histórico e não reiniciou a tarefa "
+            "por outro executor/modelo. Confira arquivos, estado do Git e estado efetivo do destino antes de continuar; "
+            "pode haver aplicação parcial.\n\n" + str(detail or "O executor não entregou uma conclusão confirmada.")
+        )
+
     def _try_codex_fallback_models(
         self,
         executable,
@@ -2083,6 +2180,13 @@ except Exception as exc:
                 workspace_path=workspace_path,
                 approval_callback=approval_callback,
             )
+            if getattr(self, "_codex_attempt_succeeded", False) and response:
+                return f"[Codex alternativo: {model}]\n\n{response}"
+            if getattr(self, "_codex_attempt_had_activity", False) and (
+                not response or self._is_capacity_message(response) or self._is_codex_error_message(response)
+                or self._is_codex_progress_timeout(response)
+            ):
+                return self._codex_partial_execution_diagnostic(response)
             if response and not self._is_capacity_message(response) and not self._is_codex_error_message(response):
                 return f"[Codex alternativo: {model}]\n\n{response}"
         return None
@@ -2139,7 +2243,12 @@ except Exception as exc:
         image_result_callback=None,
     ):
         workspace = Path(workspace_path).resolve() if workspace_path else Path.cwd()
-        selected_model = model_override or self.codex_model_name or "gpt-5.5"
+        self._codex_attempt_had_activity = False
+        self._codex_attempt_succeeded = False
+        selected_model = str(model_override or self.codex_model_name or "").strip()
+        self.active_codex_model_name = ""
+        if getattr(self, "provider", "") == "codex":
+            self.model_id = self._codex_display_model()
         selected_effort = (reasoning_effort or self.codex_reasoning_effort or "xhigh").strip().lower()
         approval_policy = (
             os.getenv("MEROTEC_CODEX_APP_SERVER_APPROVAL_POLICY", "on-request").strip()
@@ -2168,19 +2277,19 @@ except Exception as exc:
             "Historico, MISSAO ORIGINAL e MISSAO ATIVA sao contexto, nao autorizacao para ignorar uma nova ordem do usuario.\n\n"
             f"{self._message_payload(prompt, code_context)}"
         )
+        if "EXECUÇÃO E DIAGNÓSTICO DO PROJETO:" not in str(code_context or ""):
+            try:
+                prompt_text += "\n\n" + execution_guidance(workspace)
+            except (OSError, ValueError):
+                pass
 
         try:
+            startup_command = [executable, "app-server", "-c", 'model_provider="openai"']
+            if selected_model:
+                startup_command.extend(["-c", f"model={json.dumps(selected_model)}"])
+            startup_command.extend(["-c", f'model_reasoning_effort="{selected_effort}"'])
             process = subprocess.Popen(
-                [
-                    executable,
-                    "app-server",
-                    "-c",
-                    'model_provider="openai"',
-                    "-c",
-                    f'model="{selected_model}"',
-                    "-c",
-                    f'model_reasoning_effort="{selected_effort}"',
-                ],
+                startup_command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -2241,6 +2350,19 @@ except Exception as exc:
             params = message.get("params") or {}
             if request_id is None or not method:
                 return False
+            if method in {"item/commandExecution/requestApproval", "execCommandApproval"}:
+                command = self._extract_app_server_command_text(params)
+                try:
+                    working = params.get("cwd") or workspace
+                    assessment = ExecutionLessons(workspace).assess_repeat(command, context=execution_context(workspace, working)) if command else {}
+                except (OSError, ValueError):
+                    assessment = {}
+                if assessment.get("should_pause"):
+                    decision = "reject" if method.startswith("item/") else "denied"
+                    respond(request_id, {"decision": decision})
+                    if stream_callback:
+                        stream_callback("[ATIVIDADE] Comando repetido recusado: " + assessment["recommendation"])
+                    return True
             if method in {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}:
                 approved = False if self._app_server_message_has_placeholder_command(method, params) else ask_approval(method, params)
                 decision = "acceptForSession" if approved else "reject"
@@ -2347,6 +2469,7 @@ except Exception as exc:
             thread_id = (thread_result.get("thread") or {}).get("id")
             if not thread_id:
                 return None
+            self._remember_codex_response_model(thread_result, requested_model=selected_model)
 
             input_items = [{"type": "text", "text": prompt_text}]
             if image_path and os.path.exists(image_path):
@@ -2378,6 +2501,12 @@ except Exception as exc:
             last_error = ""
             completed = False
             reported_image_paths = set()
+            observed_command_ids = set()
+            command_start_times = {}
+            active_turn_id = ""
+            steer_request_ids = set()
+            diagnostic_steers = 0
+            steering_supported = True
 
             def publish_generated_images(payload):
                 paths = self._extract_app_server_generated_image_paths(payload)
@@ -2432,16 +2561,63 @@ except Exception as exc:
                     continue
                 last_activity = time.time()
 
+                if message.get("id") in steer_request_ids:
+                    if "error" in message:
+                        steering_supported = False
+                        if stream_callback:
+                            stream_callback("[ATIVIDADE] Diagnóstico salvo; este servidor recusou a atualização durante o turno.")
+                    continue
+
                 if message.get("id") == turn_response_id and "error" in message:
                     last_error = message["error"].get("message", str(message["error"]))
                     break
+                if message.get("id") == turn_response_id and "result" in message:
+                    self._remember_codex_response_model(message["result"])
+                    active_turn_id = (message["result"].get("turn") or {}).get("id") or active_turn_id
 
                 method = message.get("method", "")
                 params = message.get("params") or {}
                 self._remember_quota_message_handler(method, params)
+                if method in {"thread/started", "thread/updated", "turn/started", "turn/completed", "turnCompleted"}:
+                    self._remember_codex_response_model(params)
+                if method == "turn/started":
+                    active_turn_id = (params.get("turn") or {}).get("id") or active_turn_id
 
                 if handle_server_request(message):
                     continue
+
+                try:
+                    command_item = params.get("item") or {}
+                    if not isinstance(command_item, dict):
+                        command_item = {}
+                    if method in {"item/started", "item/completed"} and command_item.get("type") in {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"}:
+                        self._codex_attempt_had_activity = True
+                    if method == "item/started" and command_item.get("type") == "commandExecution" and command_item.get("id"):
+                        command_start_times[command_item["id"]] = time.time()
+                    started_at = command_start_times.pop(command_item.get("id"), None) if method == "item/completed" else None
+                    observation = record_codex_command_event(method, params, workspace, observed_command_ids, started=started_at)
+                    if observation is None:
+                        observation = record_codex_action_event(method, params, workspace, observed_command_ids)
+                    if observation and observation["assessment"]["should_pause"] and stream_callback:
+                        stream_callback("[ATIVIDADE] Memória de execução: " + observation["assessment"]["recommendation"])
+                    if (observation and observation.get("entry", {}).get("status") in {"failed", "timeout", "rejected", "launch_error"}
+                            and steering_supported and active_turn_id and diagnostic_steers < 4):
+                        entry = observation["entry"]
+                        feedback = (
+                            "DIAGNÓSTICO DA IDE baseado em resultado estruturado, sem mudar a missão atual.\n"
+                            + entry.get("diagnosis", "A ação foi recusada; confira o arquivo real e o erro retornado.")
+                            + "\n" + observation["assessment"]["recommendation"]
+                            + "\nAntes de repetir deploy/push/upload/criação, confira se houve aplicação parcial no destino. "
+                            "Obtenha um fato novo com diagnóstico limitado; não repita a mesma tentativa às cegas."
+                        )
+                        send("turn/steer", {"threadId": thread_id, "expectedTurnId": active_turn_id,
+                                           "input": [{"type": "text", "text": feedback}]}, next_id)
+                        steer_request_ids.add(next_id)
+                        next_id += 1
+                        diagnostic_steers += 1
+                except (OSError, ValueError):
+                    # Memory must never turn a completed command into a task failure.
+                    pass
 
                 # Algumas versoes do app-server anunciam a imagem antes de
                 # concluir a rodada; outras a colocam somente no turno final.
@@ -2487,6 +2663,7 @@ except Exception as exc:
                 if method.endswith("turn/completed") or method == "turnCompleted":
                     completed = True
                     turn = params.get("turn") or {}
+                    self._codex_attempt_succeeded = turn.get("status") == "completed"
                     if turn.get("status") == "failed":
                         error = turn.get("error") or {}
                         self._remember_quota_error({"error": error})
@@ -2500,6 +2677,8 @@ except Exception as exc:
                     break
 
             final_message = "".join(chunks).strip() or final_from_items.strip()
+            if last_error and not completed and self._codex_attempt_had_activity:
+                return self._codex_partial_execution_diagnostic(last_error)
             if last_error and self._is_codex_progress_timeout(last_error) and not completed:
                 return self._format_codex_app_server_error(last_error)
             if final_message:
@@ -2509,7 +2688,9 @@ except Exception as exc:
             if completed:
                 return "Codex terminou a tarefa sem mensagem final."
             return None
-        except Exception:
+        except Exception as exc:
+            if getattr(self, "_codex_attempt_had_activity", False):
+                return self._codex_partial_execution_diagnostic(f"Falha de comunicação/protocolo: {type(exc).__name__}.")
             return None
         finally:
             try:
@@ -2830,6 +3011,9 @@ except Exception as exc:
         workspace_path=None,
     ):
         workspace = Path(workspace_path).resolve() if workspace_path else Path.cwd()
+        self.active_codex_model_name = ""
+        if getattr(self, "provider", "") == "codex":
+            self.model_id = self._codex_display_model()
         selected_effort = (reasoning_effort or self.codex_reasoning_effort or "xhigh").strip().lower()
         prompt_text = (
             f"{self.system_instruction}\n\n"
@@ -2840,6 +3024,10 @@ except Exception as exc:
             "Ao terminar, responda em portugues com um resumo curto do que fez.\n\n"
             f"{self._message_payload(prompt, code_context)}"
         )
+        try:
+            prompt_text += "\n\nHISTÓRICO ATUALIZADO ANTES DE EXECUTAR:\n" + execution_guidance(workspace)
+        except (OSError, ValueError):
+            pass
 
         output_path = None
         try:
@@ -2849,10 +3037,9 @@ except Exception as exc:
             command = [
                 executable,
                 "exec",
+                "--json",
                 "-c",
                 'model_provider="openai"',
-                "-c",
-                f'model="{self.codex_model_name or "gpt-5.5"}"',
                 "-c",
                 f'model_reasoning_effort="{selected_effort}"',
                 "-c",
@@ -2866,7 +3053,7 @@ except Exception as exc:
                 str(output_path),
             ]
             if self.codex_model_name:
-                command.extend(["--model", self.codex_model_name])
+                command.extend(["-c", f"model={json.dumps(self.codex_model_name)}", "--model", self.codex_model_name])
             if image_path and os.path.exists(image_path):
                 command.extend(["--image", image_path])
             command.append("-")
@@ -2888,8 +3075,38 @@ except Exception as exc:
             if stream_callback:
                 stream_callback("Codex iniciou a tarefa...\n")
 
-            output_chunks = []
+            output_chunks = deque(maxlen=2_000_000)
             buffer = []
+            cli_observed_ids = set()
+            cli_final_message = ""
+
+            def consume_cli_line(line):
+                nonlocal cli_final_message
+                try:
+                    event = json.loads(line)
+                except (ValueError, TypeError):
+                    if stream_callback:
+                        stream_callback(line[:4000])
+                    return
+                if not isinstance(event, dict):
+                    return
+                self._remember_codex_response_model(event)
+                try:
+                    observed = record_codex_cli_event(event, workspace, cli_observed_ids)
+                except (OSError, ValueError):
+                    observed = None
+                item = event.get("item") or {}
+                if not isinstance(item, dict):
+                    return
+                if item.get("type") == "agent_message" and event.get("type") == "item.completed":
+                    cli_final_message = str(item.get("text") or "")
+                if stream_callback:
+                    if item.get("type") == "command_execution" and item.get("command"):
+                        stream_callback("[TERMINAL_IA] " + str(item["command"])[:4000])
+                        if event.get("type") == "item.completed" and item.get("aggregated_output"):
+                            stream_callback("[TERMINAL_IA_OUTPUT] " + str(item["aggregated_output"])[-12000:])
+                    if observed and observed.get("entry", {}).get("diagnosis"):
+                        stream_callback("[ATIVIDADE] " + observed["entry"]["diagnosis"])
             started_at = time.time()
             while True:
                 if self.cancel_requested:
@@ -2899,18 +3116,20 @@ except Exception as exc:
                 if not chunk:
                     break
                 output_chunks.append(chunk)
-                buffer.append(chunk)
-                if stream_callback and (chunk in {"\n", "\r"} or len(buffer) >= 160):
-                    stream_callback("".join(buffer))
+                if len(buffer) < 1_000_000:
+                    buffer.append(chunk)
+                if chunk == "\n":
+                    consume_cli_line("".join(buffer))
                     buffer.clear()
                 if time.time() - started_at > 1800:
                     self.cancel_generation()
                     return "Codex demorou mais de 30 minutos nessa tarefa. Divida em passos menores e tente novamente."
 
-            if stream_callback and buffer:
-                stream_callback("".join(buffer))
+            if buffer:
+                consume_cli_line("".join(buffer))
             process.wait(timeout=5)
             output = "".join(output_chunks)
+            self._remember_codex_cli_model(output)
             final_message = output_path.read_text(encoding="utf-8").strip() if output_path.exists() else ""
 
             if process.returncode != 0:
@@ -2929,7 +3148,9 @@ except Exception as exc:
                     )
                 return f"Codex retornou erro {process.returncode}.\n\n{tail}"
 
-            return final_message or (output or "").strip() or "Codex terminou sem mensagem final."
+            if not getattr(self, "active_codex_model_name", ""):
+                self._remember_codex_response_model({}, requested_model=self.codex_model_name)
+            return final_message or cli_final_message or "Codex terminou sem mensagem final."
         except subprocess.TimeoutExpired:
             self.cancel_generation()
             return "Codex demorou mais de 30 minutos nessa tarefa. Divida em passos menores e tente novamente."
@@ -2985,23 +3206,47 @@ except Exception as exc:
                 "Login no ChatGPT/Codex nao pode ser usado diretamente como chave de API."
             )
 
+        # Read the selected profile's model at request time. model_id is also
+        # used for display and may still describe the preceding selection.
+        current_model = str(getattr(self, "openai_model_name", "") or "").strip()
+        if not current_model:
+            return "Selecione o ID exato do modelo nas Configurações da IA e salve o perfil."
+
+        self.model_id = current_model
+        self.active_openai_model_name = ""
         try:
             user_content = self._openai_chat_message_content(prompt, code_context, image_path)
-            # Detecta se a chave pertence ao OpenRouter
-            base_url = str(getattr(self, "openai_base_url", "") or "https://api.openai.com/v1").rstrip("/")
+            # Share endpoint normalization with discovery, including legacy
+            # OpenRouter keys saved against the default OpenAI URL.
+            base_url = normalize_openai_base_url(getattr(self, "openai_base_url", ""), self.openai_api_key)
+            self.openai_base_url = base_url
             openrouter_key = self.openai_api_key.startswith("sk-or-")
-            if openrouter_key and "api.openai.com" in base_url.lower():
-                # Migra configuracoes antigas que guardavam apenas a chave e o modelo.
-                base_url = "https://openrouter.ai/api/v1"
-                self.openai_base_url = base_url
-            is_openrouter = openrouter_key or "openrouter.ai" in base_url.lower()
-            
-            if is_openrouter:
+            host = urllib.parse.urlsplit(base_url).hostname or ""
+            is_openrouter = openrouter_key or host.lower() == "openrouter.ai"
+
+            if host.lower() == "api.openai.com":
+                # The official Responses API accepts current reasoning models
+                # without the chat-only max_tokens/temperature assumptions.
+                endpoint = f"{base_url}/responses"
+                if isinstance(user_content, list):
+                    response_content = []
+                    for item in user_content:
+                        if item.get("type") == "text":
+                            response_content.append({"type": "input_text", "text": item["text"]})
+                        elif item.get("type") == "image_url":
+                            image = item["image_url"]
+                            response_content.append({"type": "input_image", "image_url": image["url"], "detail": image.get("detail", "auto")})
+                else:
+                    response_content = user_content
+                payload = {
+                    "model": current_model,
+                    "instructions": self._agent_protocol_system_instruction(),
+                    "input": [{"role": "user", "content": response_content}],
+                    "max_output_tokens": 4096,
+                    "store": False,
+                }
+            else:
                 endpoint = f"{base_url}/chat/completions"
-                current_model = str(self.openai_model_name or self.model_id or "").strip()
-                if not current_model:
-                    return "Configure o ID exato do modelo OpenRouter em Configurações."
-                    
                 payload = {
                     "model": current_model,
                     "messages": [
@@ -3011,27 +3256,13 @@ except Exception as exc:
                     "temperature": 0.1,
                     "max_tokens": 4096,
                 }
-                headers = {
-                    "Authorization": f"Bearer {self.openai_api_key.strip()}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://github.com/merotec/ai-ide",
-                    "X-Title": "Merotec AI IDE",
-                }
-            else:
-                endpoint = f"{base_url}/chat/completions"
-                payload = {
-                    "model": self.model_id,
-                    "messages": [
-                        {"role": "system", "content": self._agent_protocol_system_instruction()},
-                        {"role": "user", "content": user_content}
-                    ],
-                    "temperature": 0.1,
-                    "max_tokens": 4096,
-                }
-                headers = {
-                    "Authorization": f"Bearer {self.openai_api_key.strip()}",
-                    "Content-Type": "application/json",
-                }
+
+            headers = {
+                "Authorization": f"Bearer {self.openai_api_key.strip()}",
+                "Content-Type": "application/json",
+            }
+            if is_openrouter:
+                headers.update({"HTTP-Referer": "https://github.com/merotec/ai-ide", "X-Title": "Merotec AI IDE"})
 
             request = urllib.request.Request(
                 endpoint,
@@ -3046,12 +3277,25 @@ except Exception as exc:
             if "usage" in data:
                 self._remember_openai_usage(data.get("usage"))
                 
-            return self._extract_openai_text(data)
+            if data.get("status") == "incomplete":
+                reason = (data.get("incomplete_details") or {}).get("reason") or "limite de geração"
+                return f"O modelo `{current_model}` interrompeu a resposta ({reason}). A resposta parcial não foi aplicada; a seleção do modelo foi preservada."
+            text = self._extract_openai_text(data)
+            if text:
+                return text
+            return f"O modelo `{current_model}` respondeu sem texto utilizável. Confira se ele oferece geração de texto neste endpoint."
         except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            finally:
+                exc.close()
             return self._format_openai_http_error(exc.code, body)
         except Exception as exc:
-            return f"Erro no motor OpenAI usando modelo `{self.model_id}`: {exc}"
+            return f"Erro no motor OpenAI usando modelo `{current_model}`: {exc}"
+
+    @staticmethod
+    def normalize_openai_base_url(base_url):
+        return normalize_openai_base_url(base_url)
 
     def _openai_chat_message_content(self, prompt, code_context=None, image_path=None):
         """Monta conteúdo multimodal para o endpoint Chat Completions.
@@ -3367,16 +3611,20 @@ except Exception as exc:
     def _format_openai_http_error(self, status_code, body):
         try:
             payload = json.loads(body)
-            message = payload.get("error", {}).get("message", body)
-            code = payload.get("error", {}).get("code", "")
-        except json.JSONDecodeError:
+            error = payload.get("error", {}) if isinstance(payload, dict) else {}
+            error = error if isinstance(error, dict) else {}
+            message = str(error.get("message") or body)
+            code = str(error.get("code") or "")
+            parameter = str(error.get("param") or "")
+        except (json.JSONDecodeError, TypeError):
             message = body
             code = ""
+            parameter = ""
 
         if status_code == 401 or code == "invalid_api_key":
             return (
                 f"A chave inserida foi rejeitada pela API (HTTP {status_code}). Verifique se "
-                "copiou o token completo do OpenRouter corretamente."
+                "a chave e a URL base pertencem ao mesmo provedor nas Configurações da IA."
             )
 
         if status_code == 429 and code == "insufficient_quota":
@@ -3387,10 +3635,12 @@ except Exception as exc:
                 "Verifique seu saldo na plataforma."
             )
 
-        if status_code in {400, 404} and "model" in message.lower():
+        if code in {"model_not_found", "invalid_model", "unsupported_model"} or parameter == "model" or (status_code in {403, 404} and "model" in message.lower()):
+            selected_model = str(getattr(self, "openai_model_name", "") or getattr(self, "model_id", "") or "não definido")
             return (
-                f"O modelo `{self.model_id}` nao foi localizado. Certifique-se de que digitou o ID "
-                "exato do OpenRouter (Exemplo: deepseek/deepseek-chat:free)."
+                f"O modelo `{selected_model}` foi rejeitado ou não está disponível neste endpoint (HTTP {status_code}). "
+                "Atualize a lista nas Configurações da IA e confira o ID, o acesso da conta e o tipo de modelo. "
+                "A IDE não substituiu o modelo selecionado."
             )
 
         return f"Erro na requisição: HTTP {status_code} - {message}"

@@ -7,10 +7,12 @@ ao adaptador PySide6 sem depender de widgets Tk.
 from __future__ import annotations
 
 import re
+import hashlib
 from pathlib import Path
 
 from modules.app_constants import is_ignored_dir_name
 from modules.code_transport import unwrap_transport_code, validate_file, validate_source_text
+from modules.process_runtime import ProcessObservation, RepeatedExecutionError, process_scope
 
 
 class QtAgentActions:
@@ -137,6 +139,40 @@ class QtAgentActions:
             return
 
     def apply(self, response):
+        actions = re.findall(r"\[(WRITE(?:_PART)?|REPLACE|PATCH|INSERT_BEFORE|INSERT_AFTER|DELETE|VALIDATE)\b", response, re.I)
+        observation = None
+        if actions:
+            # Persist an identity of the proposed action, never the source code.
+            key = "coding " + ",".join(sorted(set(action.upper() for action in actions)))
+            key += " sha256=" + hashlib.sha256(response.encode("utf-8")).hexdigest()
+            observation = ProcessObservation(key, self.workspace, operation="coding", origin="agent-actions", autonomous=True, timeout=None)
+            try:
+                observation.check()
+            except RepeatedExecutionError as exc:
+                self.last_observations = []
+                self.last_followup_required = self.last_action_count = 1
+                self.last_command_requested = self.last_visual_test_requested = self.last_browser_action_requested = False
+                self.last_validated_paths = []
+                self._message("Erro", "Ação de código repetida recusada: " + str(exc))
+                return []
+        try:
+            with process_scope(workspace=self.workspace, origin="coding-validation", autonomous=True):
+                changed = self._apply_actions(response)
+        except Exception as exc:
+            if observation:
+                observation.feed(type(exc).__name__)
+                observation.finish(outcome="rejected")
+            raise
+        if observation:
+            if any(message.startswith("Erro:") for message in self.last_observations):
+                observation.feed("Ação de código recusada. Consulte o erro de validação e o arquivo canônico na IDE.")
+                observation.finish(outcome="rejected")
+            elif changed or self.last_validated_paths:
+                observation.feed("Ação aplicada/verificada localmente; funcionamento do projeto ainda exige validação apropriada.")
+                observation.finish(outcome="applied")
+        return changed
+
+    def _apply_actions(self, response):
         changed = []
         self.last_observations = []
         self.last_action_count = 0

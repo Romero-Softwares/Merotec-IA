@@ -5,6 +5,10 @@ from modules.app_constants import DEFAULT_WORKSPACE
 class ProjectLoader:
     @staticmethod
     def detect_project_type(project):
+        from modules.electronics import detect_embedded
+        embedded = detect_embedded(project)
+        if embedded:
+            return embedded
         if (project / "pubspec.yaml").exists():
             try:
                 pubspec = (project / "pubspec.yaml").read_text(encoding="utf-8", errors="replace").lower()

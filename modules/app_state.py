@@ -405,6 +405,8 @@ class AppStateMixin:
 
         default_workspace.mkdir(parents=True, exist_ok=True)
         self.current_workspace = str(default_workspace)
+        from modules.process_runtime import set_active_workspace
+        set_active_workspace(self.current_workspace)
         os.chdir(self.current_workspace)
         if hasattr(self, "memory_subnet"):
             self.memory_subnet.reset_workspace(default_workspace)
@@ -468,6 +470,8 @@ class AppStateMixin:
             return
 
         self.current_workspace = str(resolved)
+        from modules.process_runtime import set_active_workspace
+        set_active_workspace(self.current_workspace)
         os.chdir(self.current_workspace)
         if hasattr(self, "memory_subnet"):
             self.memory_subnet.reset_workspace(resolved)

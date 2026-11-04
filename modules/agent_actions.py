@@ -5,7 +5,8 @@ import queue
 import re
 import shutil
 import socket
-import subprocess
+from modules.process_runtime import subprocess
+from modules.process_runtime import process_scope
 import sys
 import threading
 import time
@@ -5115,13 +5116,14 @@ class AgentActionsMixin:
 
         def run():
             try:
-                process = subprocess.Popen(
-                    command,
-                    shell=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    cwd=self.current_workspace,
-                )
+                with process_scope(workspace=self.current_workspace, origin="legacy-agent", autonomous=True):
+                    process = subprocess.Popen(
+                        command,
+                        shell=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        cwd=self.current_workspace,
+                    )
                 self.register_terminal_process(process, f"IA: {command}")
                 output = self.stream_process_output(process, collect=True)
                 process.wait()

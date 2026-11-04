@@ -1,6 +1,6 @@
 import os
 import shutil
-import subprocess
+from modules.process_runtime import subprocess
 import threading
 from pathlib import Path
 from tkinter import StringVar, filedialog

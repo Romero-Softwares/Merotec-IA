@@ -14,7 +14,7 @@ import json
 import os
 import re
 import shutil
-import subprocess
+from modules.process_runtime import subprocess
 import sys
 import threading
 import xml.etree.ElementTree as ET
@@ -26,7 +26,7 @@ IGNORED_DIRS = {
     ".git", ".venv", "venv", "env", "node_modules", "__pycache__",
     ".merotec_backups", ".merotec_patch_backups", ".dart_tool",
     "build", "dist", "out", ".idea", ".vscode", ".next", ".nuxt",
-    "target", "bin", "obj", ".gradle", ".cache",
+    "target", "bin", "obj", ".gradle", ".cache", ".pio",
 }
 
 SOURCE_SUFFIXES = {
@@ -34,11 +34,12 @@ SOURCE_SUFFIXES = {
     ".dart", ".json", ".html", ".htm", ".css", ".scss", ".sass",
     ".ps1", ".sh", ".bash", ".zsh", ".bat", ".cmd", ".cs", ".csx",
     ".java", ".kt", ".kts", ".go", ".rs", ".c", ".h", ".cc", ".cpp",
-    ".cxx", ".hpp", ".hh", ".php", ".rb", ".swift", ".lua", ".sql",
+    ".ino", ".cxx", ".hpp", ".hh", ".php", ".rb", ".swift", ".lua", ".sql",
     ".xml", ".xaml", ".yml", ".yaml", ".toml", ".vue", ".svelte",
 }
 
 EXTENSION_LANGUAGE = {
+    ".ino": "cpp",
     ".py": "python", ".pyw": "python",
     ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript", ".jsx": "javascript",
     ".ts": "typescript", ".tsx": "typescript",
@@ -152,6 +153,10 @@ def _is_flet_project(root: Path):
 def detect_workspace_language(workspace):
     """Escolhe a stack predominante a partir de arquivos de projeto reais."""
     root = Path(workspace).resolve()
+    from modules.electronics import detect_embedded
+    embedded = detect_embedded(root)
+    if embedded:
+        return embedded
     if (root / "pubspec.yaml").exists():
         return "flutter_dart" if _is_flutter_project(root) else "dart"
     if (root / "Cargo.toml").exists():
@@ -540,6 +545,10 @@ def workspace_contract(workspace):
     root = Path(workspace).resolve()
     language = detect_workspace_language(root)
     profile = {
+        "arduino": "Arduino detectado: valide .ino como C++; compile com Arduino CLI na pasta do sketch e FQBN correto. Não execute firmware como app desktop. Compilação não comprova comportamento físico.",
+        "platformio": "PlatformIO detectado: preserve platformio.ini; use pio run para compilar. Confirme ambiente, placa e porta antes de gravar. Não declare teste físico sem medição.",
+        "micropython": "MicroPython detectado: preserve APIs da placa. CPython pode validar sintaxe, mas não executa drivers MicroPython. Use ferramenta de transferência e REPL compatíveis.",
+        "electronics": "Projeto eletrônico: preserve BOM, pinagem, dossiê e plano de ensaios. Registre unidades, hipóteses, datasheets e resultados medidos.",
         "flet_python": "Flet detectado: preserve a arvore de controles, handlers e imports; valide sintaxe Python e rode o app quando houver tela.",
         "python": "Python detectado: preserve indentação e valide sintaxe/testes Python.",
         "flutter_dart": "Flutter/Dart detectado: preserve null-safety e valide com flutter analyze.",

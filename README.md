@@ -11,6 +11,15 @@ gerenciamento de projetos, execucao de comandos, navegador interno e recursos de
 <img width="1919" height="1013" alt="image" src="https://github.com/user-attachments/assets/62908d27-b26a-4af2-9783-57446523791a" />
 
 
+## Modelos de IA nas configurações
+
+Configurações da IA agora descobre modelos automaticamente para **Codex local** e
+**API compatível com OpenAI**, com listas pesquisáveis/editáveis, atualização manual,
+IDs exatos e níveis de raciocínio Codex. Salvar aplica o perfil às próximas solicitações.
+O ID identificado fica visível no cabeçalho e na barra inferior, inclusive no modo
+automático, e acompanha o modelo informado durante a execução.
+Veja o [guia de descoberta e troca](docs/model-discovery.md).
+
 ## Fluxo de projetos
 
 - `Arquivo > Novo projeto`: cria projetos vazios, Python, Flet, Web, Dart ou Flutter sem sobrescrever pastas existentes.
@@ -146,3 +155,58 @@ Se o remoto `origin` ja existir, use:
 git remote set-url origin https://github.com/SEU_USUARIO/SEU_REPOSITORIO.git
 git push -u origin main
 ```
+
+## Engenharia elétrica e eletrônica
+
+**Firmware nativo Python:** a bancada agora usa **Merotec Python (nativo)** por
+padrão, com instalação gerida de pacotes AVR, build, gravação e monitor serial
+sem Arduino CLI/PIO. Suporta Uno/Nano/Mega AVR e um subconjunto de `platformio.ini`.
+Veja o [guia e limites do gerenciador próprio](docs/native-firmware.md).
+
+**Código Arduino:** busque a pasta/arquivo de firmware ou use a aba **Código Arduino**
+para criar sketches a partir de modelos, colar/editar código, salvar, compilar e
+enviar à placa. Logs e monitor serial aparecem no painel inferior da bancada.
+
+**Simulador Arduino:** execute o HEX compilado de Uno/Nano ATmega328P em um emulador
+offline, com seleção de LEDs, relés, motor, I/O, 7 segmentos, visor serial e analisador
+lógico. Há entradas digitais/ADC, UART virtual e controles de pausa/passo/reinício.
+Veja o [guia e limites da simulação](docs/arduino-simulator.md); os modelos didáticos
+de cargas não reproduzem toda a física do dispositivo.
+
+**CAD nativo Python:** abra **Engenharia > Editor nativo de esquemático e PCB**
+para criar componentes, redes e rotas em camada única SMD, com ERC/DRC interno,
+desfazer/refazer, salvamento `.mpcb.json` e exportação SVG/BOM. Não requer KiCad.
+Veja o [guia e limites do editor nativo](docs/native-pcb.md).
+
+**Testes PCB e arquitetura:** na bancada, a aba **PCB e arquitetura** verifica BOM,
+pinagem, alimentação, orçamento de corrente, interfaces e medições registradas.
+A opção KiCad executa ERC/DRC quando `kicad-cli` está no PATH. Gera relatórios TXT/JSON
+com resultados aprovados, falhas e pendências. Veja o [formato dos dados e exemplos](docs/pcb-diagnostics.md).
+
+A interface PySide6 oferece **Engenharia > Bancada eletrônica** com:
+
+- Cálculos offline de lei de Ohm, potência DC, resistor de LED e filtro RC, com unidades explícitas.
+- Firmware: listar dispositivos, compilar, compilar/gravar e monitor serial com saída no painel inferior da bancada.
+- Novos projetos `arduino`, `esp32`, `stm32`, `micropython` e `electronics` em Arquivo > Novo projeto.
+- BOM e pinagem CSV, dossiê de engenharia e plano de ensaios para preencher em cada novo projeto.
+- Especialista no chat: `/skill electrical-electronics-engineer desenvolva ...`; seleção automática para pedidos de eletrônica, firmware e automação.
+- Autocompletar local Arduino em `.ino` e vocabulário C em `.c`/`.h`.
+
+Para o backend nativo AVR, use **Preparar toolchain AVR da IDE**. Para os backends
+externos opcionais, instale Arduino CLI/PlatformIO e os pacotes da placa no PATH.
+A bancada mostra quais ferramentas estão presentes e não grava placas ao abrir.
+Arduino usa `firmware/firmware.ino` e Uno como configuração inicial; ESP32 usa `esp32dev`, STM32 usa `nucleo_f401re`.
+Adapte a configuração, pinagem e níveis elétricos à placa real. O envio Arduino compila antes de gravar.
+O monitor usa o painel da bancada até ser interrompido. Salve os arquivos antes de compilar.
+MicroPython oferece estrutura inicial e assistência no chat; transferência e REPL dependem da ferramenta da placa.
+
+A IDE usa uma [camada comum de execução, memória e diagnóstico](docs/execution-diagnostics.md)
+para deploy, Git, compilação, scripts, testes, ferramentas da bancada e ações de código.
+O terminal persistente registra o código de saída real e preserva ambiente e diretório.
+Tentativas automáticas repetidas exigem mudança de contexto ou diagnóstico novo;
+tentativas manuais continuam disponíveis. Apenas os testes Python simples usam
+AppData e temporários isolados: Git/deploy preservam autenticação e perfis.
+
+Os cálculos são ideais e os projetos são pontos de partida: não incluem circuito físico validado
+ou certificação industrial. O CAD nativo cobre esquemáticos genéricos e PCB de camada única SMD;
+KiCad/SPICE/HDL continuam opcionais para fluxos além desse escopo. Registre hipóteses, datasheets e medições no dossiê.

@@ -6,7 +6,8 @@ import os
 import re
 import shutil
 import socket
-import subprocess
+from modules.process_runtime import subprocess
+from modules.process_runtime import set_active_workspace
 import sys
 import threading
 import queue
@@ -197,6 +198,7 @@ class UniversalApp(AppStateMixin, AiConfigMixin, WorkspaceIntelligenceMixin, Age
         self.change_history = self._load_change_history()
         self._apply_settings_to_environment()
         self.current_workspace = str(self._initial_workspace())
+        set_active_workspace(self.current_workspace)
         os.chdir(self.current_workspace)
         self.open_editors = {}
         self.path_to_tab = {}
